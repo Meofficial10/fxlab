@@ -12,7 +12,7 @@ venv/
 .env
 
 # Data & artifacts (never commit raw/derived market data)
-data/
+/data/
 !data/.gitkeep
 experiments/*/
 !experiments/.gitkeep
