@@ -9,7 +9,6 @@ import pandas as pd
 from fxlab.execution.broker import (
     AccountInfo,
     OrderRequest,
-    Position,
     Tick,
 )
 from fxlab.execution.market_data import MarketDataStream
@@ -38,7 +37,9 @@ class MockBroker:
         return None
 
     def get_account_info(self) -> AccountInfo:
-        return AccountInfo(balance=10000.0, equity=10000.0, margin_used=0.0, margin_available=10000.0)
+        return AccountInfo(
+            balance=10000.0, equity=10000.0, margin_used=0.0, margin_available=10000.0
+        )
 
     def submit_order(self, order: OrderRequest) -> str:
         return order.order_id
@@ -128,7 +129,13 @@ def test_bounded_tick_buffer_size():
     start_time = datetime(2026, 8, 25, 10, 0, 0, tzinfo=UTC)
     for i in range(10):
         t = start_time + timedelta(seconds=i)
-        tick = Tick(symbol="EURUSD", timestamp=t, bid=1.0850 + i * 0.0001, ask=1.0852 + i * 0.0001, mid=1.0851 + i * 0.0001)
+        tick = Tick(
+            symbol="EURUSD",
+            timestamp=t,
+            bid=1.0850 + i * 0.0001,
+            ask=1.0852 + i * 0.0001,
+            mid=1.0851 + i * 0.0001,
+        )
         stream.on_tick(tick)
 
     # Buffer maxlen is 5, so buffer length must be 5
@@ -169,18 +176,24 @@ def test_closed_candle_discipline_no_forming_bar_leakage():
 def test_historical_forming_bar_is_filtered():
     broker = MockBroker()
 
-    # Historical bars returned from broker: 09:55:00 (closed) and 10:00:00 (forming relative to 10:04:59)
-    hist_index = pd.DatetimeIndex([
-        pd.Timestamp("2026-08-25 09:55:00", tz="UTC"),
-        pd.Timestamp("2026-08-25 10:00:00", tz="UTC"),
-    ], name="ts_open")
-    broker.historical_bars_mock = pd.DataFrame({
-        "open": [1.0845, 1.0850],
-        "high": [1.0850, 1.0858],
-        "low": [1.0842, 1.0848],
-        "close": [1.0849, 1.0855],
-        "volume": [15.0, 8.0],
-    }, index=hist_index)
+    # Broker returns 09:55 (closed) and 10:00 (forming relative to 10:04:59).
+    hist_index = pd.DatetimeIndex(
+        [
+            pd.Timestamp("2026-08-25 09:55:00", tz="UTC"),
+            pd.Timestamp("2026-08-25 10:00:00", tz="UTC"),
+        ],
+        name="ts_open",
+    )
+    broker.historical_bars_mock = pd.DataFrame(
+        {
+            "open": [1.0845, 1.0850],
+            "high": [1.0850, 1.0858],
+            "low": [1.0842, 1.0848],
+            "close": [1.0849, 1.0855],
+            "volume": [15.0, 8.0],
+        },
+        index=hist_index,
+    )
 
     stream = MarketDataStream(broker=broker, symbols=["EURUSD"])
 
@@ -201,6 +214,91 @@ def test_historical_forming_bar_is_filtered():
     # The 10:00:00 bar MUST now be included!
     assert len(bars_boundary) == 2
     assert bars_boundary.index[-1] == pd.Timestamp("2026-08-25 10:00:00", tz="UTC")
+
+
+def test_historical_forming_bar_excluded_without_live_ticks():
+    broker = MockBroker()
+    hist_index = pd.DatetimeIndex(
+        [
+            pd.Timestamp("2026-08-25 09:55:00", tz="UTC"),
+            pd.Timestamp("2026-08-25 10:00:00", tz="UTC"),
+        ],
+        name="ts_open",
+    )
+    broker.historical_bars_mock = pd.DataFrame(
+        {
+            "open": [1.0845, 1.0850],
+            "high": [1.0850, 1.0858],
+            "low": [1.0842, 1.0848],
+            "close": [1.0849, 1.0855],
+            "volume": [15.0, 8.0],
+        },
+        index=hist_index,
+    )
+    now = datetime(2026, 8, 25, 10, 4, 59, tzinfo=UTC)
+    stream = MarketDataStream(
+        broker=broker,
+        symbols=["EURUSD"],
+        time_provider=lambda: now,
+    )
+
+    bars = stream.get_closed_bars("EURUSD", "M5")
+
+    assert list(bars.index) == [pd.Timestamp("2026-08-25 09:55:00", tz="UTC")]
+
+
+def test_historical_bar_included_at_exact_close_boundary_without_live_ticks():
+    broker = MockBroker()
+    ts_open = pd.Timestamp("2026-08-25 10:00:00", tz="UTC")
+    broker.historical_bars_mock = pd.DataFrame(
+        {
+            "open": [1.0850],
+            "high": [1.0858],
+            "low": [1.0848],
+            "close": [1.0855],
+            "volume": [8.0],
+        },
+        index=pd.DatetimeIndex([ts_open], name="ts_open"),
+    )
+    boundary = datetime(2026, 8, 25, 10, 5, 0, tzinfo=UTC)
+    stream = MarketDataStream(
+        broker=broker,
+        symbols=["EURUSD"],
+        time_provider=lambda: boundary,
+    )
+
+    bars = stream.get_closed_bars("EURUSD", "M5")
+
+    assert list(bars.index) == [ts_open]
+
+
+def test_proven_closed_historical_bar_wins_over_partial_tick_reconstruction():
+    broker = MockBroker()
+    ts_open = pd.Timestamp("2026-08-25 10:00:00", tz="UTC")
+    broker.historical_bars_mock = pd.DataFrame(
+        {
+            "open": [1.0800],
+            "high": [1.0900],
+            "low": [1.0700],
+            "close": [1.0880],
+            "volume": [100.0],
+        },
+        index=pd.DatetimeIndex([ts_open], name="ts_open"),
+    )
+    stream = MarketDataStream(broker=broker, symbols=["EURUSD"])
+    stream.on_tick(Tick("EURUSD", datetime(2026, 8, 25, 10, 2, tzinfo=UTC), 1.0849, 1.0851, 1.0850))
+    stream.on_tick(Tick("EURUSD", datetime(2026, 8, 25, 10, 5, tzinfo=UTC), 1.0859, 1.0861, 1.0860))
+
+    bars = stream.get_closed_bars("EURUSD", "M5")
+
+    assert list(bars.index) == [ts_open]
+    assert bars.loc[ts_open].to_dict() == {
+        "open": 1.0800,
+        "high": 1.0900,
+        "low": 1.0700,
+        "close": 1.0880,
+        "volume": 100.0,
+    }
 
 
 def test_dynamic_symbol_registration():
@@ -224,10 +322,11 @@ def test_bar_aggregation_ohlcv_accuracy():
     t_open = datetime(2026, 8, 25, 11, 0, 0, tzinfo=UTC)
     ticks = [
         Tick("EURUSD", t_open + timedelta(seconds=1), 1.0800, 1.0802, 1.0801),  # Open = 1.0801
-        Tick("EURUSD", t_open + timedelta(seconds=30), 1.0820, 1.0822, 1.0821), # High = 1.0821
-        Tick("EURUSD", t_open + timedelta(seconds=60), 1.0790, 1.0792, 1.0791), # Low = 1.0791
-        Tick("EURUSD", t_open + timedelta(seconds=90), 1.0810, 1.0812, 1.0811), # Close = 1.0811
-        Tick("EURUSD", t_open + timedelta(minutes=5), 1.0815, 1.0817, 1.0816),  # Triggers close of M5 bar 11:00:00
+        Tick("EURUSD", t_open + timedelta(seconds=30), 1.0820, 1.0822, 1.0821),
+        Tick("EURUSD", t_open + timedelta(seconds=60), 1.0790, 1.0792, 1.0791),
+        Tick("EURUSD", t_open + timedelta(seconds=90), 1.0810, 1.0812, 1.0811),
+        # Triggers close of the M5 bar opened at 11:00:00.
+        Tick("EURUSD", t_open + timedelta(minutes=5), 1.0815, 1.0817, 1.0816),
     ]
 
     for t in ticks:
@@ -249,17 +348,23 @@ def test_get_closed_bars_combines_history_and_ticks():
     broker = MockBroker()
 
     # Setup historical bars
-    hist_index = pd.DatetimeIndex([
-        pd.Timestamp("2026-08-25 09:50:00", tz="UTC"),
-        pd.Timestamp("2026-08-25 09:55:00", tz="UTC"),
-    ], name="ts_open")
-    broker.historical_bars_mock = pd.DataFrame({
-        "open": [1.0840, 1.0845],
-        "high": [1.0848, 1.0850],
-        "low": [1.0838, 1.0842],
-        "close": [1.0845, 1.0849],
-        "volume": [10.0, 15.0],
-    }, index=hist_index)
+    hist_index = pd.DatetimeIndex(
+        [
+            pd.Timestamp("2026-08-25 09:50:00", tz="UTC"),
+            pd.Timestamp("2026-08-25 09:55:00", tz="UTC"),
+        ],
+        name="ts_open",
+    )
+    broker.historical_bars_mock = pd.DataFrame(
+        {
+            "open": [1.0840, 1.0845],
+            "high": [1.0848, 1.0850],
+            "low": [1.0838, 1.0842],
+            "close": [1.0845, 1.0849],
+            "volume": [10.0, 15.0],
+        },
+        index=hist_index,
+    )
 
     stream = MarketDataStream(broker=broker, symbols=["EURUSD"])
 

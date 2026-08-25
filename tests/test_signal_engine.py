@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -35,7 +34,9 @@ class DummyBroker:
         return None
 
     def get_account_info(self) -> AccountInfo:
-        return AccountInfo(balance=10000.0, equity=10000.0, margin_used=0.0, margin_available=10000.0)
+        return AccountInfo(
+            balance=10000.0, equity=10000.0, margin_used=0.0, margin_available=10000.0
+        )
 
     def submit_order(self, order: OrderRequest) -> str:
         return order.order_id
@@ -51,6 +52,21 @@ class DummyBroker:
 
     def get_historical_bars(self, symbol: str, tf: str, count: int) -> pd.DataFrame:
         return self.historical_bars_mock.copy()
+
+
+def _authoritative_time() -> datetime:
+    return datetime(2026, 8, 25, 12, 0, 0, tzinfo=UTC)
+
+
+def _make_market_data(
+    broker: DummyBroker,
+    symbols: list[str] | None = None,
+) -> MarketDataStream:
+    return MarketDataStream(
+        broker=broker,
+        symbols=symbols or ["EURUSD"],
+        time_provider=_authoritative_time,
+    )
 
 
 class MockSetup:
@@ -72,13 +88,16 @@ class MockSetup:
 
 def _make_closed_bars(count: int = 10, start_time: str = "2026-08-25 10:00:00") -> pd.DataFrame:
     idx = pd.date_range(start_time, periods=count, freq="5min", tz="UTC")
-    df = pd.DataFrame({
-        "open": [1.0850] * count,
-        "high": [1.0860] * count,
-        "low": [1.0840] * count,
-        "close": [1.0855] * count,
-        "volume": [100.0] * count,
-    }, index=idx)
+    df = pd.DataFrame(
+        {
+            "open": [1.0850] * count,
+            "high": [1.0860] * count,
+            "low": [1.0840] * count,
+            "close": [1.0855] * count,
+            "volume": [100.0] * count,
+        },
+        index=idx,
+    )
     df.index.name = "ts_open"
     df.attrs["symbol"] = "EURUSD"
     df.attrs["timeframe"] = "M5"
@@ -88,7 +107,7 @@ def _make_closed_bars(count: int = 10, start_time: str = "2026-08-25 10:00:00") 
 def test_newest_closed_bar_no_signal():
     broker = DummyBroker()
     broker.historical_bars_mock = _make_closed_bars(10)
-    market_data = MarketDataStream(broker=broker, symbols=["EURUSD"])
+    market_data = _make_market_data(broker)
     setup = MockSetup(signals={})  # No signals
 
     engine = SignalEngine(setup=setup, market_data=market_data, timeframe="M5")
@@ -100,7 +119,7 @@ def test_newest_closed_bar_long_signal():
     broker = DummyBroker()
     bars = _make_closed_bars(10)
     broker.historical_bars_mock = bars
-    market_data = MarketDataStream(broker=broker, symbols=["EURUSD"])
+    market_data = _make_market_data(broker)
     # Signal on the last bar index (9) -> LONG (+1)
     setup = MockSetup(signals={9: 1})
 
@@ -121,7 +140,7 @@ def test_newest_closed_bar_short_signal():
     broker = DummyBroker()
     bars = _make_closed_bars(10)
     broker.historical_bars_mock = bars
-    market_data = MarketDataStream(broker=broker, symbols=["EURUSD"])
+    market_data = _make_market_data(broker)
     # Signal on the last bar index (9) -> SHORT (-1)
     setup = MockSetup(signals={9: -1})
 
@@ -136,7 +155,7 @@ def test_older_signal_is_not_emitted_as_current():
     broker = DummyBroker()
     bars = _make_closed_bars(10)
     broker.historical_bars_mock = bars
-    market_data = MarketDataStream(broker=broker, symbols=["EURUSD"])
+    market_data = _make_market_data(broker)
     # Signal on older bar index (5), NOT newest bar (9)
     setup = MockSetup(signals={5: 1})
 
@@ -149,10 +168,11 @@ def test_duplicate_polling_protection():
     broker = DummyBroker()
     bars = _make_closed_bars(10)
     broker.historical_bars_mock = bars
-    market_data = MarketDataStream(broker=broker, symbols=["EURUSD"])
+    market_data = _make_market_data(broker)
     setup = MockSetup(signals={9: 1})
 
     received_events: list[SignalEvent] = []
+
     def callback(evt: SignalEvent) -> None:
         received_events.append(evt)
 
@@ -173,7 +193,7 @@ def test_new_closed_bar_emits_again():
     broker = DummyBroker()
     bars10 = _make_closed_bars(10)
     broker.historical_bars_mock = bars10
-    market_data = MarketDataStream(broker=broker, symbols=["EURUSD"])
+    market_data = _make_market_data(broker)
     setup = MockSetup(signals={9: 1, 10: -1})
 
     engine = SignalEngine(setup=setup, market_data=market_data, timeframe="M5")
@@ -208,7 +228,7 @@ def test_multi_symbol_isolation():
 
     broker.get_historical_bars = mock_hist  # type: ignore
 
-    market_data = MarketDataStream(broker=broker, symbols=["EURUSD", "GBPUSD"])
+    market_data = _make_market_data(broker, ["EURUSD", "GBPUSD"])
     setup = MockSetup(signals={9: 1})
 
     engine = SignalEngine(setup=setup, market_data=market_data, timeframe="M5")
@@ -228,7 +248,7 @@ def test_multi_timeframe_isolation():
     bars_m5 = _make_closed_bars(10, start_time="2026-08-25 10:00:00")
 
     broker.historical_bars_mock = bars_m5
-    market_data = MarketDataStream(broker=broker, symbols=["EURUSD"])
+    market_data = _make_market_data(broker)
     setup = MockSetup(signals={9: 1})
 
     engine_m5 = SignalEngine(setup=setup, market_data=market_data, timeframe="M5")
@@ -246,7 +266,7 @@ def test_multi_timeframe_isolation():
 def test_optional_callback():
     broker = DummyBroker()
     broker.historical_bars_mock = _make_closed_bars(10)
-    market_data = MarketDataStream(broker=broker, symbols=["EURUSD"])
+    market_data = _make_market_data(broker)
     setup = MockSetup(signals={9: 1})
 
     called: list[SignalEvent] = []
@@ -261,17 +281,33 @@ def test_optional_callback():
     assert len(called) == 1
     assert called[0] == evt
 
-    # Test without callback (should operate cleanly)
+    # An independent engine without a callback still returns its event.
     engine_no_cb = SignalEngine(setup=setup, market_data=market_data, timeframe="M5")
     evt2 = engine_no_cb.process_symbol("EURUSD")
-    # Duplicate protection will prevent evt2, but no exception occurs
-    assert evt2 is None
+    assert evt2 is not None
+    assert evt2 == evt
+
+
+def test_duplicate_state_is_independent_across_engine_instances():
+    broker = DummyBroker()
+    broker.historical_bars_mock = _make_closed_bars(10)
+    market_data = _make_market_data(broker)
+    setup = MockSetup(signals={9: 1})
+
+    first_engine = SignalEngine(setup=setup, market_data=market_data, timeframe="M5")
+    second_engine = SignalEngine(setup=setup, market_data=market_data, timeframe="M5")
+
+    first_event = first_engine.process_symbol("EURUSD")
+    second_event = second_engine.process_symbol("EURUSD")
+
+    assert first_event is not None
+    assert second_event == first_event
 
 
 def test_empty_bars_graceful_handling():
     broker = DummyBroker()
     broker.historical_bars_mock = pd.DataFrame()  # Empty
-    market_data = MarketDataStream(broker=broker, symbols=["EURUSD"])
+    market_data = _make_market_data(broker)
     setup = MockSetup(signals={0: 1})
 
     engine = SignalEngine(setup=setup, market_data=market_data, timeframe="M5")
@@ -282,7 +318,7 @@ def test_empty_bars_graceful_handling():
 def test_setup_not_mutated():
     broker = DummyBroker()
     broker.historical_bars_mock = _make_closed_bars(10)
-    market_data = MarketDataStream(broker=broker, symbols=["EURUSD"])
+    market_data = _make_market_data(broker)
     setup = MockSetup(name="immutable_setup", signals={9: 1})
 
     engine = SignalEngine(setup=setup, market_data=market_data, timeframe="M5")

@@ -38,7 +38,9 @@ class DummyBroker:
         return None
 
     def get_account_info(self) -> AccountInfo:
-        return AccountInfo(balance=10000.0, equity=10000.0, margin_used=0.0, margin_available=10000.0)
+        return AccountInfo(
+            balance=10000.0, equity=10000.0, margin_used=0.0, margin_available=10000.0
+        )
 
     def submit_order(self, order: OrderRequest) -> str:
         return order.order_id
@@ -111,10 +113,26 @@ def test_position_valid_instantiation_and_validation():
     assert pos.size == 0.1
 
     with pytest.raises(ValueError, match="Position side must be \\+1 \\(long\\) or -1 \\(short\\)"):
-        Position("EURUSD", side=0, size=0.1, entry_price=1.0, entry_time=now, unrealized_pnl=0.0, position_id="p1")
+        Position(
+            "EURUSD",
+            side=0,
+            size=0.1,
+            entry_price=1.0,
+            entry_time=now,
+            unrealized_pnl=0.0,
+            position_id="p1",
+        )
 
     with pytest.raises(ValueError, match="Position size must be positive"):
-        Position("EURUSD", side=1, size=0.0, entry_price=1.0, entry_time=now, unrealized_pnl=0.0, position_id="p1")
+        Position(
+            "EURUSD",
+            side=1,
+            size=0.0,
+            entry_price=1.0,
+            entry_time=now,
+            unrealized_pnl=0.0,
+            position_id="p1",
+        )
 
 
 def test_account_info_instantiation_and_validation():
@@ -163,7 +181,9 @@ def test_order_request_validation():
     assert req.order_type == "market"
 
     with pytest.raises(ValueError, match="Invalid order_type"):
-        OrderRequest(symbol="EURUSD", side=1, size=0.5, order_type="invalid_type", order_id="ord_002")
+        OrderRequest(
+            symbol="EURUSD", side=1, size=0.5, order_type="invalid_type", order_id="ord_002"
+        )
 
     with pytest.raises(ValueError, match="Order size must be positive"):
         OrderRequest(symbol="EURUSD", side=1, size=-0.1, order_type="market", order_id="ord_003")
@@ -194,10 +214,24 @@ def test_order_fill_validation():
     assert fill.fill_size == 0.5
 
     with pytest.raises(ValueError, match="Fill price must be positive"):
-        OrderFill("ord_001", fill_price=0.0, fill_time=now, fill_size=0.5, commission=0.0, slippage_pips=0.0)
+        OrderFill(
+            "ord_001",
+            fill_price=0.0,
+            fill_time=now,
+            fill_size=0.5,
+            commission=0.0,
+            slippage_pips=0.0,
+        )
 
     with pytest.raises(ValueError, match="Fill size must be positive"):
-        OrderFill("ord_001", fill_price=1.08, fill_time=now, fill_size=-0.5, commission=0.0, slippage_pips=0.0)
+        OrderFill(
+            "ord_001",
+            fill_price=1.08,
+            fill_time=now,
+            fill_size=-0.5,
+            commission=0.0,
+            slippage_pips=0.0,
+        )
 
 
 def test_broker_adapter_protocol_runtime_check():

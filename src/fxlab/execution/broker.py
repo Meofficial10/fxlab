@@ -92,7 +92,9 @@ class OrderRequest:
         if self.size <= 0:
             raise ValueError(f"Order size must be positive, got {self.size}")
         if self.order_type not in ("market", "limit", "stop"):
-            raise ValueError(f"Invalid order_type '{self.order_type}'. Expected 'market', 'limit', or 'stop'")
+            raise ValueError(
+                f"Invalid order_type '{self.order_type}'. Expected 'market', 'limit', or 'stop'"
+            )
 
 
 @dataclass

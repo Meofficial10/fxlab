@@ -8,13 +8,20 @@ strategy/downstream engines NEVER see currently-forming candles.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from threading import Lock
 
 import pandas as pd
 
 from ..data.schema import OHLCV, timeframe_to_offset, timeframe_to_timedelta
 from .broker import BrokerAdapter, Tick
+
+
+def _utc_now() -> datetime:
+    """Return the current UTC wall-clock time."""
+    return datetime.now(UTC)
 
 
 @dataclass
@@ -28,6 +35,7 @@ class MarketDataStream:
     broker: BrokerAdapter
     symbols: list[str]
     tick_buffer_size: int = 1000
+    time_provider: Callable[[], datetime] = field(default=_utc_now, repr=False)
 
     # Master stream lock for dynamic symbol registration
     _stream_lock: Lock = field(default_factory=Lock, init=False)
@@ -77,6 +85,14 @@ class MarketDataStream:
                 return None
             return self._tick_buffers[symbol][-1]
 
+    def _authoritative_watermark(self, ticks: list[Tick]) -> pd.Timestamp:
+        """Return the newest accepted tick time, or injected UTC time when tickless."""
+        watermark = ticks[-1].timestamp if ticks else self.time_provider()
+        timestamp = pd.Timestamp(watermark)
+        if timestamp.tz is None:
+            return timestamp.tz_localize("UTC")
+        return timestamp.tz_convert("UTC")
+
     def _aggregate_ticks_to_bars(self, ticks: list[Tick], tf: str, symbol: str) -> pd.DataFrame:
         """Aggregate a list of ticks into canonical OHLCV bars.
 
@@ -100,10 +116,12 @@ class MarketDataStream:
                 ts = ts.tz_convert("UTC")
 
             ts_open = ts.floor(offset_str)
-            records.append({
-                "ts_open": ts_open,
-                "price": t.mid,
-            })
+            records.append(
+                {
+                    "ts_open": ts_open,
+                    "price": t.mid,
+                }
+            )
 
         df_ticks = pd.DataFrame(records)
         grouped = df_ticks.groupby("ts_open")["price"]
@@ -140,34 +158,25 @@ class MarketDataStream:
             ticks = list(self._tick_buffers.get(symbol, []))
 
         tf_delta = timeframe_to_timedelta(tf)
+        watermark = self._authoritative_watermark(ticks)
+        tick_bars = self._aggregate_ticks_to_bars(ticks, tf, symbol)
 
-        if ticks:
-            last_tick_ts = pd.Timestamp(ticks[-1].timestamp)
-            if last_tick_ts.tz is None:
-                last_tick_ts = last_tick_ts.tz_localize("UTC")
-            else:
-                last_tick_ts = last_tick_ts.tz_convert("UTC")
-
-            tick_bars = self._aggregate_ticks_to_bars(ticks, tf, symbol)
-
-            # Filter out forming bar: a bar is closed only if ts_open + tf_delta <= last_tick_ts
-            closed_tick_bars = tick_bars[tick_bars.index + tf_delta <= last_tick_ts]
-
-            # Historical bars must also obey closed-candle discipline when last_tick_ts is known
-            if not hist_bars.empty:
-                closed_hist_bars = hist_bars[hist_bars.index + tf_delta <= last_tick_ts]
-            else:
-                closed_hist_bars = hist_bars
-
-            if not closed_hist_bars.empty and not closed_tick_bars.empty:
-                combined = pd.concat([closed_hist_bars, closed_tick_bars])
-                combined = combined[~combined.index.duplicated(keep="last")].sort_index()
-            elif not closed_hist_bars.empty:
-                combined = closed_hist_bars
-            else:
-                combined = closed_tick_bars
+        # Neither broker history nor reconstructed ticks prove closure on their own.
+        if hist_bars.empty:
+            closed_hist_bars = hist_bars
         else:
-            combined = hist_bars
+            closed_hist_bars = hist_bars[hist_bars.index + tf_delta <= watermark]
+        closed_tick_bars = tick_bars[tick_bars.index + tf_delta <= watermark]
+
+        if not closed_hist_bars.empty and not closed_tick_bars.empty:
+            # Tick bars fill historical gaps. A proven-closed historical row is the
+            # authoritative complete OHLCV record when both sources share ts_open.
+            combined = pd.concat([closed_tick_bars, closed_hist_bars])
+            combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+        elif not closed_hist_bars.empty:
+            combined = closed_hist_bars
+        else:
+            combined = closed_tick_bars
 
         if combined.empty:
             empty = pd.DataFrame(columns=OHLCV, dtype="float64")

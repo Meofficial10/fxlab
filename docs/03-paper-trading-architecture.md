@@ -5,6 +5,11 @@
 **Prerequisites:** Research layer frozen at P4 NO-GO; no validated strategy exists  
 **Scope:** Trading-system infrastructure only — NO strategy creation, NO test window access
 
+> **Foundation-repair clarification (2026-08-25):** The focused decisions in
+> `docs/04-foundation-repair-decisions.md` supersede this draft wherever it discusses
+> market-data closure/overlap, SignalEngine duplicate scope, or ownership of future
+> execution-intent and risk concerns. No research-layer contract is changed.
+
 ---
 
 ## Executive Summary

@@ -23,8 +23,7 @@ class SetupProtocol(Protocol):
 
     name: str
 
-    def generate(self, bars: pd.DataFrame) -> tuple:
-        ...
+    def generate(self, bars: pd.DataFrame) -> tuple: ...
 
 
 @dataclass(frozen=True)
@@ -55,10 +54,12 @@ class SignalEngine:
     on_signal: Callable[[SignalEvent], None] | None = None
 
     # Track last processed bar open timestamp per (symbol, timeframe)
-    _last_processed_bar_time: dict[tuple[str, str], datetime] = field(default_factory=dict, init=False)
+    _last_processed_bar_time: dict[tuple[str, str], datetime] = field(
+        default_factory=dict, init=False
+    )
 
     def process_symbol(self, symbol: str) -> SignalEvent | None:
-        """Fetch closed bars for symbol, evaluate setup, and emit SignalEvent if fired on newest bar."""
+        """Evaluate closed bars and emit a SignalEvent when the newest bar fires."""
         bars = self.market_data.get_closed_bars(symbol, self.timeframe, count=self.lookback_count)
         if bars.empty:
             return None
@@ -67,7 +68,10 @@ class SignalEngine:
         key = (symbol, self.timeframe)
 
         # Duplicate protection: do not re-evaluate the same closed bar timestamp
-        if key in self._last_processed_bar_time and latest_bar_ts <= self._last_processed_bar_time[key]:
+        if (
+            key in self._last_processed_bar_time
+            and latest_bar_ts <= self._last_processed_bar_time[key]
+        ):
             return None
 
         self._last_processed_bar_time[key] = latest_bar_ts
@@ -97,7 +101,7 @@ class SignalEngine:
         return None
 
     def process_all_symbols(self, symbols: list[str] | None = None) -> list[SignalEvent]:
-        """Process closed bars for given symbols (or all tracked symbols) and return generated signals."""
+        """Process given symbols, or every tracked symbol, and return generated signals."""
         target_symbols = symbols if symbols is not None else self.market_data.symbols
         events: list[SignalEvent] = []
 
