@@ -1,0 +1,57 @@
+[project]
+name = "fxlab"
+version = "0.1.0"
+description = "AI-assisted forex trading RESEARCH platform — expectancy & robustness first, no false confidence."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "Proprietary" }
+authors = [{ name = "fxlab" }]
+dependencies = [
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "pyarrow>=16",
+    "duckdb>=1.1",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "pyyaml>=6.0",
+    "typer>=0.12",
+    "rich>=13.7",
+]
+
+# Heavy / network-dependent extras kept OUT of the core install so `uv sync`
+# and the test suite never depend on network or optional native wheels.
+[project.optional-dependencies]
+data = ["dukascopy-python>=4.0"]
+
+[project.scripts]
+fxlab = "fxlab.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "hypothesis>=6.100",
+    "ruff>=0.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fxlab"]
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-q -ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

@@ -1,0 +1,14 @@
+# Cost model (Phase 1). Backtests ALWAYS report gross AND net; stress runs multiply by stress_factor.
+pip_size:
+  EURUSD: 0.0001
+  GBPUSD: 0.0001
+  USDJPY: 0.01
+
+default:
+  spread_pips: 0.6                    # used when tick spread is unavailable
+  commission_per_lot_roundturn: 7.0   # USD per 1.0 standard lot, round turn
+  slippage_pips_base: 0.2             # baseline slippage per side
+  slippage_vol_coeff: 0.10            # extra pips per unit of normalized ATR (worse when volatile)
+  latency_bars: 1                     # execution delayed by N bars (fills at post-latency price)
+
+stress_factor: 1.5                    # +50% spread/slippage stress test

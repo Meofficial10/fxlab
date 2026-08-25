@@ -1,0 +1,18 @@
+# Data foundation (Phase 1). Timeframes/pairs are HYPOTHESES to be tested, not fixed truths.
+symbols: [EURUSD, GBPUSD, USDJPY]   # start liquid/tight-spread majors; no exotics
+base_timeframe: M5                  # lowest TF we ingest/store; higher TFs derived by resampling
+timeframes: [M5, M15, H1, H4]       # HTF H4/H1 -> MTF M15 -> LTF M5
+source: dukascopy                   # dukascopy | synthetic
+date_range:
+  start: "2015-01-01"
+  end: "2025-12-31"
+
+# Fixed-UTC session windows, evaluated in PRIORITY ORDER (first match wins).
+# SIMPLIFICATION (UNPROVEN): ignores DST shifts; revisit when sessions are tested in P3.
+# A window with start_hour > end_hour wraps past midnight.
+sessions:
+  - { name: Overlap, start_hour: 12, end_hour: 16 }   # London/New York overlap
+  - { name: London,  start_hour: 7,  end_hour: 16 }
+  - { name: NewYork, start_hour: 12, end_hour: 21 }
+  - { name: Asia,    start_hour: 23, end_hour: 8 }     # wraps midnight (Tokyo/Sydney)
+  # anything unmatched -> "Off"

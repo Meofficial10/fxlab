@@ -1,0 +1,17 @@
+# Top-level app + split + labeling config (Phase 1).
+project_name: fxlab
+data_dir: data
+experiments_dir: experiments
+
+# Chronological split. The TEST window (val_end .. date_range.end) is UNTOUCHED until P4.
+split:
+  train_end: "2021-12-31"
+  val_end: "2023-12-31"
+  embargo_bars: 10             # bars removed after each test fold to prevent leakage
+
+# Triple-barrier labeling defaults (TP-before-SL with a time barrier).
+label:
+  max_hold_bars: 24
+  tp_atr_mult: 2.0
+  sl_atr_mult: 1.0
+  atr_window: 14

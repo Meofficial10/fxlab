@@ -1,0 +1,8 @@
+# Risk defaults (consumed by the risk engine in Phase 6; recorded here so limits are config-as-code).
+max_risk_per_trade_pct: 1.0
+max_daily_loss_pct: 3.0
+max_consecutive_losses: 5
+max_drawdown_pct: 20.0
+max_trades_per_day: 2          # spec constraint; test whether another limit is superior
+starting_equity: 10.0          # $10 research simulation (NOT a claim of sustainable returns)
+ruin_threshold_pct: 50.0       # equity below this % of start counts as "ruin"

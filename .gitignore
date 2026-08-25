@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Environment / secrets
+.env
+
+# Data & artifacts (never commit raw/derived market data)
+data/
+!data/.gitkeep
+experiments/*/
+!experiments/.gitkeep
+!experiments/registry.jsonl
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
