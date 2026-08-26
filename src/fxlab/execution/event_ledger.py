@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from threading import Lock
 from types import MappingProxyType
+from typing import Protocol
 
 from .signal_engine import SignalEvent
 
@@ -53,6 +54,14 @@ class AuditComponent(StrEnum):
 
 class AuditLedgerError(RuntimeError):
     """Raised when a validated event cannot be appended to the ledger."""
+
+
+class DurableEventBackend(Protocol):
+    session_id: str
+
+    def append(self, event: AuditEvent) -> None: ...
+
+    def load_events(self) -> tuple[AuditEvent, ...]: ...
 
 
 @dataclass(frozen=True)
@@ -126,6 +135,7 @@ class EventLedger:
 
     session_id: str
     time_provider: Callable[[], datetime] = lambda: datetime.now(UTC)
+    durable_store: DurableEventBackend | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -135,8 +145,15 @@ class EventLedger:
         if not callable(self.time_provider):
             raise ValueError("time_provider must be callable")
         self.session_id = self.session_id.strip()
-        self._events: list[AuditEvent] = []
-        self._next_sequence = 1
+        if self.durable_store is not None:
+            if self.durable_store.session_id != self.session_id:
+                raise ValueError("durable store session_id must match the ledger")
+            loaded = self.durable_store.load_events()
+            self._events = list(loaded)
+            self._next_sequence = len(loaded) + 1
+        else:
+            self._events = []
+            self._next_sequence = 1
         self._lock = Lock()
 
     def append(
@@ -205,6 +222,8 @@ class EventLedger:
             return len(self._events)
 
     def _store_event(self, event: AuditEvent) -> None:
+        if self.durable_store is not None:
+            self.durable_store.append(event)
         self._events.append(event)
 
 

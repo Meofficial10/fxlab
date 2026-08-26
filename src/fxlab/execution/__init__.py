@@ -3,6 +3,7 @@
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .durable_event_store import SQLiteEventStore, StoredCheckpoint
     from .event_ledger import (
         AuditComponent,
         AuditEvent,
@@ -27,6 +28,13 @@ if TYPE_CHECKING:
         PaperCycleResult,
         PaperTradingSession,
     )
+    from .recovery import (
+        RecoveryResult,
+        RecoveryState,
+        UnsafeCheckpointError,
+        create_checkpoint,
+        recover,
+    )
 
 __all__ = [
     "AuditComponent",
@@ -35,6 +43,13 @@ __all__ = [
     "AuditLedgerError",
     "EventCorrelation",
     "EventLedger",
+    "SQLiteEventStore",
+    "StoredCheckpoint",
+    "RecoveryResult",
+    "RecoveryState",
+    "UnsafeCheckpointError",
+    "create_checkpoint",
+    "recover",
     "ExecutionIntent",
     "ExecutionResult",
     "ExecutionResultKind",
@@ -55,9 +70,23 @@ __all__ = [
 
 def __getattr__(name: str) -> Any:
     if name in __all__:
-        from . import event_ledger, order_manager, paper_broker, paper_session
+        from . import (
+            durable_event_store,
+            event_ledger,
+            order_manager,
+            paper_broker,
+            paper_session,
+            recovery,
+        )
 
-        for module in (event_ledger, order_manager, paper_broker, paper_session):
+        for module in (
+            durable_event_store,
+            event_ledger,
+            order_manager,
+            paper_broker,
+            paper_session,
+            recovery,
+        ):
             if hasattr(module, name):
                 return getattr(module, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

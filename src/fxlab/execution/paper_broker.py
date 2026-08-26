@@ -273,6 +273,83 @@ class PaperBroker:
             self._close_events.clear()
             return events
 
+    @property
+    def has_pending_close_events(self) -> bool:
+        with self._lock:
+            return bool(self._close_events)
+
+    def snapshot_state(self) -> dict[str, object]:
+        """Return primitive PaperBroker state; connection state is excluded."""
+        with self._lock:
+            return {
+                "balance": self._balance,
+                "equity": self._equity,
+                "latest_ticks": [
+                    {
+                        "symbol": tick.symbol,
+                        "timestamp": tick.timestamp.astimezone(UTC).isoformat(),
+                        "bid": tick.bid,
+                        "ask": tick.ask,
+                        "mid": tick.mid,
+                    }
+                    for _, tick in sorted(self._latest_ticks.items())
+                ],
+                "positions": [
+                    {
+                        "symbol": item.position.symbol,
+                        "side": item.position.side,
+                        "size": item.position.size,
+                        "entry_price": item.position.entry_price,
+                        "entry_time": item.position.entry_time.astimezone(UTC).isoformat(),
+                        "unrealized_pnl": item.position.unrealized_pnl,
+                        "position_id": item.position.position_id,
+                        "client_entry_order_id": item.client_entry_order_id,
+                        "broker_entry_order_id": item.broker_entry_order_id,
+                        "sl_price": item.sl_price,
+                        "tp_price": item.tp_price,
+                    }
+                    for _, item in sorted(self._positions.items())
+                ],
+                "statuses": {key: value.value for key, value in sorted(self._statuses.items())},
+                "correlations": [
+                    {
+                        "client_order_id": item.client_order_id,
+                        "broker_order_id": item.broker_order_id,
+                        "position_id": item.position_id,
+                    }
+                    for _, item in sorted(self._correlations.items())
+                ],
+            }
+
+    def configuration_snapshot(self, symbols: list[str]) -> dict[str, object]:
+        return {
+            "initial_balance": self.initial_balance,
+            "pip_value_per_lot": self.pip_value_per_lot,
+            "cost_config": self._cost_config.model_dump(mode="json"),
+            "pip_sizes": {
+                symbol: self._cost_config.pip_size_for(symbol)
+                for symbol in sorted({_canonical_symbol(item) for item in symbols})
+            },
+        }
+
+    def restore_state(self, state: Mapping[str, object]) -> None:
+        """Atomically restore validated paper state without fills or PnL actions."""
+        balance, equity, ticks, positions, statuses, correlations, reverse = (
+            _parse_paper_broker_state(state)
+        )
+        with self._lock:
+            self._balance = balance
+            self._equity = equity
+            self._latest_ticks = ticks
+            self._positions = positions
+            self._statuses = statuses
+            self._correlations = correlations
+            self._client_by_broker_id = reverse
+            self._close_events = []
+            self._cost_models = {}
+            self._connected = False
+            self._subscriptions = set()
+
     def get_historical_bars(self, symbol: str, tf: str, count: int) -> pd.DataFrame:
         """Return only bars proven closed by the latest accepted replay tick."""
         canonical = _canonical_symbol(symbol)
@@ -413,6 +490,151 @@ class PaperBroker:
         if not math.isfinite(converted):
             raise ValueError("paper account equity must remain finite")
         self._equity = converted
+
+
+def _parse_paper_broker_state(state: Mapping[str, object]) -> tuple:
+    if not isinstance(state, Mapping):
+        raise ValueError("paper-broker state must be a mapping")
+    balance, expected_equity = state.get("balance"), state.get("equity")
+    if not _finite_number(balance) or not _finite_number(expected_equity):
+        raise ValueError("invalid paper account state")
+    ticks_raw, positions_raw = state.get("latest_ticks"), state.get("positions")
+    statuses_raw, correlations_raw = state.get("statuses"), state.get("correlations")
+    if not isinstance(ticks_raw, list) or not isinstance(positions_raw, list):
+        raise ValueError("paper ticks and positions must be lists")
+    if not isinstance(statuses_raw, Mapping) or not isinstance(correlations_raw, list):
+        raise ValueError("paper order state is malformed")
+    ticks: dict[str, Tick] = {}
+    for raw in ticks_raw:
+        if not isinstance(raw, Mapping):
+            raise ValueError("invalid persisted tick")
+        if not isinstance(raw.get("symbol"), str) or not raw.get("symbol"):
+            raise ValueError("invalid persisted tick")
+        try:
+            tick = Tick(
+                str(raw["symbol"]),
+                datetime.fromisoformat(str(raw["timestamp"])),
+                float(raw["bid"]),
+                float(raw["ask"]),
+                float(raw["mid"]),
+            )
+            _validate_tick(tick)
+        except Exception as exc:
+            raise ValueError("invalid persisted tick") from exc
+        symbol = _canonical_symbol(tick.symbol)
+        if symbol in ticks:
+            raise ValueError("duplicate persisted tick symbol")
+        ticks[symbol] = tick
+    positions: dict[str, _PaperPosition] = {}
+    for raw in positions_raw:
+        if not isinstance(raw, Mapping):
+            raise ValueError("invalid persisted position")
+        if (
+            not isinstance(raw.get("symbol"), str)
+            or not raw.get("symbol")
+            or isinstance(raw.get("side"), bool)
+            or not isinstance(raw.get("side"), int)
+            or not isinstance(raw.get("position_id"), str)
+            or not isinstance(raw.get("client_entry_order_id"), str)
+            or not isinstance(raw.get("broker_entry_order_id"), str)
+        ):
+            raise ValueError("invalid persisted position")
+        try:
+            position = Position(
+                symbol=str(raw["symbol"]),
+                side=int(raw["side"]),
+                size=float(raw["size"]),
+                entry_price=float(raw["entry_price"]),
+                entry_time=datetime.fromisoformat(str(raw["entry_time"])),
+                unrealized_pnl=float(raw["unrealized_pnl"]),
+                position_id=str(raw["position_id"]),
+            )
+            client_id, broker_id = str(raw["client_entry_order_id"]), str(
+                raw["broker_entry_order_id"]
+            )
+        except Exception as exc:
+            raise ValueError("invalid persisted position") from exc
+        if (
+            not position.position_id
+            or position.position_id in positions
+            or not client_id
+            or not broker_id
+            or not _positive_finite(position.entry_price)
+            or not math.isfinite(position.unrealized_pnl)
+            or position.entry_time.tzinfo is None
+            or any(
+                value is not None and not _positive_finite(value)
+                for value in (raw.get("sl_price"), raw.get("tp_price"))
+            )
+        ):
+            raise ValueError("invalid persisted position")
+        positions[position.position_id] = _PaperPosition(
+            position,
+            client_id,
+            broker_id,
+            raw.get("sl_price"),
+            raw.get("tp_price"),
+        )
+    statuses: dict[str, OrderStatus] = {}
+    try:
+        for key, value in statuses_raw.items():
+            if not isinstance(key, str) or not key or key in statuses:
+                raise ValueError
+            statuses[key] = OrderStatus(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid persisted statuses") from exc
+    correlations: dict[str, OrderCorrelation] = {}
+    reverse: dict[str, str] = {}
+    for raw in correlations_raw:
+        if not isinstance(raw, Mapping):
+            raise ValueError("invalid persisted correlation")
+        if any(
+            not isinstance(raw.get(key), str) or not raw.get(key)
+            for key in ("client_order_id", "broker_order_id", "position_id")
+        ):
+            raise ValueError("invalid persisted correlation")
+        try:
+            item = OrderCorrelation(
+                str(raw["client_order_id"]),
+                str(raw["broker_order_id"]),
+                str(raw["position_id"]),
+            )
+        except KeyError as exc:
+            raise ValueError("invalid persisted correlation") from exc
+        if (
+            not all((item.client_order_id, item.broker_order_id, item.position_id))
+            or item.client_order_id in correlations
+            or item.broker_order_id in reverse
+            or item.broker_order_id not in statuses
+        ):
+            raise ValueError("invalid persisted correlation")
+        correlations[item.client_order_id] = item
+        reverse[item.broker_order_id] = item.client_order_id
+    for item in positions.values():
+        correlation = correlations.get(item.client_entry_order_id)
+        if (
+            correlation is None
+            or correlation.broker_order_id != item.broker_entry_order_id
+            or correlation.position_id != item.position.position_id
+            or item.position.symbol not in ticks
+        ):
+            raise ValueError("persisted position correlation is inconsistent")
+    equity = float(Decimal(str(balance)) + sum(
+        (Decimal(str(item.position.unrealized_pnl)) for item in positions.values()),
+        start=Decimal(0),
+    ))
+    if not math.isfinite(equity) or equity != float(expected_equity):
+        raise ValueError("persisted paper equity is inconsistent")
+    return float(balance), equity, ticks, positions, statuses, correlations, reverse
+
+
+def _finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, TypeError, ValueError):
+        return False
 
 
 def _copy_position(position: Position) -> Position:

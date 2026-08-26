@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from enum import StrEnum
@@ -247,6 +248,59 @@ class RiskEngine:
             return False
         with self._lock:
             return self._approval_reservations.pop(order_id, None) is not None
+
+    def snapshot_state(self) -> dict[str, object]:
+        """Return a primitive, side-effect-free recovery snapshot."""
+        with self._lock:
+            return {
+                "kill_switch_active": self._kill_switch_active,
+                "kill_switch_reason": self._kill_switch_reason.value
+                if self._kill_switch_reason
+                else None,
+                "consecutive_losses": self._consecutive_losses,
+                "daily_trades": self._daily_trades,
+                "last_reset_date": self._last_reset_date.isoformat()
+                if self._last_reset_date
+                else None,
+                "daily_start_equity": self._daily_start_equity,
+                "peak_equity": self._peak_equity,
+                "approved_order_ids": sorted(self._approved_order_ids),
+                "reservations": [
+                    {"order_id": key, "symbol": item.symbol, "size_lots": str(item.size_lots)}
+                    for key, item in sorted(self._approval_reservations.items())
+                ],
+            }
+
+    def configuration_snapshot(self, symbols: list[str] | None = None) -> dict[str, object]:
+        snapshot: dict[str, object] = {
+            "limits": asdict(self.limits),
+            "lot_step": self.lot_step,
+            "pip_value_per_lot": self.pip_value_per_lot,
+        }
+        if symbols is not None:
+            if self.pip_size_resolver is None:
+                raise ValueError("pip-size resolver is required for configuration identity")
+            snapshot["pip_sizes"] = {
+                symbol: float(self.pip_size_resolver.pip_size_for(symbol))
+                for symbol in sorted(set(symbols))
+            }
+        return snapshot
+
+    def restore_state(self, state: Mapping[str, object]) -> None:
+        """Atomically install validated state without invoking trading behavior."""
+        parsed = _parse_risk_state(state)
+        with self._lock:
+            (
+                self._kill_switch_active,
+                self._kill_switch_reason,
+                self._consecutive_losses,
+                self._daily_trades,
+                self._last_reset_date,
+                self._daily_start_equity,
+                self._peak_equity,
+                self._approved_order_ids,
+                self._approval_reservations,
+            ) = parsed
 
     def evaluate(
         self,
@@ -613,6 +667,84 @@ def _aware_utc(value: object) -> datetime | None:
 
 def _valid_token(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip()) and bool(_TOKEN_PATTERN.fullmatch(value))
+
+
+def _parse_risk_state(state: Mapping[str, object]) -> tuple:
+    if not isinstance(state, Mapping):
+        raise ValueError("risk state must be a mapping")
+    active = state.get("kill_switch_active")
+    reason_raw = state.get("kill_switch_reason")
+    if not isinstance(active, bool):
+        raise ValueError("invalid kill-switch state")
+    try:
+        reason = KillSwitchReason(reason_raw) if reason_raw is not None else None
+    except ValueError as exc:
+        raise ValueError("invalid kill-switch reason") from exc
+    if active != (reason is not None):
+        raise ValueError("kill-switch active/reason mismatch")
+    losses, trades = state.get("consecutive_losses"), state.get("daily_trades")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in (losses, trades)
+    ):
+        raise ValueError("risk counters must be non-negative integers")
+    date_raw = state.get("last_reset_date")
+    if date_raw is not None and not isinstance(date_raw, str):
+        raise ValueError("invalid reset date")
+    try:
+        reset_date = date.fromisoformat(date_raw) if isinstance(date_raw, str) else None
+    except ValueError as exc:
+        raise ValueError("invalid reset date") from exc
+    daily, peak = state.get("daily_start_equity"), state.get("peak_equity")
+    for value in (daily, peak):
+        if value is not None and not _is_positive_finite(value):
+            raise ValueError("risk equity baselines must be positive and finite")
+    if reset_date is None and (daily is not None or trades != 0):
+        raise ValueError("daily state requires a reset date")
+    if reset_date is not None and daily is None:
+        raise ValueError("reset date requires daily-start equity")
+    approved_raw, reservations_raw = (
+        state.get("approved_order_ids"),
+        state.get("reservations"),
+    )
+    if not isinstance(approved_raw, list) or not isinstance(reservations_raw, list):
+        raise ValueError("risk IDs and reservations must be lists")
+    approved: set[str] = set()
+    for item in approved_raw:
+        if not isinstance(item, str) or not item.strip() or item in approved:
+            raise ValueError("invalid approved order ID")
+        approved.add(item)
+    reservations: dict[str, _ApprovalReservation] = {}
+    for item in reservations_raw:
+        if not isinstance(item, Mapping):
+            raise ValueError("invalid approval reservation")
+        order_id, symbol = item.get("order_id"), item.get("symbol")
+        try:
+            size = Decimal(str(item.get("size_lots")))
+        except InvalidOperation as exc:
+            raise ValueError("invalid reservation size") from exc
+        if (
+            not isinstance(order_id, str)
+            or order_id not in approved
+            or order_id in reservations
+            or not isinstance(symbol, str)
+            or not _canonical_symbol(symbol)
+            or not size.is_finite()
+            or size <= 0
+        ):
+            raise ValueError("invalid approval reservation")
+        reservations[order_id] = _ApprovalReservation(_canonical_symbol(symbol), size)
+    return (
+        active,
+        reason,
+        losses,
+        trades,
+        reset_date,
+        float(daily) if daily is not None else None,
+        float(peak) if peak is not None else None,
+        approved,
+        reservations,
+    )
 
 
 def _canonical_symbol(symbol: str) -> str:

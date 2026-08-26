@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
+import struct
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -79,11 +81,14 @@ class HistoricalBarReplay:
     _events: tuple[Tick, ...] = field(init=False, repr=False)
     _cursor: int = field(default=0, init=False)
     _stopped: bool = field(default=False, init=False)
+    _dataset_fingerprint: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         delta = timeframe_to_timedelta(self.timeframe)
+        digest = hashlib.sha256(b"fxlab-replay-dataset-v1\0")
+        digest.update(self.timeframe.encode("utf-8") + b"\0")
         events: list[Tick] = []
-        for raw_symbol, raw_bars in self.bars_by_symbol.items():
+        for raw_symbol, raw_bars in sorted(self.bars_by_symbol.items()):
             symbol = raw_symbol.strip().upper()
             if not symbol or not isinstance(raw_bars, pd.DataFrame):
                 raise ValueError("replay requires non-empty symbols and DataFrames")
@@ -98,6 +103,12 @@ class HistoricalBarReplay:
             missing = [column for column in OHLCV if column not in bars.columns]
             if missing:
                 raise ValueError(f"replay bars missing columns: {missing}")
+            digest.update(symbol.encode("utf-8") + b"\0")
+            digest.update(struct.pack("!Q", len(bars)))
+            for timestamp, values in zip(bars.index, bars[OHLCV].to_numpy(), strict=True):
+                digest.update(struct.pack("!q", int(timestamp.value)))
+                for value in values:
+                    digest.update(struct.pack("!d", float(value)))
             for ts_open, row in bars.sort_index().iterrows():
                 close = _positive_float(row["close"])
                 if close is None:
@@ -106,10 +117,15 @@ class HistoricalBarReplay:
                 events.append(Tick(symbol, timestamp, close, close, close))
         events.sort(key=lambda tick: (tick.timestamp.astimezone(UTC), tick.symbol))
         self._events = tuple(events)
+        self._dataset_fingerprint = digest.hexdigest()
 
     @property
     def exhausted(self) -> bool:
         return self._cursor >= len(self._events)
+
+    @property
+    def dataset_fingerprint(self) -> str:
+        return self._dataset_fingerprint
 
     def next_tick(self, *, until: datetime | None = None) -> Tick | None:
         if self._stopped or self.exhausted:
@@ -126,6 +142,32 @@ class HistoricalBarReplay:
     def stop(self) -> None:
         self._stopped = True
 
+    def snapshot_state(self) -> dict[str, object]:
+        last = self._events[self._cursor - 1].timestamp if self._cursor else None
+        return {
+            "cursor": self._cursor,
+            "last_consumed_timestamp": last.astimezone(UTC).isoformat() if last else None,
+        }
+
+    def restore_state(self, state: Mapping[str, object]) -> None:
+        if not isinstance(state, Mapping):
+            raise ValueError("replay state must be a mapping")
+        cursor, timestamp = state.get("cursor"), state.get("last_consumed_timestamp")
+        if (
+            isinstance(cursor, bool)
+            or not isinstance(cursor, int)
+            or not 0 <= cursor <= len(self._events)
+        ):
+            raise ValueError("invalid replay cursor")
+        expected = self._events[cursor - 1].timestamp.astimezone(UTC) if cursor else None
+        parsed = datetime.fromisoformat(timestamp) if isinstance(timestamp, str) else None
+        if parsed is not None:
+            parsed = parsed.astimezone(UTC)
+        if parsed != expected:
+            raise ValueError("replay cursor/timestamp mismatch")
+        self._cursor = cursor
+        self._stopped = False
+
 
 @dataclass
 class PaperTradingSession:
@@ -139,10 +181,12 @@ class PaperTradingSession:
     risk_engine: RiskEngine
     execution_policy: ExecutionPolicy
     event_ledger: EventLedger
+    runtime_id: str = "runtime-1"
 
     _started: bool = field(default=False, init=False)
     _stopped: bool = field(default=False, init=False)
     _audit_failed: bool = field(default=False, init=False)
+    _recovery_required: bool = field(default=False, init=False)
     _tracked_orders: set[str] = field(default_factory=set, init=False)
     _position_correlations: dict[str, EventCorrelation] = field(
         default_factory=dict, init=False
@@ -158,10 +202,14 @@ class PaperTradingSession:
             self.order_manager.event_ledger = self.event_ledger
         elif self.order_manager.event_ledger is not self.event_ledger:
             raise ValueError("session and order manager must share one EventLedger")
+        if not isinstance(self.runtime_id, str) or not self.runtime_id.strip():
+            raise ValueError("runtime_id must be a non-empty string")
 
     def start(self) -> None:
         if self._started:
             return
+        if self._recovery_required:
+            raise RuntimeError("reconciliation is required before session start")
         if self._stopped:
             raise RuntimeError("a stopped paper session cannot be restarted")
         self.broker.connect()
@@ -175,7 +223,7 @@ class PaperTradingSession:
                 AuditEventType.SESSION_STARTED,
                 occurred_at=self.event_ledger.now(),
                 component=AuditComponent.PAPER_SESSION,
-                payload={},
+                payload={"runtime_id": self.runtime_id},
             )
         except AuditLedgerError:
             self.broker.disconnect()
@@ -199,7 +247,7 @@ class PaperTradingSession:
     def _poll_once(self, *, until: datetime | None = None) -> PaperCycleResult:
         if not self._started or self._stopped:
             return _cycle_failure("session_not_running", "paper session is not running")
-        if self._audit_failed or self.order_manager.audit_failed:
+        if self._audit_failed or self.order_manager.audit_failed or self._recovery_required:
             return _cycle_failure(
                 "audit_unavailable", "audit integrity is unavailable; execution is disabled"
             )
@@ -423,6 +471,48 @@ class PaperTradingSession:
             self.broker.disconnect()
         self._stopped = True
 
+    @property
+    def recovery_required(self) -> bool:
+        return self._recovery_required
+
+    def snapshot_state(self) -> dict[str, object]:
+        return {
+            "audit_failed": self._audit_failed,
+            "recovery_required": self._recovery_required,
+            "tracked_orders": sorted(self._tracked_orders),
+            "position_correlations": [
+                {
+                    "position_id": key,
+                    "signal_id": item.signal_id,
+                    "client_order_id": item.client_order_id,
+                    "broker_order_id": item.broker_order_id,
+                    "close_order_id": item.close_order_id,
+                }
+                for key, item in sorted(self._position_correlations.items())
+            ],
+            "reported_reconciliation_failures": sorted(
+                self._reported_reconciliation_failures
+            ),
+        }
+
+    def restore_state(self, state: Mapping[str, object]) -> None:
+        parsed = _parse_session_state(state)
+        (
+            self._audit_failed,
+            self._recovery_required,
+            self._tracked_orders,
+            self._position_correlations,
+            self._reported_reconciliation_failures,
+        ) = parsed
+        self._started = False
+        self._stopped = False
+
+    def require_reconciliation(self) -> None:
+        self._recovery_required = True
+        self.risk_engine.trigger_kill_switch(
+            KillSwitchReason.POSITION_RECONCILIATION_FAILED
+        )
+
     def _refresh_and_reconcile(self, current_time: datetime) -> list[ExecutionResult]:
         results: list[ExecutionResult] = []
         for client_id in tuple(sorted(self._tracked_orders)):
@@ -604,6 +694,39 @@ class PaperTradingSession:
             )
         except AuditLedgerError:
             pass
+
+
+def _parse_session_state(state: Mapping[str, object]) -> tuple:
+    if not isinstance(state, Mapping):
+        raise ValueError("session state must be a mapping")
+    audit, recovery = state.get("audit_failed"), state.get("recovery_required")
+    tracked, failures = state.get("tracked_orders"), state.get(
+        "reported_reconciliation_failures"
+    )
+    raw_correlations = state.get("position_correlations")
+    if not isinstance(audit, bool) or not isinstance(recovery, bool):
+        raise ValueError("invalid session flags")
+    if not isinstance(tracked, list) or not isinstance(failures, list):
+        raise ValueError("invalid session order collections")
+    if any(not isinstance(item, str) or not item for item in tracked + failures):
+        raise ValueError("invalid session order identity")
+    if not isinstance(raw_correlations, list):
+        raise ValueError("invalid session correlations")
+    correlations: dict[str, EventCorrelation] = {}
+    for raw in raw_correlations:
+        if not isinstance(raw, Mapping):
+            raise ValueError("invalid session correlation")
+        position_id = raw.get("position_id")
+        if not isinstance(position_id, str) or not position_id or position_id in correlations:
+            raise ValueError("invalid session position identity")
+        correlations[position_id] = EventCorrelation(
+            signal_id=raw.get("signal_id"),
+            client_order_id=raw.get("client_order_id"),
+            broker_order_id=raw.get("broker_order_id"),
+            position_id=position_id,
+            close_order_id=raw.get("close_order_id"),
+        )
+    return audit, recovery, set(tracked), correlations, set(failures)
 
 
 def _positive_float(value: object) -> float | None:

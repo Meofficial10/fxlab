@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -465,6 +466,34 @@ class OrderManager:
         with self._lock:
             return self._records.get(client_order_id)
 
+    def snapshot_state(self) -> dict[str, object]:
+        """Return primitive order state without polling or submitting."""
+        with self._lock:
+            return {
+                "audit_failed": self._audit_failed,
+                "records": [
+                    {
+                        "client_order_id": record.client_order_id,
+                        "broker_order_id": record.broker_order_id,
+                        "status": record.status.value,
+                        "reservation_released": record.reservation_released,
+                        "request": _request_payload(record.request)
+                        | {
+                            "order_id": record.request.order_id,
+                            "price": record.request.price,
+                        },
+                    }
+                    for _, record in sorted(self._records.items())
+                ],
+            }
+
+    def restore_state(self, state: Mapping[str, object]) -> None:
+        """Atomically restore validated records without broker operations."""
+        records, audit_failed = _parse_order_manager_state(state)
+        with self._lock:
+            self._records = records
+            self._audit_failed = audit_failed
+
     def _audit(
         self,
         event_type: AuditEventType,
@@ -730,6 +759,60 @@ def _request_payload(request: OrderRequest) -> dict[str, object]:
         "sl_price": request.sl_price,
         "tp_price": request.tp_price,
     }
+
+
+def _parse_order_manager_state(
+    state: Mapping[str, object],
+) -> tuple[dict[str, OrderRecord], bool]:
+    if not isinstance(state, Mapping) or not isinstance(state.get("audit_failed"), bool):
+        raise ValueError("invalid order-manager state")
+    raw_records = state.get("records")
+    if not isinstance(raw_records, list):
+        raise ValueError("order-manager records must be a list")
+    records: dict[str, OrderRecord] = {}
+    for raw in raw_records:
+        if not isinstance(raw, Mapping) or not isinstance(raw.get("request"), Mapping):
+            raise ValueError("invalid order record")
+        request_raw = raw["request"]
+        if (
+            not isinstance(request_raw.get("symbol"), str)
+            or not request_raw.get("symbol")
+            or isinstance(request_raw.get("side"), bool)
+            or not isinstance(request_raw.get("side"), int)
+            or request_raw.get("side") not in (1, -1)
+            or not _positive_finite(request_raw.get("size"))
+            or not isinstance(request_raw.get("order_type"), str)
+            or not isinstance(request_raw.get("order_id"), str)
+        ):
+            raise ValueError("invalid persisted order request")
+        try:
+            request = OrderRequest(
+                symbol=request_raw["symbol"],
+                side=request_raw["side"],
+                size=request_raw["size"],
+                order_type=request_raw["order_type"],
+                order_id=request_raw["order_id"],
+                price=request_raw.get("price"),
+                sl_price=request_raw.get("sl_price"),
+                tp_price=request_raw.get("tp_price"),
+            )
+            client_id = raw["client_order_id"]
+            broker_id = raw.get("broker_order_id")
+            status = OrderStatus(raw["status"])
+            released = raw["reservation_released"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid order record") from exc
+        if (
+            not isinstance(client_id, str)
+            or not client_id.strip()
+            or client_id != request.order_id
+            or client_id in records
+            or (broker_id is not None and (not isinstance(broker_id, str) or not broker_id.strip()))
+            or not isinstance(released, bool)
+        ):
+            raise ValueError("invalid order record identity")
+        records[client_id] = OrderRecord(client_id, broker_id, request, status, released)
+    return records, bool(state["audit_failed"])
 
 
 def _failure(kind: ExecutionResultKind, reason: str, message: str) -> ExecutionResult:
