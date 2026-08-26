@@ -20,6 +20,11 @@ from fxlab.execution.broker import (
     OrderStatus,
     Tick,
 )
+from fxlab.execution.broker_capabilities import (
+    BrokerCapability,
+    BrokerDescriptor,
+    BrokerEnvironment,
+)
 from fxlab.execution.event_ledger import AuditEventType, EventLedger
 from fxlab.execution.signal_engine import SignalEvent
 from fxlab.risk import (
@@ -99,6 +104,23 @@ class FakeBroker:
         self.status_result: object = {"status": "pending"}
         self.submitted: list[OrderRequest] = []
         self.status_queries: list[str] = []
+
+    @property
+    def broker_descriptor(self) -> BrokerDescriptor:
+        return BrokerDescriptor(
+            "fake-broker",
+            "1",
+            BrokerEnvironment.PAPER,
+            frozenset(
+                {
+                    BrokerCapability.MARKET_ORDERS,
+                    BrokerCapability.NATIVE_SL_TP,
+                    BrokerCapability.HEDGING,
+                    BrokerCapability.CLIENT_ORDER_IDS,
+                }
+            ),
+            True,
+        )
 
     def get_latest_tick(self, symbol: str) -> Tick | None:
         if self.tick_error is not None:

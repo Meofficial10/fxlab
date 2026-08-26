@@ -11,6 +11,10 @@ from threading import Lock
 
 from ..risk.engine import KillSwitchReason, RiskDecision, RiskEngine, RiskRejection
 from .broker import BrokerAdapter, OrderRequest, OrderStatus, Tick
+from .broker_capabilities import (
+    CURRENT_ORDER_MANAGER_REQUIREMENTS,
+    inspect_broker_capabilities,
+)
 from .event_ledger import (
     AuditComponent,
     AuditEventType,
@@ -106,6 +110,40 @@ class OrderManager:
                 ExecutionResultKind.EXECUTION_REJECTED,
                 "invalid_current_time",
                 "current_time must be timezone-aware",
+            )
+
+        capability_check = inspect_broker_capabilities(
+            self.broker,
+            CURRENT_ORDER_MANAGER_REQUIREMENTS,
+            require_hedging=True,
+        )
+        if not capability_check.compatible:
+            descriptor = capability_check.descriptor
+            if not self._audit(
+                AuditEventType.BROKER_CAPABILITY_REJECTED,
+                occurred_at=current_utc,
+                component=AuditComponent.BROKER_ADAPTER,
+                correlation=_signal_correlation(intent.signal),
+                payload={
+                    "reason": capability_check.reason,
+                    "required_capabilities": tuple(
+                        item.value for item in capability_check.required
+                    ),
+                    "missing_capabilities": tuple(
+                        item.value for item in capability_check.missing
+                    ),
+                    "broker_id": descriptor.broker_id if descriptor else None,
+                },
+            ):
+                return _failure(
+                    ExecutionResultKind.EXECUTION_REJECTED,
+                    "audit_failure_before_submission",
+                    "broker capability rejection could not be audited",
+                )
+            return _failure(
+                ExecutionResultKind.EXECUTION_REJECTED,
+                capability_check.reason,
+                "broker capabilities are incompatible with current execution semantics",
             )
 
         quote_result = self._current_entry_price(intent.signal, current_utc)

@@ -8,6 +8,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from fxlab.execution.broker_capabilities import (
+    BrokerCapability,
+    BrokerDescriptor,
+    BrokerEnvironment,
+)
 from fxlab.execution.durable_event_store import SQLiteEventStore
 from fxlab.execution.event_ledger import AuditComponent, AuditEventType, EventLedger
 from fxlab.execution.market_data import MarketDataStream
@@ -355,3 +360,69 @@ def test_recovery_does_not_invoke_policy(tmp_path) -> None:
     )
     assert result.recovered
     assert calls == 0
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "broker_id",
+        "implementation_version",
+        "demo",
+        "live",
+        "capability_removed",
+        "capability_added",
+        "netting",
+        "non_deterministic",
+    ],
+)
+def test_recovery_rejects_broker_capability_identity_changes(
+    tmp_path, monkeypatch, change
+) -> None:
+    path, _, store, _ = checkpoint_live_session(tmp_path)
+    store.close()
+    restored, reopened = make_session(path)
+    base = restored.broker.broker_descriptor
+    broker_id = "different-paper" if change == "broker_id" else base.broker_id
+    version = "2" if change == "implementation_version" else base.implementation_version
+    environment = (
+        BrokerEnvironment.DEMO
+        if change == "demo"
+        else BrokerEnvironment.LIVE
+        if change == "live"
+        else base.environment
+    )
+    capabilities = set(base.capabilities)
+    if change == "capability_removed":
+        capabilities.remove(BrokerCapability.NATIVE_SL_TP)
+    if change == "capability_added":
+        capabilities.add(BrokerCapability.LIMIT_ORDERS)
+    if change == "netting":
+        capabilities.remove(BrokerCapability.HEDGING)
+        capabilities.add(BrokerCapability.NETTING)
+    replacement = BrokerDescriptor(
+        broker_id,
+        version,
+        environment,
+        frozenset(capabilities),
+        change != "non_deterministic",
+    )
+    monkeypatch.setattr(
+        PaperBroker, "broker_descriptor", property(lambda self: replacement)
+    )
+    result = recover(
+        restored, reopened, software_version="1.0", execution_policy_id="policy-v1"
+    )
+    assert result.state is RecoveryState.FAILED
+    assert result.reason == "configuration_mismatch"
+
+
+def test_broker_connection_state_does_not_change_recovery_identity(tmp_path) -> None:
+    path, original, store, _ = checkpoint_live_session(tmp_path)
+    assert original.broker.is_connected()
+    store.close()
+    restored, reopened = make_session(path)
+    assert not restored.broker.is_connected()
+    result = recover(
+        restored, reopened, software_version="1.0", execution_policy_id="policy-v1"
+    )
+    assert result.recovered

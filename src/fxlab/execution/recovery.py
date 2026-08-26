@@ -244,6 +244,8 @@ def _validate_safe_point(
         ]:
             raise UnsafeCheckpointError("filled_position_not_reflected")
     session_state = session.snapshot_state()
+    if session_state["capability_failed"]:
+        raise UnsafeCheckpointError("broker_capability_failed")
     if session_state["tracked_orders"]:
         raise UnsafeCheckpointError("unresolved_submission")
     risk_state = session.risk_engine.snapshot_state()

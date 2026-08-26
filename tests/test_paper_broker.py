@@ -105,6 +105,16 @@ def test_connection_lifecycle_and_protocol() -> None:
     assert not broker.is_connected()
 
 
+def test_descriptor_stable_after_order_and_position_close() -> None:
+    broker = connected_broker()
+    descriptor = broker.broker_descriptor
+    broker.accept_tick(tick())
+    broker.submit_order(order())
+    position_id = broker.get_account_info().open_positions[0].position_id
+    broker.close_position(position_id)
+    assert broker.broker_descriptor is descriptor
+
+
 def test_accept_tick_requires_connection_and_subscription() -> None:
     broker = PaperBroker()
     with pytest.raises(RuntimeError):

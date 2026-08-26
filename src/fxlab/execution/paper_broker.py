@@ -16,6 +16,26 @@ from ..config import CostConfig
 from ..costs.model import CostModel
 from ..data.schema import OHLCV, timeframe_to_timedelta
 from .broker import AccountInfo, OrderRequest, OrderStatus, Position, Tick
+from .broker_capabilities import (
+    BrokerCapability,
+    BrokerDescriptor,
+    BrokerEnvironment,
+)
+
+_PAPER_BROKER_DESCRIPTOR = BrokerDescriptor(
+    broker_id="fxlab-paper",
+    implementation_version="1",
+    environment=BrokerEnvironment.PAPER,
+    capabilities=frozenset(
+        {
+            BrokerCapability.MARKET_ORDERS,
+            BrokerCapability.NATIVE_SL_TP,
+            BrokerCapability.HEDGING,
+            BrokerCapability.CLIENT_ORDER_IDS,
+        }
+    ),
+    deterministic=True,
+)
 
 
 @dataclass(frozen=True)
@@ -129,6 +149,11 @@ class PaperBroker:
     def connect(self) -> None:
         with self._lock:
             self._connected = True
+
+    @property
+    def broker_descriptor(self) -> BrokerDescriptor:
+        """Return the immutable capability declaration for this adapter."""
+        return _PAPER_BROKER_DESCRIPTOR
 
     def disconnect(self) -> None:
         with self._lock:
@@ -323,6 +348,7 @@ class PaperBroker:
 
     def configuration_snapshot(self, symbols: list[str]) -> dict[str, object]:
         return {
+            "broker_descriptor": self.broker_descriptor.compatibility_snapshot(),
             "initial_balance": self.initial_balance,
             "pip_value_per_lot": self.pip_value_per_lot,
             "cost_config": self._cost_config.model_dump(mode="json"),

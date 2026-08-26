@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import struct
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -18,6 +19,12 @@ from ..data.provider import ProvenanceQuality
 from ..data.schema import OHLCV, timeframe_to_timedelta
 from ..risk.engine import KillSwitchReason, RiskEngine
 from .broker import AccountInfo, OrderStatus, Tick
+from .broker_capabilities import (
+    CURRENT_PAPER_SESSION_REQUIREMENTS,
+    BrokerDescriptor,
+    BrokerEnvironment,
+    inspect_broker_capabilities,
+)
 from .event_ledger import (
     AuditComponent,
     AuditEventType,
@@ -229,6 +236,8 @@ class PaperTradingSession:
     _stopped: bool = field(default=False, init=False)
     _audit_failed: bool = field(default=False, init=False)
     _recovery_required: bool = field(default=False, init=False)
+    _capability_failed: bool = field(default=False, init=False)
+    _broker_descriptor_fingerprint: str | None = field(default=None, init=False)
     _tracked_orders: set[str] = field(default_factory=set, init=False)
     _position_correlations: dict[str, EventCorrelation] = field(
         default_factory=dict, init=False
@@ -254,6 +263,28 @@ class PaperTradingSession:
             raise RuntimeError("reconciliation is required before session start")
         if self._stopped:
             raise RuntimeError("a stopped paper session cannot be restarted")
+        capability_check = inspect_broker_capabilities(
+            self.broker,
+            CURRENT_PAPER_SESSION_REQUIREMENTS,
+            environment=BrokerEnvironment.PAPER,
+            deterministic=True,
+            require_hedging=True,
+        )
+        descriptor = capability_check.descriptor
+        changed = (
+            descriptor is not None
+            and self._broker_descriptor_fingerprint is not None
+            and descriptor.fingerprint != self._broker_descriptor_fingerprint
+        )
+        if not capability_check.compatible or changed:
+            self._capability_failed = True
+            self._record_capability_rejection(
+                capability_check.reason if not changed else "broker_descriptor_changed",
+                capability_check,
+                self.event_ledger.now(),
+            )
+            raise RuntimeError("broker capabilities are incompatible with paper session")
+        assert isinstance(descriptor, BrokerDescriptor)
         self.broker.connect()
         try:
             self.market_data.start()
@@ -267,6 +298,14 @@ class PaperTradingSession:
                 component=AuditComponent.PAPER_SESSION,
                 payload={"runtime_id": self.runtime_id},
             )
+            if self._broker_descriptor_fingerprint is None:
+                self._append(
+                    AuditEventType.BROKER_CAPABILITIES_BOUND,
+                    occurred_at=self.event_ledger.now(),
+                    component=AuditComponent.BROKER_ADAPTER,
+                    payload=descriptor.compatibility_snapshot(),
+                )
+                self._broker_descriptor_fingerprint = descriptor.fingerprint
             self._append(
                 AuditEventType.DATA_PROVIDER_SELECTED,
                 occurred_at=self.event_ledger.now(),
@@ -318,6 +357,11 @@ class PaperTradingSession:
         if self._audit_failed or self.order_manager.audit_failed or self._recovery_required:
             return _cycle_failure(
                 "audit_unavailable", "audit integrity is unavailable; execution is disabled"
+            )
+        if not self._verify_broker_descriptor():
+            return _cycle_failure(
+                "broker_capability_unsupported",
+                "broker capability declaration changed; execution is disabled",
             )
         try:
             tick = self.replay.next_tick(until=until)
@@ -550,6 +594,8 @@ class PaperTradingSession:
         return {
             "audit_failed": self._audit_failed,
             "recovery_required": self._recovery_required,
+            "capability_failed": self._capability_failed,
+            "broker_descriptor_fingerprint": self._broker_descriptor_fingerprint,
             "tracked_orders": sorted(self._tracked_orders),
             "position_correlations": [
                 {
@@ -571,12 +617,55 @@ class PaperTradingSession:
         (
             self._audit_failed,
             self._recovery_required,
+            self._capability_failed,
+            self._broker_descriptor_fingerprint,
             self._tracked_orders,
             self._position_correlations,
             self._reported_reconciliation_failures,
         ) = parsed
         self._started = False
         self._stopped = False
+
+    def _verify_broker_descriptor(self) -> bool:
+        if self._capability_failed:
+            return False
+        check = inspect_broker_capabilities(
+            self.broker,
+            CURRENT_PAPER_SESSION_REQUIREMENTS,
+            environment=BrokerEnvironment.PAPER,
+            deterministic=True,
+            require_hedging=True,
+        )
+        descriptor = check.descriptor
+        valid = (
+            check.compatible
+            and descriptor is not None
+            and descriptor.fingerprint == self._broker_descriptor_fingerprint
+        )
+        if valid:
+            return True
+        self._capability_failed = True
+        reason = check.reason if not check.compatible else "broker_descriptor_changed"
+        self._record_capability_rejection(reason, check, self.event_ledger.now())
+        return False
+
+    def _record_capability_rejection(
+        self, reason: str, check: object, occurred_at: datetime
+    ) -> None:
+        descriptor = getattr(check, "descriptor", None)
+        required = getattr(check, "required", ())
+        missing = getattr(check, "missing", ())
+        self._append(
+            AuditEventType.BROKER_CAPABILITY_REJECTED,
+            occurred_at=occurred_at,
+            component=AuditComponent.BROKER_ADAPTER,
+            payload={
+                "reason": reason,
+                "required_capabilities": tuple(item.value for item in required),
+                "missing_capabilities": tuple(item.value for item in missing),
+                "broker_id": descriptor.broker_id if descriptor else None,
+            },
+        )
 
     def require_reconciliation(self) -> None:
         self._recovery_required = True
@@ -771,12 +860,23 @@ def _parse_session_state(state: Mapping[str, object]) -> tuple:
     if not isinstance(state, Mapping):
         raise ValueError("session state must be a mapping")
     audit, recovery = state.get("audit_failed"), state.get("recovery_required")
+    capability_failed = state.get("capability_failed")
+    descriptor_fingerprint = state.get("broker_descriptor_fingerprint")
     tracked, failures = state.get("tracked_orders"), state.get(
         "reported_reconciliation_failures"
     )
     raw_correlations = state.get("position_correlations")
-    if not isinstance(audit, bool) or not isinstance(recovery, bool):
+    if (
+        not isinstance(audit, bool)
+        or not isinstance(recovery, bool)
+        or not isinstance(capability_failed, bool)
+    ):
         raise ValueError("invalid session flags")
+    if descriptor_fingerprint is not None and (
+        not isinstance(descriptor_fingerprint, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", descriptor_fingerprint)
+    ):
+        raise ValueError("invalid broker descriptor fingerprint")
     if not isinstance(tracked, list) or not isinstance(failures, list):
         raise ValueError("invalid session order collections")
     if any(not isinstance(item, str) or not item for item in tracked + failures):
@@ -797,7 +897,15 @@ def _parse_session_state(state: Mapping[str, object]) -> tuple:
             position_id=position_id,
             close_order_id=raw.get("close_order_id"),
         )
-    return audit, recovery, set(tracked), correlations, set(failures)
+    return (
+        audit,
+        recovery,
+        capability_failed,
+        descriptor_fingerprint,
+        set(tracked),
+        correlations,
+        set(failures),
+    )
 
 
 def _positive_float(value: object) -> float | None:

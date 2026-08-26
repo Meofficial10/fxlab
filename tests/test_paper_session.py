@@ -10,6 +10,11 @@ import pytest
 
 from fxlab.config import CostConfig, CostDefaults
 from fxlab.execution.broker import AccountInfo, Tick
+from fxlab.execution.broker_capabilities import (
+    BrokerCapability,
+    BrokerDescriptor,
+    BrokerEnvironment,
+)
 from fxlab.execution.event_ledger import AuditEventType, EventLedger
 from fxlab.execution.market_data import MarketDataStream
 from fxlab.execution.order_manager import ExecutionIntent, ExecutionResultKind, OrderManager
@@ -151,6 +156,90 @@ def test_start_poll_stop_and_idempotent_lifecycle() -> None:
     session.stop()
     assert not broker.is_connected()
     assert session.poll_once().reason == "session_not_running"
+
+
+def test_broker_capabilities_bind_once_per_logical_session() -> None:
+    session, _, _ = make_session(setup=NoSignalSetup())
+    session.start()
+    session.start()
+    bound = [
+        event
+        for event in session.event_ledger.events()
+        if event.event_type is AuditEventType.BROKER_CAPABILITIES_BOUND
+    ]
+    assert len(bound) == 1
+    assert bound[0].payload["broker_id"] == "fxlab-paper"
+    assert tuple(bound[0].payload["capabilities"]) == tuple(
+        sorted(item.value for item in session.broker.broker_descriptor.capabilities)
+    )
+
+
+@pytest.mark.parametrize(
+    "descriptor",
+    [
+        BrokerDescriptor(
+            "wrong-environment",
+            "1",
+            BrokerEnvironment.DEMO,
+            frozenset(
+                {
+                    BrokerCapability.MARKET_ORDERS,
+                    BrokerCapability.NATIVE_SL_TP,
+                    BrokerCapability.HEDGING,
+                    BrokerCapability.CLIENT_ORDER_IDS,
+                }
+            ),
+            True,
+        ),
+        BrokerDescriptor(
+            "non-deterministic",
+            "1",
+            BrokerEnvironment.PAPER,
+            frozenset(
+                {
+                    BrokerCapability.MARKET_ORDERS,
+                    BrokerCapability.NATIVE_SL_TP,
+                    BrokerCapability.HEDGING,
+                    BrokerCapability.CLIENT_ORDER_IDS,
+                }
+            ),
+            False,
+        ),
+    ],
+)
+def test_incompatible_broker_cannot_start(monkeypatch, descriptor) -> None:
+    session, _, broker = make_session(setup=NoSignalSetup())
+    monkeypatch.setattr(
+        PaperBroker, "broker_descriptor", property(lambda self: descriptor)
+    )
+    with pytest.raises(RuntimeError, match="capabilities"):
+        session.start()
+    assert not broker.is_connected()
+    assert session.event_ledger.last_event().event_type is (
+        AuditEventType.BROKER_CAPABILITY_REJECTED
+    )
+
+
+def test_descriptor_mutation_during_runtime_fails_closed(monkeypatch) -> None:
+    session, _, _ = make_session(setup=LatestSignalSetup())
+    session.start()
+    changed = BrokerDescriptor(
+        "fxlab-paper",
+        "2",
+        BrokerEnvironment.PAPER,
+        session.broker.broker_descriptor.capabilities,
+        True,
+    )
+    monkeypatch.setattr(
+        PaperBroker, "broker_descriptor", property(lambda self: changed)
+    )
+    result = session.poll_once()
+    assert result.kind is CycleKind.FAILED
+    assert result.reason == "broker_capability_unsupported"
+    assert not session.broker.get_account_info().open_positions
+    assert session.event_ledger.last_event().event_type is (
+        AuditEventType.BROKER_CAPABILITY_REJECTED
+    )
 
 
 def test_audit_lifecycle_market_and_account_ordering() -> None:

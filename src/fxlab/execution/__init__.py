@@ -3,6 +3,15 @@
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .broker_capabilities import (
+        BrokerCapability,
+        BrokerCapabilityProvider,
+        BrokerCompatibility,
+        BrokerDescriptor,
+        BrokerEnvironment,
+        inspect_broker_capabilities,
+        required_capabilities_for_order,
+    )
     from .durable_event_store import SQLiteEventStore, StoredCheckpoint
     from .event_ledger import (
         AuditComponent,
@@ -46,6 +55,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AuditComponent",
+    "BrokerCapability",
+    "BrokerCapabilityProvider",
+    "BrokerCompatibility",
+    "BrokerDescriptor",
+    "BrokerEnvironment",
     "AuditEvent",
     "AuditEventType",
     "AuditLedgerError",
@@ -79,12 +93,15 @@ __all__ = [
     "MarketContext",
     "PaperCycleResult",
     "PaperTradingSession",
+    "inspect_broker_capabilities",
+    "required_capabilities_for_order",
 ]
 
 
 def __getattr__(name: str) -> Any:
     if name in __all__:
         from . import (
+            broker_capabilities,
             durable_event_store,
             event_ledger,
             order_manager,
@@ -95,6 +112,7 @@ def __getattr__(name: str) -> Any:
         )
 
         for module in (
+            broker_capabilities,
             durable_event_store,
             event_ledger,
             order_manager,

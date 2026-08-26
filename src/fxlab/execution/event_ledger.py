@@ -47,6 +47,8 @@ class AuditEventType(StrEnum):
     DATA_PROVIDER_FALLBACK = "data_provider_fallback"
     DATA_STALE = "data_stale"
     DATASET_BOUND = "dataset_bound"
+    BROKER_CAPABILITIES_BOUND = "broker_capabilities_bound"
+    BROKER_CAPABILITY_REJECTED = "broker_capability_rejected"
     RUNTIME_FAILURE = "runtime_failure"
 
 
@@ -60,6 +62,7 @@ class AuditComponent(StrEnum):
     PAPER_BROKER = "paper_broker"
     RECONCILIATION_ENGINE = "reconciliation_engine"
     MARKET_DATA_PROVIDER = "market_data_provider"
+    BROKER_ADAPTER = "broker_adapter"
 
 
 class AuditLedgerError(RuntimeError):
