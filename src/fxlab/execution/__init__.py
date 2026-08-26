@@ -10,6 +10,15 @@ if TYPE_CHECKING:
         OrderManager,
         OrderRecord,
     )
+    from .paper_broker import OrderCorrelation, PaperBroker
+    from .paper_session import (
+        CycleKind,
+        ExecutionPolicy,
+        HistoricalBarReplay,
+        MarketContext,
+        PaperCycleResult,
+        PaperTradingSession,
+    )
 
 __all__ = [
     "ExecutionIntent",
@@ -17,12 +26,22 @@ __all__ = [
     "ExecutionResultKind",
     "OrderManager",
     "OrderRecord",
+    "OrderCorrelation",
+    "PaperBroker",
+    "CycleKind",
+    "ExecutionPolicy",
+    "HistoricalBarReplay",
+    "MarketContext",
+    "PaperCycleResult",
+    "PaperTradingSession",
 ]
 
 
 def __getattr__(name: str) -> Any:
     if name in __all__:
-        from . import order_manager
+        from . import order_manager, paper_broker, paper_session
 
-        return getattr(order_manager, name)
+        for module in (order_manager, paper_broker, paper_session):
+            if hasattr(module, name):
+                return getattr(module, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

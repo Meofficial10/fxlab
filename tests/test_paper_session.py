@@ -1,0 +1,267 @@
+"""Tests for deterministic Phase 6 historical paper-trading orchestration."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from fxlab.execution.broker import Tick
+from fxlab.execution.market_data import MarketDataStream
+from fxlab.execution.order_manager import ExecutionIntent, ExecutionResultKind, OrderManager
+from fxlab.execution.paper_broker import PaperBroker
+from fxlab.execution.paper_session import (
+    CycleKind,
+    HistoricalBarReplay,
+    MarketContext,
+    PaperTradingSession,
+)
+from fxlab.execution.signal_engine import SignalEngine, SignalEvent
+from fxlab.risk import KillSwitchReason, RiskEngine, RiskLimits
+
+
+class PipSizes:
+    def pip_size_for(self, symbol: str) -> float:
+        return 0.0001
+
+
+class LatestSignalSetup:
+    name = "test_setup"
+
+    def generate(self, bars: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        return np.array([len(bars) - 1]), np.array([1])
+
+
+class NoSignalSetup:
+    name = "no_signal"
+
+    def generate(self, bars: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        return np.array([], dtype=int), np.array([], dtype=int)
+
+
+def bars(periods: int = 2) -> pd.DataFrame:
+    index = pd.date_range("2026-08-25 10:00", periods=periods, freq="5min", tz="UTC")
+    close = np.arange(periods, dtype=float) * 0.001 + 1.1000
+    return pd.DataFrame(
+        {
+            "open": close,
+            "high": close + 0.0005,
+            "low": close - 0.0005,
+            "close": close,
+            "volume": np.ones(periods),
+        },
+        index=index,
+    )
+
+
+def policy(signal: SignalEvent, context: MarketContext) -> ExecutionIntent:
+    assert context.closed_bars.index.max() + pd.Timedelta(minutes=5) <= context.current_time
+    return ExecutionIntent(signal, sl_price=context.tick.bid - 0.001, tp_price=None)
+
+
+def make_session(
+    *,
+    setup: object | None = None,
+    execution_policy=policy,
+    source: pd.DataFrame | None = None,
+    broker_type=PaperBroker,
+) -> tuple[PaperTradingSession, RiskEngine, PaperBroker]:
+    frame = source if source is not None else bars()
+    broker = broker_type(historical_bars={("EURUSD", "M5"): frame})
+    replay = HistoricalBarReplay({"EURUSD": frame}, "M5")
+    market_data = MarketDataStream(
+        broker=broker,
+        symbols=["EURUSD"],
+        time_provider=lambda: datetime(1990, 1, 1, tzinfo=UTC),
+    )
+    signal_engine = SignalEngine(
+        setup=setup or LatestSignalSetup(),  # type: ignore[arg-type]
+        market_data=market_data,
+        timeframe="M5",
+    )
+    risk = RiskEngine(
+        RiskLimits(max_open_positions=5, max_trades_per_day=5),
+        PipSizes(),
+    )
+    manager = OrderManager(broker, risk)
+    session = PaperTradingSession(
+        broker,
+        replay,
+        market_data,
+        signal_engine,
+        manager,
+        risk,
+        execution_policy,
+    )
+    return session, risk, broker
+
+
+def test_start_poll_stop_and_idempotent_lifecycle() -> None:
+    session, _, broker = make_session(setup=NoSignalSetup())
+    session.start()
+    session.start()
+    result = session.poll_once()
+    assert result.kind is CycleKind.NO_SIGNAL
+    assert broker.is_connected()
+    session.stop()
+    session.stop()
+    assert not broker.is_connected()
+    assert session.poll_once().reason == "session_not_running"
+
+
+def test_chronological_replay_and_no_lookahead() -> None:
+    replay = HistoricalBarReplay({"EURUSD": bars()}, "M5")
+    before_first_close = datetime(2026, 8, 25, 10, 4, 59, tzinfo=UTC)
+    assert replay.next_tick(until=before_first_close) is None
+    first = replay.next_tick(until=datetime(2026, 8, 25, 10, 5, tzinfo=UTC))
+    second = replay.next_tick()
+    assert first is not None and second is not None
+    assert first.timestamp < second.timestamp
+    assert first.bid == first.ask == bars().iloc[0].close
+
+
+def test_session_never_exposes_future_bar_to_policy() -> None:
+    observed: list[pd.DataFrame] = []
+
+    def observing_policy(signal: SignalEvent, context: MarketContext) -> ExecutionIntent | None:
+        observed.append(context.closed_bars)
+        return None
+
+    session, _, _ = make_session(execution_policy=observing_policy)
+    session.start()
+    result = session.poll_once()
+    assert result.kind is CycleKind.POLICY_DECLINED
+    assert len(observed[0]) == 1
+    assert observed[0].index[0] == pd.Timestamp("2026-08-25 10:00", tz="UTC")
+
+
+def test_signal_policy_submission_and_reflection_release() -> None:
+    session, risk, broker = make_session()
+    session.start()
+    result = session.poll_once()
+    assert result.kind is CycleKind.PROCESSED
+    submitted = next(
+        item for item in result.executions if item.kind is ExecutionResultKind.SUBMITTED
+    )
+    assert submitted.record is not None
+    assert submitted.record.request.sl_price == pytest.approx(1.099)
+    assert submitted.record.request.tp_price is None
+    assert broker.get_correlation(submitted.record.client_order_id) is not None
+    assert risk.reserved_position_count == 0
+    assert len(broker.get_account_info().open_positions) == 1
+
+
+def test_policy_decline_does_not_submit() -> None:
+    session, risk, broker = make_session(execution_policy=lambda signal, context: None)
+    session.start()
+    assert session.poll_once().kind is CycleKind.POLICY_DECLINED
+    assert not risk.approved_order_ids
+    assert not broker.get_account_info().open_positions
+
+
+def test_policy_exception_is_structured_failure() -> None:
+    def broken(signal: SignalEvent, context: MarketContext) -> ExecutionIntent:
+        raise ValueError("test policy failure")
+
+    session, _, broker = make_session(execution_policy=broken)
+    session.start()
+    result = session.poll_once()
+    assert result.kind is CycleKind.FAILED
+    assert result.reason == "execution_policy_failure"
+    assert not broker.get_account_info().open_positions
+
+
+def test_risk_rejection_is_returned_without_submission() -> None:
+    def bad_stop(signal: SignalEvent, context: MarketContext) -> ExecutionIntent:
+        return ExecutionIntent(signal, sl_price=context.tick.ask + 0.001)
+
+    session, _, broker = make_session(execution_policy=bad_stop)
+    session.start()
+    result = session.poll_once()
+    assert result.kind is CycleKind.PROCESSED
+    assert result.executions[0].kind is ExecutionResultKind.RISK_REJECTED
+    assert not broker.get_account_info().open_positions
+
+
+def test_replay_exhaustion() -> None:
+    session, _, _ = make_session(setup=NoSignalSetup(), source=bars(1))
+    session.start()
+    session.poll_once()
+    result = session.poll_once()
+    assert result.kind is CycleKind.EXHAUSTED
+    assert result.reason == "replay_exhausted"
+
+
+def test_market_data_failure_is_structured() -> None:
+    session, _, broker = make_session(setup=NoSignalSetup())
+    session.start()
+    broker.disconnect()
+    result = session.poll_once()
+    assert result.kind is CycleKind.FAILED
+    assert result.reason == "market_data_failure"
+
+
+def test_account_state_checked_each_market_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    session, risk, _ = make_session(setup=NoSignalSetup())
+    calls = 0
+    original = risk.check_account_state
+
+    def checked(account, current_time):
+        nonlocal calls
+        calls += 1
+        return original(account, current_time)
+
+    monkeypatch.setattr(risk, "check_account_state", checked)
+    session.start()
+    session.poll_once()
+    session.poll_once()
+    assert calls == 2
+
+
+class UncertainBroker(PaperBroker):
+    def submit_order(self, order):
+        raise RuntimeError("unknown submission outcome")
+
+
+def test_submission_uncertainty_latches_reconciliation_switch() -> None:
+    session, risk, _ = make_session(broker_type=UncertainBroker)
+    session.start()
+    result = session.poll_once()
+    assert result.executions[0].kind is ExecutionResultKind.INDETERMINATE
+    assert risk.kill_switch_reason is KillSwitchReason.POSITION_RECONCILIATION_FAILED
+
+
+class MissingCorrelationBroker(PaperBroker):
+    def get_correlation(self, client_order_id):
+        return None
+
+
+def test_filled_order_without_exact_correlation_latches_switch() -> None:
+    session, risk, _ = make_session(broker_type=MissingCorrelationBroker)
+    session.start()
+    result = session.poll_once()
+    assert any(item.reason == "position_reconciliation_failed" for item in result.executions)
+    assert risk.kill_switch_reason is KillSwitchReason.POSITION_RECONCILIATION_FAILED
+    assert risk.reserved_position_count == 1
+
+
+def test_no_research_or_persistence_ownership() -> None:
+    session, _, _ = make_session()
+    assert not hasattr(session, "save")
+    assert not hasattr(session, "load")
+    assert not hasattr(session, "generate_stop_loss")
+
+
+def test_replay_rejects_naive_until_time() -> None:
+    replay = HistoricalBarReplay({"EURUSD": bars()}, "M5")
+    with pytest.raises(ValueError, match="timezone-aware"):
+        replay.next_tick(until=datetime(2026, 8, 25, 10, 5))
+
+
+def test_replay_close_quote_is_zero_spread_without_microstructure() -> None:
+    replay = HistoricalBarReplay({"EURUSD": bars(1)}, "M5")
+    event = replay.next_tick()
+    assert isinstance(event, Tick)
+    assert event.bid == event.ask == event.mid
