@@ -1,6 +1,19 @@
-"""Risk engine (Phase 6). Not in P1.
+"""Public Phase 4 risk-decision API."""
 
-Pluggable position sizing (fixed-fractional, martingale [included only to demonstrate
-ruin], anti-martingale, conditional-progressive), kill-switches, and a Monte-Carlo
-risk-of-ruin + $10 experiment simulator. Losing scenarios are never hidden.
-"""
+from .engine import (
+    KillSwitchReason,
+    PipSizeResolver,
+    RiskDecision,
+    RiskEngine,
+    RiskLimits,
+    RiskRejection,
+)
+
+__all__ = [
+    "KillSwitchReason",
+    "PipSizeResolver",
+    "RiskDecision",
+    "RiskEngine",
+    "RiskLimits",
+    "RiskRejection",
+]
