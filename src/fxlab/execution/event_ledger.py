@@ -49,6 +49,7 @@ class AuditEventType(StrEnum):
     DATASET_BOUND = "dataset_bound"
     BROKER_CAPABILITIES_BOUND = "broker_capabilities_bound"
     BROKER_CAPABILITY_REJECTED = "broker_capability_rejected"
+    RUNTIME_STATE_CHANGED = "runtime_state_changed"
     RUNTIME_FAILURE = "runtime_failure"
 
 

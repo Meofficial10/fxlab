@@ -25,6 +25,7 @@ from fxlab.execution.recovery import (
     create_checkpoint,
     recover,
 )
+from fxlab.execution.runtime_control import RuntimeState
 from fxlab.execution.signal_engine import SignalEngine, SignalEvent
 from fxlab.risk import RiskEngine, RiskLimits
 
@@ -166,6 +167,79 @@ def test_replay_continues_after_last_consumed_event(tmp_path) -> None:
     result = restored.poll_once()
     assert result.tick is not None
     assert result.tick.timestamp == datetime(2026, 8, 25, 10, 10, tzinfo=UTC)
+
+
+def test_paused_runtime_restores_paused_and_requires_explicit_resume(tmp_path) -> None:
+    path, original, store, _ = checkpoint_live_session(tmp_path)
+    original.pause()
+    create_checkpoint(
+        original,
+        store,
+        software_version="1.0",
+        execution_policy_id="policy-v1",
+    )
+    store.close()
+    restored, reopened = make_session(path)
+    assert recover(
+        restored, reopened, software_version="1.0", execution_policy_id="policy-v1"
+    ).recovered
+    assert restored.runtime_status().state is RuntimeState.PAUSED
+    restored.start()
+    assert restored.runtime_status().state is RuntimeState.PAUSED
+    assert not restored.runtime_status().execution_enabled
+
+
+def test_stopping_runtime_restores_blocked_and_cannot_start(tmp_path) -> None:
+    path, original, store, _ = checkpoint_live_session(tmp_path)
+    original.request_stop()
+    create_checkpoint(
+        original,
+        store,
+        software_version="1.0",
+        execution_policy_id="policy-v1",
+    )
+    store.close()
+    restored, reopened = make_session(path)
+    assert recover(
+        restored, reopened, software_version="1.0", execution_policy_id="policy-v1"
+    ).recovered
+    assert restored.runtime_status().state is RuntimeState.STOPPING
+    with pytest.raises(RuntimeError, match="stopping"):
+        restored.start()
+
+
+def test_stopped_runtime_restores_terminal(tmp_path) -> None:
+    path, original, store, _ = checkpoint_live_session(tmp_path)
+    original.stop()
+    create_checkpoint(
+        original,
+        store,
+        software_version="1.0",
+        execution_policy_id="policy-v1",
+    )
+    store.close()
+    restored, reopened = make_session(path)
+    assert recover(
+        restored, reopened, software_version="1.0", execution_policy_id="policy-v1"
+    ).recovered
+    assert restored.runtime_status().state is RuntimeState.STOPPED
+    with pytest.raises(RuntimeError, match="stopped"):
+        restored.start()
+
+
+def test_complete_stop_can_commit_stopping_and_terminal_checkpoints(tmp_path) -> None:
+    _, session, store, _ = checkpoint_live_session(tmp_path)
+    session.request_stop()
+    result = session.complete_stop(
+        checkpoint_store=store,
+        software_version="1.0",
+        execution_policy_id="policy-v1",
+    )
+    assert result.changed
+    checkpoint = store.load_latest_checkpoint()
+    assert checkpoint is not None
+    assert checkpoint.last_event_sequence == store.last_sequence()
+    assert checkpoint.state["session"]["runtime_control"]["state"] == "stopped"
 
 
 @pytest.mark.parametrize(

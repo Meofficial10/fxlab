@@ -8,14 +8,24 @@ import math
 import re
 import struct
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Protocol
+from threading import Lock
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Protocol
 
 import pandas as pd
 
-from ..data.provider import ProvenanceQuality
+if TYPE_CHECKING:
+    from .durable_event_store import SQLiteEventStore
+
+from ..data.provider import (
+    ProvenanceQuality,
+    ProviderFailure,
+    ProviderFailureCategory,
+)
 from ..data.schema import OHLCV, timeframe_to_timedelta
 from ..risk.engine import KillSwitchReason, RiskEngine
 from .broker import AccountInfo, OrderStatus, Tick
@@ -36,6 +46,13 @@ from .event_ledger import (
 from .market_data import MarketDataStream
 from .order_manager import ExecutionIntent, ExecutionResult, ExecutionResultKind, OrderManager
 from .paper_broker import PaperBroker, PositionClose
+from .runtime_control import (
+    RuntimeController,
+    RuntimeControlReason,
+    RuntimeControlResult,
+    RuntimeState,
+    RuntimeStatus,
+)
 from .signal_engine import SignalEngine, SignalEvent
 
 
@@ -245,6 +262,12 @@ class PaperTradingSession:
     _reported_reconciliation_failures: set[str] = field(
         default_factory=set, init=False
     )
+    _runtime_controller: RuntimeController = field(
+        default_factory=RuntimeController, init=False, repr=False
+    )
+    _last_market_time: datetime | None = field(default=None, init=False)
+    _resume_data_ready: bool = field(default=False, init=False)
+    _cycle_lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.event_ledger, EventLedger):
@@ -257,12 +280,21 @@ class PaperTradingSession:
             raise ValueError("runtime_id must be a non-empty string")
 
     def start(self) -> None:
+        with self._cycle_lock:
+            self._start_unlocked()
+
+    def _start_unlocked(self) -> None:
         if self._started:
             return
         if self._recovery_required:
             raise RuntimeError("reconciliation is required before session start")
         if self._stopped:
             raise RuntimeError("a stopped paper session cannot be restarted")
+        control_state = self.runtime_status().state
+        if control_state is RuntimeState.STOPPING:
+            raise RuntimeError("a stopping paper session cannot be started")
+        if control_state is RuntimeState.FAILED:
+            raise RuntimeError("a failed paper session cannot be started")
         capability_check = inspect_broker_capabilities(
             self.broker,
             CURRENT_PAPER_SESSION_REQUIREMENTS,
@@ -336,29 +368,49 @@ class PaperTradingSession:
             self.broker.disconnect()
             self._audit_failed = True
             raise
+        if self._runtime_controller.status().state is RuntimeState.STOPPED:
+            self._append_runtime_transition(
+                RuntimeState.STOPPED,
+                RuntimeState.RUNNING,
+                RuntimeControlReason.SESSION_STOPPED,
+                operator_requested=False,
+                occurred_at=self.event_ledger.now(),
+            )
+            transition = self._runtime_controller.start()
+            if not transition.accepted:
+                self.broker.disconnect()
+                raise RuntimeError("runtime controller rejected session start")
         self._started = True
 
     def poll_once(self, *, until: datetime | None = None) -> PaperCycleResult:
         """Advance one replay cycle, failing closed on any audit-integrity loss."""
-        try:
-            return self._poll_once(until=until)
-        except AuditLedgerError:
-            self._audit_failed = True
-            self.risk_engine.trigger_kill_switch(
-                KillSwitchReason.POSITION_RECONCILIATION_FAILED
-            )
-            return _cycle_failure(
-                "audit_unavailable", "required runtime transition could not be audited"
-            )
+        with self._cycle_lock:
+            try:
+                return self._poll_once(until=until)
+            except AuditLedgerError:
+                self._audit_failed = True
+                self._runtime_controller.fail(
+                    RuntimeControlReason.AUDIT_INTEGRITY_FAILED
+                )
+                self.risk_engine.trigger_kill_switch(
+                    KillSwitchReason.POSITION_RECONCILIATION_FAILED
+                )
+                return _cycle_failure(
+                    "audit_unavailable", "required runtime transition could not be audited"
+                )
 
     def _poll_once(self, *, until: datetime | None = None) -> PaperCycleResult:
         if not self._started or self._stopped:
             return _cycle_failure("session_not_running", "paper session is not running")
+        initial_status = self.runtime_status()
+        if initial_status.state in {RuntimeState.STOPPING, RuntimeState.STOPPED}:
+            return _cycle_failure(initial_status.reason.value, "paper session is stopping")
         if self._audit_failed or self.order_manager.audit_failed or self._recovery_required:
             return _cycle_failure(
                 "audit_unavailable", "audit integrity is unavailable; execution is disabled"
             )
         if not self._verify_broker_descriptor():
+            self._transition_failed(RuntimeControlReason.BROKER_INCOMPATIBLE)
             return _cycle_failure(
                 "broker_capability_unsupported",
                 "broker capability declaration changed; execution is disabled",
@@ -367,6 +419,7 @@ class PaperTradingSession:
             tick = self.replay.next_tick(until=until)
         except Exception:
             self._record_runtime_failure("replay_failure")
+            self._transition_failed(RuntimeControlReason.RUNTIME_FAILED)
             return _cycle_failure("replay_failure", "historical replay could not advance")
         if tick is None:
             kind = CycleKind.EXHAUSTED if self.replay.exhausted else CycleKind.NO_SIGNAL
@@ -398,6 +451,8 @@ class PaperTradingSession:
                 },
             )
             self.market_data.on_tick(tick)
+            self._last_market_time = current_time
+            self._resume_data_ready = True
             closes = self._drain_close_events(current_time)
             account = self.broker.get_account_info()
             self._record_account(account, current_time)
@@ -411,6 +466,9 @@ class PaperTradingSession:
             )
         except Exception:
             self._record_runtime_failure("market_data_failure", current_time)
+            self._transition_paused(
+                RuntimeControlReason.BROKER_UNAVAILABLE, current_time
+            )
             return _cycle_failure(
                 "market_data_failure", "replay market state could not be accepted", current_time
             )
@@ -433,6 +491,18 @@ class PaperTradingSession:
                 message=account_rejection.message,
             )
 
+        gate = self.runtime_status()
+        if not gate.execution_enabled:
+            maintenance = tuple(self._refresh_and_reconcile(current_time))
+            return PaperCycleResult(
+                CycleKind.PROCESSED if maintenance or closes else CycleKind.NO_SIGNAL,
+                current_time,
+                tick,
+                executions=maintenance,
+                closes=closes,
+                reason=gate.reason.value,
+            )
+
         try:
             signals = tuple(self.signal_engine.process_all_symbols([tick.symbol]))
         except Exception:
@@ -449,6 +519,20 @@ class PaperTradingSession:
                 correlation=_signal_correlation(signal),
                 payload=_signal_payload(signal),
             )
+
+        eligible_signals: list[SignalEvent] = []
+        for signal in signals:
+            if self._runtime_controller.signal_is_eligible(signal.signal_time):
+                eligible_signals.append(signal)
+                continue
+            self._append(
+                AuditEventType.SIGNAL_DECLINED,
+                occurred_at=current_time,
+                component=AuditComponent.PAPER_SESSION,
+                correlation=_signal_correlation(signal),
+                payload={"reason": "runtime_entry_watermark"},
+            )
+        signals = tuple(eligible_signals)
 
         executions: list[ExecutionResult] = []
         declined = False
@@ -523,6 +607,8 @@ class PaperTradingSession:
                 )
             if result.kind is ExecutionResultKind.SUBMITTED and result.record is not None:
                 self._tracked_orders.add(result.record.client_order_id)
+            if result.kind is ExecutionResultKind.INDETERMINATE:
+                self.require_reconciliation()
 
         executions.extend(self._refresh_and_reconcile(current_time))
         if executions:
@@ -552,6 +638,10 @@ class PaperTradingSession:
 
     def close_position(self, position_id: str) -> PositionClose | None:
         """Manually close a paper position and notify risk exactly once."""
+        with self._cycle_lock:
+            return self._close_position_unlocked(position_id)
+
+    def _close_position_unlocked(self, position_id: str) -> PositionClose | None:
         if not self._started or self._stopped:
             return None
         close_order_id = self.broker.close_position(position_id)
@@ -568,23 +658,222 @@ class PaperTradingSession:
             )
         return close
 
-    def stop(self) -> None:
-        if self._stopped:
-            return
-        if self._started and not self._audit_failed:
-            try:
-                self._append(
-                    AuditEventType.SESSION_STOPPED,
-                    occurred_at=self.event_ledger.now(),
-                    component=AuditComponent.PAPER_SESSION,
-                    payload={},
+    def runtime_status(self) -> RuntimeStatus:
+        failed_reason = None
+        if self._audit_failed or self.order_manager.audit_failed:
+            failed_reason = RuntimeControlReason.AUDIT_INTEGRITY_FAILED
+        elif self._capability_failed:
+            failed_reason = RuntimeControlReason.BROKER_INCOMPATIBLE
+        return self._runtime_controller.status(
+            reconciliation_required=self._recovery_required,
+            failed_reason=failed_reason,
+            kill_switch_active=self.risk_engine.kill_switch_active,
+            emergency_stop=(
+                self.risk_engine.kill_switch_reason is KillSwitchReason.MANUAL
+            ),
+        )
+
+    def pause(self) -> RuntimeControlResult:
+        with self._cycle_lock:
+            return self._transition_paused(
+                RuntimeControlReason.OPERATOR_PAUSED,
+                self._last_market_time or self.event_ledger.now(),
+                operator_requested=True,
+            )
+
+    def resume(self) -> RuntimeControlResult:
+        with self._cycle_lock:
+            before = self.runtime_status()
+            if self._last_market_time is None or not self._resume_data_ready:
+                return RuntimeControlResult(
+                    False, False, before.state, before.state, before.reason
                 )
-            except AuditLedgerError:
-                self._audit_failed = True
-        self.replay.stop()
-        if self.broker.is_connected():
-            self.broker.disconnect()
-        self._stopped = True
+            failure = None
+            if self._audit_failed or self.order_manager.audit_failed:
+                failure = RuntimeControlReason.AUDIT_INTEGRITY_FAILED
+            elif self._capability_failed:
+                failure = RuntimeControlReason.BROKER_INCOMPATIBLE
+            if (
+                before.state is not RuntimeState.PAUSED
+                or self._recovery_required
+                or failure is not None
+                or self.risk_engine.kill_switch_active
+                or self._has_unresolved_execution()
+            ):
+                return RuntimeControlResult(
+                    before.state is RuntimeState.RUNNING,
+                    False,
+                    before.state,
+                    before.state,
+                    before.reason,
+                )
+            if not self._verify_broker_descriptor():
+                self._transition_failed(RuntimeControlReason.BROKER_INCOMPATIBLE)
+                after = self.runtime_status()
+                return RuntimeControlResult(
+                    False, True, before.state, after.state, after.reason
+                )
+            self._append_runtime_transition(
+                RuntimeState.PAUSED,
+                RuntimeState.RUNNING,
+                RuntimeControlReason.OPERATOR_PAUSED,
+                operator_requested=True,
+                occurred_at=self.event_ledger.now(),
+            )
+            return self._runtime_controller.resume(self._last_market_time)
+
+    def emergency_stop(self) -> RuntimeControlResult:
+        with self._cycle_lock:
+            before = self.runtime_status()
+            was_active = self.risk_engine.kill_switch_active
+            self.risk_engine.trigger_kill_switch(KillSwitchReason.MANUAL)
+            after = self.runtime_status()
+            if not was_active:
+                self._record_kill_transition(False, self.event_ledger.now())
+            return RuntimeControlResult(
+                True,
+                before.state is not after.state,
+                before.state,
+                after.state,
+                after.reason,
+            )
+
+    def handle_provider_failure(
+        self, failure: ProviderFailure, *, occurred_at: datetime | None = None
+    ) -> RuntimeControlResult:
+        """Apply Phase 11 failure categories without retrying or exposing data."""
+        if not isinstance(failure, ProviderFailure):
+            raise ValueError("failure must be a ProviderFailure")
+        with self._cycle_lock:
+            timestamp = occurred_at or self.event_ledger.now()
+            temporary = failure.category in {
+                ProviderFailureCategory.STALE_DATA,
+                ProviderFailureCategory.TRANSIENT,
+                ProviderFailureCategory.RATE_LIMIT,
+                ProviderFailureCategory.NO_DATA,
+            }
+            if temporary:
+                reason = (
+                    RuntimeControlReason.DATA_STALE
+                    if failure.category is ProviderFailureCategory.STALE_DATA
+                    else RuntimeControlReason.DATA_UNAVAILABLE
+                )
+                result = self._transition_paused(reason, timestamp)
+            else:
+                reason = (
+                    RuntimeControlReason.DATA_INVALID
+                    if failure.category
+                    in {
+                        ProviderFailureCategory.INVALID_DATA,
+                        ProviderFailureCategory.INCOMPATIBLE_SCHEMA,
+                    }
+                    else RuntimeControlReason.RUNTIME_FAILED
+                )
+                result = self._transition_failed(reason)
+            self._append(
+                AuditEventType.DATA_STALE
+                if failure.category is ProviderFailureCategory.STALE_DATA
+                else AuditEventType.DATA_PROVIDER_FAILED,
+                occurred_at=timestamp,
+                component=AuditComponent.MARKET_DATA_PROVIDER,
+                payload={
+                    "category": failure.category.value,
+                    "reason": failure.reason,
+                    "provider_id": failure.provider_id,
+                    "retryable": failure.retryable,
+                },
+            )
+            return result
+
+    def request_stop(self) -> RuntimeControlResult:
+        with self._cycle_lock:
+            result = self._runtime_controller.request_stop()
+            if result.changed:
+                self._audit_controller_result(result, operator_requested=True)
+            return result
+
+    def complete_stop(
+        self,
+        *,
+        checkpoint_store: SQLiteEventStore | None = None,
+        software_version: str | None = None,
+        execution_policy_id: str | None = None,
+    ) -> RuntimeControlResult:
+        with self._cycle_lock:
+            before = self.runtime_status()
+            if before.state is RuntimeState.STOPPED:
+                return RuntimeControlResult(
+                    True, False, before.state, before.state, before.reason
+                )
+            if before.state is not RuntimeState.STOPPING:
+                return RuntimeControlResult(
+                    False, False, before.state, before.state, before.reason
+                )
+            now = self.event_ledger.now()
+            if not self._audit_failed and not self.order_manager.audit_failed:
+                self._drain_close_events(now)
+                self._refresh_and_reconcile(now)
+            if checkpoint_store is not None:
+                if software_version is None or execution_policy_id is None:
+                    raise ValueError(
+                        "durable stop requires software_version and execution_policy_id"
+                    )
+                from .recovery import create_checkpoint
+
+                create_checkpoint(
+                    self,
+                    checkpoint_store,
+                    software_version=software_version,
+                    execution_policy_id=execution_policy_id,
+                    created_at=now,
+                )
+            self.replay.stop()
+            if self.broker.is_connected():
+                self.broker.disconnect()
+            result = self._runtime_controller.complete_stop()
+            self._stopped = True
+            if not self._audit_failed:
+                try:
+                    self._audit_controller_result(result, operator_requested=True)
+                    self._append(
+                        AuditEventType.SESSION_STOPPED,
+                        occurred_at=now,
+                        component=AuditComponent.PAPER_SESSION,
+                        payload={},
+                    )
+                except AuditLedgerError:
+                    self._audit_failed = True
+            if checkpoint_store is not None and not self._audit_failed:
+                from .recovery import create_checkpoint
+
+                create_checkpoint(
+                    self,
+                    checkpoint_store,
+                    software_version=software_version,
+                    execution_policy_id=execution_policy_id,
+                    created_at=now,
+                )
+            return result
+
+    def stop(self) -> None:
+        try:
+            self.request_stop()
+        except AuditLedgerError:
+            # Audit loss must block execution, but it must not prevent disconnect.
+            pass
+        self.complete_stop()
+
+    def account_snapshot(self) -> AccountInfo:
+        return self.broker.get_account_info()
+
+    def positions_snapshot(self) -> tuple[object, ...]:
+        return tuple(self.broker.get_account_info().open_positions)
+
+    def orders_snapshot(self) -> Mapping[str, object]:
+        return MappingProxyType(deepcopy(self.order_manager.snapshot_state()))
+
+    def risk_state_snapshot(self) -> Mapping[str, object]:
+        return MappingProxyType(deepcopy(self.risk_engine.snapshot_state()))
 
     @property
     def recovery_required(self) -> bool:
@@ -610,6 +899,13 @@ class PaperTradingSession:
             "reported_reconciliation_failures": sorted(
                 self._reported_reconciliation_failures
             ),
+            "runtime_control": self._runtime_controller.snapshot_state(),
+            "last_market_time": (
+                self._last_market_time.astimezone(UTC).isoformat()
+                if self._last_market_time is not None
+                else None
+            ),
+            "resume_data_ready": self._resume_data_ready,
         }
 
     def restore_state(self, state: Mapping[str, object]) -> None:
@@ -622,9 +918,13 @@ class PaperTradingSession:
             self._tracked_orders,
             self._position_correlations,
             self._reported_reconciliation_failures,
+            runtime_state,
+            self._last_market_time,
+            self._resume_data_ready,
         ) = parsed
+        self._runtime_controller.restore_state(runtime_state)
         self._started = False
-        self._stopped = False
+        self._stopped = bool(runtime_state["terminally_stopped"])
 
     def _verify_broker_descriptor(self) -> bool:
         if self._capability_failed:
@@ -673,6 +973,85 @@ class PaperTradingSession:
             KillSwitchReason.POSITION_RECONCILIATION_FAILED
         )
 
+    def _transition_paused(
+        self,
+        reason: RuntimeControlReason,
+        occurred_at: datetime,
+        *,
+        operator_requested: bool = False,
+    ) -> RuntimeControlResult:
+        result = self._runtime_controller.pause(occurred_at, reason=reason)
+        if operator_requested:
+            self._resume_data_ready = self._last_market_time is not None
+        else:
+            self._resume_data_ready = False
+        if result.changed:
+            try:
+                self._audit_controller_result(
+                    result,
+                    operator_requested=operator_requested,
+                    occurred_at=occurred_at,
+                )
+            except AuditLedgerError:
+                self._runtime_controller.fail(
+                    RuntimeControlReason.AUDIT_INTEGRITY_FAILED
+                )
+                raise
+        return result
+
+    def _has_unresolved_execution(self) -> bool:
+        if self._tracked_orders:
+            return True
+        records = self.order_manager.snapshot_state().get("records")
+        return not isinstance(records, list) or any(
+            not isinstance(record, Mapping) or record.get("broker_order_id") is None
+            for record in records
+        )
+
+    def _transition_failed(self, reason: RuntimeControlReason) -> RuntimeControlResult:
+        result = self._runtime_controller.fail(reason)
+        if result.changed and not self._audit_failed:
+            self._audit_controller_result(result, operator_requested=False)
+        return result
+
+    def _audit_controller_result(
+        self,
+        result: RuntimeControlResult,
+        *,
+        operator_requested: bool,
+        occurred_at: datetime | None = None,
+    ) -> None:
+        if not result.changed:
+            return
+        self._append_runtime_transition(
+            result.previous_state,
+            result.current_state,
+            result.reason,
+            operator_requested=operator_requested,
+            occurred_at=occurred_at or self.event_ledger.now(),
+        )
+
+    def _append_runtime_transition(
+        self,
+        previous: RuntimeState,
+        current: RuntimeState,
+        reason: RuntimeControlReason,
+        *,
+        operator_requested: bool,
+        occurred_at: datetime,
+    ) -> None:
+        self._append(
+            AuditEventType.RUNTIME_STATE_CHANGED,
+            occurred_at=occurred_at,
+            component=AuditComponent.PAPER_SESSION,
+            payload={
+                "previous_state": previous.value,
+                "current_state": current.value,
+                "reason": reason.value,
+                "operator_requested": operator_requested,
+            },
+        )
+
     def _refresh_and_reconcile(self, current_time: datetime) -> list[ExecutionResult]:
         results: list[ExecutionResult] = []
         for client_id in tuple(sorted(self._tracked_orders)):
@@ -680,6 +1059,11 @@ class PaperTradingSession:
                 client_id, current_time=current_time
             )
             results.append(result)
+            if result.kind is ExecutionResultKind.STATUS_FAILURE:
+                self._transition_paused(
+                    RuntimeControlReason.BROKER_UNAVAILABLE, current_time
+                )
+                continue
             record = result.record
             if record is None or record.status is not OrderStatus.FILLED:
                 continue
@@ -815,6 +1199,7 @@ class PaperTradingSession:
         if client_id in self._reported_reconciliation_failures:
             return
         self._reported_reconciliation_failures.add(client_id)
+        self._recovery_required = True
         was_active = self.risk_engine.kill_switch_active
         self.risk_engine.trigger_kill_switch(
             KillSwitchReason.POSITION_RECONCILIATION_FAILED
@@ -841,6 +1226,17 @@ class PaperTradingSession:
             component=AuditComponent.RISK_ENGINE,
             payload={"reason": self.risk_engine.kill_switch_reason},
         )
+        prior = self._runtime_controller.status().state
+        current = self.runtime_status()
+        if prior is not current.state:
+            self._append_runtime_transition(
+                prior,
+                current.state,
+                current.reason,
+                operator_requested=current.reason
+                is RuntimeControlReason.EMERGENCY_STOPPED,
+                occurred_at=current_time,
+            )
 
     def _record_runtime_failure(
         self, reason: str, current_time: datetime | None = None
@@ -866,6 +1262,9 @@ def _parse_session_state(state: Mapping[str, object]) -> tuple:
         "reported_reconciliation_failures"
     )
     raw_correlations = state.get("position_correlations")
+    runtime_state = state.get("runtime_control")
+    raw_last_market_time = state.get("last_market_time")
+    resume_data_ready = state.get("resume_data_ready")
     if (
         not isinstance(audit, bool)
         or not isinstance(recovery, bool)
@@ -897,6 +1296,19 @@ def _parse_session_state(state: Mapping[str, object]) -> tuple:
             position_id=position_id,
             close_order_id=raw.get("close_order_id"),
         )
+    if not isinstance(runtime_state, Mapping):
+        raise ValueError("invalid runtime-control state")
+    validated_runtime = RuntimeController()
+    validated_runtime.restore_state(runtime_state)
+    last_market_time = None
+    if raw_last_market_time is not None:
+        if not isinstance(raw_last_market_time, str):
+            raise ValueError("invalid last market time")
+        last_market_time = _aware_utc(datetime.fromisoformat(raw_last_market_time))
+        if last_market_time is None:
+            raise ValueError("invalid last market time")
+    if not isinstance(resume_data_ready, bool):
+        raise ValueError("invalid resume data state")
     return (
         audit,
         recovery,
@@ -905,6 +1317,9 @@ def _parse_session_state(state: Mapping[str, object]) -> tuple:
         set(tracked),
         correlations,
         set(failures),
+        validated_runtime.snapshot_state(),
+        last_market_time,
+        resume_data_ready,
     )
 
 

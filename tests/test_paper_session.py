@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from fxlab.config import CostConfig, CostDefaults
+from fxlab.data.provider import ProviderFailure, ProviderFailureCategory
 from fxlab.execution.broker import AccountInfo, Tick
 from fxlab.execution.broker_capabilities import (
     BrokerCapability,
@@ -25,6 +26,7 @@ from fxlab.execution.paper_session import (
     MarketContext,
     PaperTradingSession,
 )
+from fxlab.execution.runtime_control import RuntimeControlReason, RuntimeState
 from fxlab.execution.signal_engine import SignalEngine, SignalEvent
 from fxlab.risk import KillSwitchReason, RiskEngine, RiskLimits, RiskRejection
 
@@ -158,6 +160,134 @@ def test_start_poll_stop_and_idempotent_lifecycle() -> None:
     assert session.poll_once().reason == "session_not_running"
 
 
+def test_pause_blocks_new_risk_but_continues_market_maintenance() -> None:
+    policy_calls = 0
+
+    def counted_policy(signal, context):
+        nonlocal policy_calls
+        policy_calls += 1
+        return policy(signal, context)
+
+    session, risk, broker = make_session(execution_policy=counted_policy)
+    session.start()
+    paused = session.pause()
+    assert paused.accepted and paused.changed
+    cycle = session.poll_once()
+    assert cycle.kind is CycleKind.NO_SIGNAL
+    assert cycle.current_time == datetime(2026, 8, 25, 10, 5, tzinfo=UTC)
+    assert policy_calls == 0
+    assert not risk.approved_order_ids
+    assert not broker.get_account_info().open_positions
+    assert session.runtime_status().state is RuntimeState.PAUSED
+
+
+def test_resume_requires_observed_data_and_watermark_blocks_paused_signal() -> None:
+    session, risk, broker = make_session()
+    session.start()
+    session.pause()
+    assert not session.resume().accepted
+    session.poll_once()
+    resumed = session.resume()
+    assert resumed.accepted and resumed.changed
+    assert session.runtime_status().entry_enable_watermark == datetime(
+        2026, 8, 25, 10, 5, tzinfo=UTC
+    )
+    session.poll_once()
+    assert risk.approved_order_ids
+    assert len(broker.get_account_info().open_positions) == 1
+
+
+def test_pause_still_executes_protective_stop_and_notifies_risk() -> None:
+    frame = bars_from_closes([1.1, 1.08])
+
+    def stop_policy(signal: SignalEvent, context: MarketContext) -> ExecutionIntent:
+        return ExecutionIntent(signal, sl_price=1.09)
+
+    session, risk, broker = make_session(
+        setup=FirstSignalSetup(),
+        execution_policy=stop_policy,
+        source=frame,
+        costs=zero_costs(),
+    )
+    session.start()
+    session.poll_once()
+    session.pause()
+    closed = session.poll_once()
+    assert len(closed.closes) == 1
+    assert risk.consecutive_losses == 1
+    assert not broker.get_account_info().open_positions
+    assert session.runtime_status().state is RuntimeState.PAUSED
+
+
+def test_emergency_stop_latches_manual_kill_without_liquidation() -> None:
+    session, risk, broker = make_session(setup=FirstSignalSetup(), source=bars(1))
+    session.start()
+    session.poll_once()
+    position_count = len(broker.get_account_info().open_positions)
+    result = session.emergency_stop()
+    assert result.accepted and result.changed
+    assert risk.kill_switch_reason is KillSwitchReason.MANUAL
+    assert session.runtime_status().state is RuntimeState.KILL_SWITCHED
+    assert len(broker.get_account_info().open_positions) == position_count
+    assert not session.resume().accepted
+    assert not session.emergency_stop().changed
+
+
+def test_runtime_state_transition_audit_is_idempotent() -> None:
+    session, _, _ = make_session(setup=NoSignalSetup())
+    session.start()
+    session.pause()
+    session.pause()
+    session.poll_once()
+    session.resume()
+    events = [
+        event
+        for event in session.event_ledger.events()
+        if event.event_type is AuditEventType.RUNTIME_STATE_CHANGED
+    ]
+    transitions = [
+        (event.payload["previous_state"], event.payload["current_state"])
+        for event in events
+    ]
+    assert transitions == [
+        (RuntimeState.STOPPED.value, RuntimeState.RUNNING.value),
+        (RuntimeState.RUNNING.value, RuntimeState.PAUSED.value),
+        (RuntimeState.PAUSED.value, RuntimeState.RUNNING.value),
+    ]
+
+
+def test_request_and_complete_stop_are_idempotent() -> None:
+    session, _, broker = make_session(setup=NoSignalSetup())
+    session.start()
+    assert session.request_stop().changed
+    assert not session.request_stop().changed
+    assert session.runtime_status().state is RuntimeState.STOPPING
+    assert session.poll_once().reason == RuntimeControlReason.SHUTDOWN_IN_PROGRESS.value
+    assert session.complete_stop().changed
+    assert not session.complete_stop().changed
+    assert session.runtime_status().state is RuntimeState.STOPPED
+    assert not broker.is_connected()
+    stopped_events = [
+        event
+        for event in session.event_ledger.events()
+        if event.event_type is AuditEventType.SESSION_STOPPED
+    ]
+    assert len(stopped_events) == 1
+
+
+def test_stop_still_disconnects_after_audit_integrity_failure() -> None:
+    session, _, broker = make_session(setup=NoSignalSetup())
+    session.start()
+
+    def fail_store(event) -> None:
+        raise OSError("ledger unavailable")
+
+    session.event_ledger._store_event = fail_store  # type: ignore[method-assign]
+    session.stop()
+    assert not broker.is_connected()
+    assert session.runtime_status().state is RuntimeState.STOPPED
+
+
 def test_broker_capabilities_bind_once_per_logical_session() -> None:
     session, _, _ = make_session(setup=NoSignalSetup())
     session.start()
@@ -237,9 +367,11 @@ def test_descriptor_mutation_during_runtime_fails_closed(monkeypatch) -> None:
     assert result.kind is CycleKind.FAILED
     assert result.reason == "broker_capability_unsupported"
     assert not session.broker.get_account_info().open_positions
-    assert session.event_ledger.last_event().event_type is (
-        AuditEventType.BROKER_CAPABILITY_REJECTED
-    )
+    failure_events = [event.event_type for event in session.event_ledger.events()][-2:]
+    assert failure_events == [
+        AuditEventType.BROKER_CAPABILITY_REJECTED,
+        AuditEventType.RUNTIME_STATE_CHANGED,
+    ]
 
 
 def test_audit_lifecycle_market_and_account_ordering() -> None:
@@ -409,6 +541,81 @@ def test_market_data_failure_is_structured() -> None:
     result = session.poll_once()
     assert result.kind is CycleKind.FAILED
     assert result.reason == "market_data_failure"
+    assert session.runtime_status().state is RuntimeState.PAUSED
+    assert session.runtime_status().reason is RuntimeControlReason.BROKER_UNAVAILABLE
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        ProviderFailureCategory.STALE_DATA,
+        ProviderFailureCategory.TRANSIENT,
+        ProviderFailureCategory.RATE_LIMIT,
+        ProviderFailureCategory.NO_DATA,
+    ],
+)
+def test_temporary_provider_failure_pauses_new_execution(category) -> None:
+    session, _, _ = make_session(setup=NoSignalSetup())
+    session.start()
+    session.handle_provider_failure(
+        ProviderFailure(category, "temporarily_unavailable", "replay", True)
+    )
+    assert session.runtime_status().state is RuntimeState.PAUSED
+
+
+def test_temporary_provider_recovery_requires_new_valid_observation_and_resume() -> None:
+    session, _, _ = make_session(setup=NoSignalSetup())
+    session.start()
+    session.poll_once()
+    session.handle_provider_failure(
+        ProviderFailure(
+            ProviderFailureCategory.TRANSIENT,
+            "temporarily_unavailable",
+            "replay",
+            True,
+        )
+    )
+    assert not session.resume().accepted
+    session.poll_once()
+    assert session.runtime_status().state is RuntimeState.PAUSED
+    assert session.resume().accepted
+
+
+def test_resume_rechecks_bound_broker_descriptor(monkeypatch) -> None:
+    session, _, _ = make_session(setup=NoSignalSetup())
+    session.start()
+    session.poll_once()
+    session.pause()
+    changed = BrokerDescriptor(
+        "fxlab-paper",
+        "2",
+        BrokerEnvironment.PAPER,
+        session.broker.broker_descriptor.capabilities,
+        True,
+    )
+    monkeypatch.setattr(PaperBroker, "broker_descriptor", property(lambda self: changed))
+    assert not session.resume().accepted
+    assert session.runtime_status().state is RuntimeState.FAILED
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        ProviderFailureCategory.INVALID_DATA,
+        ProviderFailureCategory.INCOMPATIBLE_SCHEMA,
+        ProviderFailureCategory.CONFIGURATION,
+        ProviderFailureCategory.AUTHENTICATION,
+        ProviderFailureCategory.UNSUPPORTED,
+        ProviderFailureCategory.INTERNAL,
+    ],
+)
+def test_permanent_provider_failure_fails_runtime(category) -> None:
+    session, _, _ = make_session(setup=NoSignalSetup())
+    session.start()
+    session.handle_provider_failure(
+        ProviderFailure(category, "invalid_provider_output", "replay", False)
+    )
+    assert session.runtime_status().state is RuntimeState.FAILED
 
 
 def test_account_state_checked_each_market_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -439,6 +646,7 @@ def test_submission_uncertainty_latches_reconciliation_switch() -> None:
     result = session.poll_once()
     assert result.executions[0].kind is ExecutionResultKind.INDETERMINATE
     assert risk.kill_switch_reason is KillSwitchReason.POSITION_RECONCILIATION_FAILED
+    assert session.runtime_status().state is RuntimeState.RECONCILIATION_REQUIRED
 
 
 class MissingCorrelationBroker(PaperBroker):
@@ -452,6 +660,22 @@ def test_filled_order_without_exact_correlation_latches_switch() -> None:
     result = session.poll_once()
     assert any(item.reason == "position_reconciliation_failed" for item in result.executions)
     assert risk.kill_switch_reason is KillSwitchReason.POSITION_RECONCILIATION_FAILED
+    assert risk.reserved_position_count == 1
+    assert session.runtime_status().state is RuntimeState.RECONCILIATION_REQUIRED
+
+
+class StatusUnavailableBroker(PaperBroker):
+    def get_order_status(self, broker_order_id):
+        raise RuntimeError("temporary status failure")
+
+
+def test_status_failure_pauses_new_risk_without_releasing_reservation() -> None:
+    session, risk, _ = make_session(broker_type=StatusUnavailableBroker)
+    session.start()
+    result = session.poll_once()
+    assert any(item.kind is ExecutionResultKind.STATUS_FAILURE for item in result.executions)
+    assert session.runtime_status().state is RuntimeState.PAUSED
+    assert session.runtime_status().reason is RuntimeControlReason.BROKER_UNAVAILABLE
     assert risk.reserved_position_count == 1
 
 

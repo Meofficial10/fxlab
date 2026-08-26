@@ -52,6 +52,13 @@ if TYPE_CHECKING:
         recover,
         validate_reconciliation_safe_point,
     )
+    from .runtime_control import (
+        RuntimeController,
+        RuntimeControlReason,
+        RuntimeControlResult,
+        RuntimeState,
+        RuntimeStatus,
+    )
 
 __all__ = [
     "AuditComponent",
@@ -93,6 +100,11 @@ __all__ = [
     "MarketContext",
     "PaperCycleResult",
     "PaperTradingSession",
+    "RuntimeControlReason",
+    "RuntimeControlResult",
+    "RuntimeController",
+    "RuntimeState",
+    "RuntimeStatus",
     "inspect_broker_capabilities",
     "required_capabilities_for_order",
 ]
@@ -109,6 +121,7 @@ def __getattr__(name: str) -> Any:
             paper_session,
             reconciliation,
             recovery,
+            runtime_control,
         )
 
         for module in (
@@ -120,6 +133,7 @@ def __getattr__(name: str) -> Any:
             paper_session,
             reconciliation,
             recovery,
+            runtime_control,
         ):
             if hasattr(module, name):
                 return getattr(module, name)

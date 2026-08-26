@@ -160,6 +160,10 @@ def test_reconciliation_audit_contract_is_stable() -> None:
     assert AuditComponent.RECONCILIATION_ENGINE.value == "reconciliation_engine"
 
 
+def test_runtime_state_audit_contract_is_stable() -> None:
+    assert AuditEventType.RUNTIME_STATE_CHANGED.value == "runtime_state_changed"
+
+
 def test_correlation_validation() -> None:
     with pytest.raises(ValueError, match="non-empty"):
         EventCorrelation(position_id=" ")
