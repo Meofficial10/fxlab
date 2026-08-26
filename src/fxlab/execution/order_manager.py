@@ -10,6 +10,13 @@ from threading import Lock
 
 from ..risk.engine import KillSwitchReason, RiskDecision, RiskEngine, RiskRejection
 from .broker import BrokerAdapter, OrderRequest, OrderStatus, Tick
+from .event_ledger import (
+    AuditComponent,
+    AuditEventType,
+    EventCorrelation,
+    EventLedger,
+    deterministic_signal_id,
+)
 from .signal_engine import SignalEvent
 
 
@@ -70,14 +77,22 @@ class OrderManager:
 
     broker: BrokerAdapter
     risk_engine: RiskEngine
+    event_ledger: EventLedger | None = None
 
     _records: dict[str, OrderRecord] = field(default_factory=dict, init=False)
+    _audit_failed: bool = field(default=False, init=False)
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
     def submit(
         self, intent: ExecutionIntent, *, current_time: datetime
     ) -> ExecutionResult:
         """Risk-check and submit exactly one market order for an execution intent."""
+        if self.audit_failed:
+            return _failure(
+                ExecutionResultKind.EXECUTION_REJECTED,
+                "audit_unavailable",
+                "audit integrity is unavailable; new execution is disabled",
+            )
         if not isinstance(intent, ExecutionIntent):
             return _failure(
                 ExecutionResultKind.EXECUTION_REJECTED,
@@ -94,12 +109,28 @@ class OrderManager:
 
         quote_result = self._current_entry_price(intent.signal, current_utc)
         if isinstance(quote_result, ExecutionResult):
+            if not self._audit_execution_failure(
+                intent.signal, current_utc, quote_result.reason
+            ):
+                return _failure(
+                    ExecutionResultKind.EXECUTION_REJECTED,
+                    "audit_failure_before_submission",
+                    "execution rejection could not be audited",
+                )
             return quote_result
         entry_price = quote_result
 
         try:
             account = self.broker.get_account_info()
         except Exception:
+            if not self._audit_execution_failure(
+                intent.signal, current_utc, "account_unavailable"
+            ):
+                return _failure(
+                    ExecutionResultKind.EXECUTION_REJECTED,
+                    "audit_failure_before_submission",
+                    "account failure could not be audited",
+                )
             return _failure(
                 ExecutionResultKind.EXECUTION_REJECTED,
                 "account_unavailable",
@@ -115,6 +146,25 @@ class OrderManager:
             current_time=current_utc,
         )
         if isinstance(risk_result, RiskRejection):
+            correlation = _signal_correlation(
+                intent.signal, client_order_id=risk_result.order_id
+            )
+            if not self._audit(
+                AuditEventType.RISK_REJECTED,
+                occurred_at=current_utc,
+                component=AuditComponent.RISK_ENGINE,
+                correlation=correlation,
+                payload={
+                    "reason": risk_result.reason,
+                    "message": risk_result.message,
+                    "kill_switch_reason": risk_result.kill_switch_reason,
+                },
+            ):
+                return _failure(
+                    ExecutionResultKind.EXECUTION_REJECTED,
+                    "audit_failure_before_submission",
+                    "risk rejection could not be audited",
+                )
             return ExecutionResult(
                 kind=ExecutionResultKind.RISK_REJECTED,
                 reason="risk_rejected",
@@ -122,10 +172,36 @@ class OrderManager:
                 risk_rejection=risk_result,
             )
         if not isinstance(risk_result, RiskDecision):
+            self._audit_execution_failure(
+                intent.signal, current_utc, "invalid_risk_result"
+            )
             return _failure(
                 ExecutionResultKind.EXECUTION_REJECTED,
                 "invalid_risk_result",
                 "risk engine returned an unsupported result",
+            )
+
+        correlation = _signal_correlation(
+            risk_result.signal, client_order_id=risk_result.order_id
+        )
+        if not self._audit(
+            AuditEventType.RISK_APPROVED,
+            occurred_at=current_utc,
+            component=AuditComponent.RISK_ENGINE,
+            correlation=correlation,
+            payload={
+                "size_lots": risk_result.size_lots,
+                "entry_price": risk_result.entry_price,
+                "sl_price": risk_result.sl_price,
+                "tp_price": risk_result.tp_price,
+                "modeled_monetary_risk": risk_result.modeled_monetary_risk,
+            },
+        ):
+            self.risk_engine.release_approval(risk_result.order_id)
+            return _failure(
+                ExecutionResultKind.EXECUTION_REJECTED,
+                "audit_failure_before_submission",
+                "risk approval could not be audited",
             )
 
         try:
@@ -140,7 +216,16 @@ class OrderManager:
                 tp_price=risk_result.tp_price,
             )
         except Exception:
-            self.risk_engine.release_approval(risk_result.order_id)
+            self._audit(
+                AuditEventType.EXECUTION_FAILED,
+                occurred_at=current_utc,
+                component=AuditComponent.ORDER_MANAGER,
+                correlation=correlation,
+                payload={"reason": "order_construction_failed"},
+            )
+            released = self.risk_engine.release_approval(risk_result.order_id)
+            if released:
+                self._audit_release(risk_result.order_id, current_utc, correlation)
             return ExecutionResult(
                 kind=ExecutionResultKind.EXECUTION_REJECTED,
                 reason="order_construction_failed",
@@ -165,11 +250,29 @@ class OrderManager:
                 )
             self._records[risk_result.order_id] = provisional
 
+        if not self._audit(
+            AuditEventType.ORDER_SUBMISSION_ATTEMPTED,
+            occurred_at=current_utc,
+            component=AuditComponent.ORDER_MANAGER,
+            correlation=correlation,
+            payload=_request_payload(request),
+        ):
+            with self._lock:
+                self._records.pop(risk_result.order_id, None)
+            released = self.risk_engine.release_approval(risk_result.order_id)
+            if released:
+                self._audit_release(risk_result.order_id, current_utc, correlation)
+            return _failure(
+                ExecutionResultKind.EXECUTION_REJECTED,
+                "audit_failure_before_submission",
+                "submission attempt could not be audited",
+            )
+
         try:
             broker_order_id = self.broker.submit_order(request)
         except Exception:
-            self.risk_engine.trigger_kill_switch(
-                KillSwitchReason.POSITION_RECONCILIATION_FAILED
+            self._submission_indeterminate(
+                current_utc, correlation, "broker_submission_exception"
             )
             return ExecutionResult(
                 kind=ExecutionResultKind.INDETERMINATE,
@@ -180,8 +283,8 @@ class OrderManager:
             )
 
         if not isinstance(broker_order_id, str) or not broker_order_id.strip():
-            self.risk_engine.trigger_kill_switch(
-                KillSwitchReason.POSITION_RECONCILIATION_FAILED
+            self._submission_indeterminate(
+                current_utc, correlation, "invalid_broker_order_id"
             )
             return ExecutionResult(
                 kind=ExecutionResultKind.INDETERMINATE,
@@ -194,6 +297,26 @@ class OrderManager:
         submitted = replace(provisional, broker_order_id=broker_order_id)
         with self._lock:
             self._records[risk_result.order_id] = submitted
+        submitted_correlation = replace(
+            correlation, broker_order_id=broker_order_id.strip()
+        )
+        if not self._audit(
+            AuditEventType.ORDER_SUBMITTED,
+            occurred_at=current_utc,
+            component=AuditComponent.PAPER_BROKER,
+            correlation=submitted_correlation,
+            payload={"status": submitted.status},
+        ):
+            self.risk_engine.trigger_kill_switch(
+                KillSwitchReason.POSITION_RECONCILIATION_FAILED
+            )
+            return ExecutionResult(
+                kind=ExecutionResultKind.INDETERMINATE,
+                reason="audit_failure_after_submission",
+                message="broker acknowledged submission but audit recording failed",
+                record=submitted,
+                risk_decision=risk_result,
+            )
         return ExecutionResult(
             kind=ExecutionResultKind.SUBMITTED,
             reason="submitted",
@@ -202,7 +325,9 @@ class OrderManager:
             risk_decision=risk_result,
         )
 
-    def refresh_order_status(self, client_order_id: str) -> ExecutionResult:
+    def refresh_order_status(
+        self, client_order_id: str, *, current_time: datetime | None = None
+    ) -> ExecutionResult:
         """Refresh one known order without inferring account-position reflection."""
         with self._lock:
             record = self._records.get(client_order_id)
@@ -223,6 +348,7 @@ class OrderManager:
         try:
             raw_status = self.broker.get_order_status(record.broker_order_id)
         except Exception:
+            self._audit_status_failure(record, current_time, "status_poll_exception")
             return ExecutionResult(
                 kind=ExecutionResultKind.STATUS_FAILURE,
                 reason="status_poll_exception",
@@ -231,6 +357,7 @@ class OrderManager:
             )
         status = _parse_status(raw_status)
         if status is None:
+            self._audit_status_failure(record, current_time, "malformed_broker_status")
             return ExecutionResult(
                 kind=ExecutionResultKind.STATUS_FAILURE,
                 reason="malformed_broker_status",
@@ -246,6 +373,7 @@ class OrderManager:
                     "unknown_client_order_id",
                     "client order ID is not managed",
                 )
+            changed = status is not current.status
             terminal_without_position = status in (
                 OrderStatus.REJECTED,
                 OrderStatus.CANCELLED,
@@ -258,8 +386,50 @@ class OrderManager:
             )
             self._records[client_order_id] = updated
 
+        correlation = _record_correlation(updated)
+        occurred_at = self._audit_time(current_time)
+        audit_ok = True
+        if changed and status in {
+            OrderStatus.FILLED,
+            OrderStatus.REJECTED,
+            OrderStatus.CANCELLED,
+        }:
+            event_type = {
+                OrderStatus.FILLED: AuditEventType.ORDER_FILLED,
+                OrderStatus.REJECTED: AuditEventType.ORDER_REJECTED,
+                OrderStatus.CANCELLED: AuditEventType.ORDER_CANCELLED,
+            }[status]
+            audit_ok = self._audit(
+                event_type,
+                occurred_at=occurred_at,
+                component=AuditComponent.PAPER_BROKER,
+                correlation=correlation,
+                payload={"previous_status": current.status, "status": status},
+            )
+        if not audit_ok:
+            if should_release:
+                with self._lock:
+                    latest = self._records.get(client_order_id)
+                    if latest is not None:
+                        self._records[client_order_id] = replace(
+                            latest, reservation_released=False
+                        )
+            return ExecutionResult(
+                kind=ExecutionResultKind.STATUS_FAILURE,
+                reason="audit_failure_after_status",
+                message="broker status changed but could not be audited",
+                record=updated,
+            )
         if should_release:
-            self.risk_engine.release_approval(client_order_id)
+            released = self.risk_engine.release_approval(client_order_id)
+            if released:
+                self._audit_release(client_order_id, occurred_at, correlation)
+            else:
+                with self._lock:
+                    latest = self._records.get(client_order_id)
+                    if latest is not None:
+                        updated = replace(latest, reservation_released=False)
+                        self._records[client_order_id] = updated
         return ExecutionResult(
             kind=ExecutionResultKind.STATUS_UPDATED,
             reason="status_updated",
@@ -267,7 +437,9 @@ class OrderManager:
             record=updated,
         )
 
-    def confirm_position_reflected(self, client_order_id: str) -> bool:
+    def confirm_position_reflected(
+        self, client_order_id: str, *, current_time: datetime | None = None
+    ) -> bool:
         """Release a filled order's reservation after explicit external confirmation."""
         with self._lock:
             record = self._records.get(client_order_id)
@@ -276,12 +448,122 @@ class OrderManager:
             if record.reservation_released:
                 return True
             self._records[client_order_id] = replace(record, reservation_released=True)
-        return self.risk_engine.release_approval(client_order_id)
+        released = self.risk_engine.release_approval(client_order_id)
+        if released:
+            self._audit_release(
+                client_order_id, self._audit_time(current_time), _record_correlation(record)
+            )
+        return released
+
+    @property
+    def audit_failed(self) -> bool:
+        with self._lock:
+            return self._audit_failed
 
     def get_order(self, client_order_id: str) -> OrderRecord | None:
         """Return an immutable snapshot for one managed order."""
         with self._lock:
             return self._records.get(client_order_id)
+
+    def _audit(
+        self,
+        event_type: AuditEventType,
+        *,
+        occurred_at: datetime,
+        component: AuditComponent,
+        correlation: EventCorrelation,
+        payload: dict[str, object],
+    ) -> bool:
+        if self.event_ledger is None:
+            return True
+        try:
+            self.event_ledger.append(
+                event_type,
+                occurred_at=occurred_at,
+                component=component,
+                correlation=correlation,
+                payload=payload,
+            )
+            return True
+        except Exception:
+            with self._lock:
+                self._audit_failed = True
+            return False
+
+    def _audit_time(self, value: datetime | None) -> datetime:
+        normalized = _aware_utc(value) if value is not None else None
+        if normalized is not None:
+            return normalized
+        if self.event_ledger is not None:
+            try:
+                return self.event_ledger.now()
+            except Exception:
+                pass
+        return datetime.now(UTC)
+
+    def _audit_release(
+        self, client_order_id: str, occurred_at: datetime, correlation: EventCorrelation
+    ) -> None:
+        self._audit(
+            AuditEventType.RESERVATION_RELEASED,
+            occurred_at=occurred_at,
+            component=AuditComponent.RISK_ENGINE,
+            correlation=replace(correlation, client_order_id=client_order_id),
+            payload={"client_order_id": client_order_id},
+        )
+
+    def _audit_status_failure(
+        self, record: OrderRecord, current_time: datetime | None, reason: str
+    ) -> None:
+        self._audit(
+            AuditEventType.ORDER_STATUS_FAILED,
+            occurred_at=self._audit_time(current_time),
+            component=AuditComponent.ORDER_MANAGER,
+            correlation=_record_correlation(record),
+            payload={"reason": reason},
+        )
+
+    def _audit_execution_failure(
+        self, signal: SignalEvent, occurred_at: datetime, reason: str
+    ) -> bool:
+        return self._audit(
+            AuditEventType.EXECUTION_FAILED,
+            occurred_at=occurred_at,
+            component=AuditComponent.ORDER_MANAGER,
+            correlation=_signal_correlation(signal),
+            payload={"reason": reason},
+        )
+
+    def _submission_indeterminate(
+        self, occurred_at: datetime, correlation: EventCorrelation, reason: str
+    ) -> None:
+        activated = self.risk_engine.trigger_kill_switch(
+            KillSwitchReason.POSITION_RECONCILIATION_FAILED
+        )
+        self._audit(
+            AuditEventType.ORDER_SUBMISSION_INDETERMINATE,
+            occurred_at=occurred_at,
+            component=AuditComponent.ORDER_MANAGER,
+            correlation=correlation,
+            payload={"reason": reason},
+        )
+        self._audit(
+            AuditEventType.RECONCILIATION_FAILED,
+            occurred_at=occurred_at,
+            component=AuditComponent.ORDER_MANAGER,
+            correlation=correlation,
+            payload={"reason": reason},
+        )
+        if activated:
+            self._audit(
+                AuditEventType.KILL_SWITCH_TRIGGERED,
+                occurred_at=occurred_at,
+                component=AuditComponent.RISK_ENGINE,
+                correlation=correlation,
+                payload={
+                    "reason": KillSwitchReason.POSITION_RECONCILIATION_FAILED
+                },
+            )
 
     def _current_entry_price(
         self, signal: SignalEvent, current_utc: datetime
@@ -419,6 +701,35 @@ def _positive_finite(value: object) -> bool:
 
 def _canonical_symbol(symbol: object) -> str:
     return symbol.strip().upper() if isinstance(symbol, str) else ""
+
+
+def _signal_correlation(
+    signal: SignalEvent, *, client_order_id: str | None = None
+) -> EventCorrelation:
+    try:
+        signal_id = deterministic_signal_id(signal)
+    except ValueError:
+        signal_id = None
+    return EventCorrelation(signal_id=signal_id, client_order_id=client_order_id)
+
+
+def _record_correlation(record: OrderRecord) -> EventCorrelation:
+    return EventCorrelation(
+        signal_id=record.client_order_id,
+        client_order_id=record.client_order_id,
+        broker_order_id=record.broker_order_id,
+    )
+
+
+def _request_payload(request: OrderRequest) -> dict[str, object]:
+    return {
+        "symbol": request.symbol,
+        "side": request.side,
+        "size": request.size,
+        "order_type": request.order_type,
+        "sl_price": request.sl_price,
+        "tp_price": request.tp_price,
+    }
 
 
 def _failure(kind: ExecutionResultKind, reason: str, message: str) -> ExecutionResult:

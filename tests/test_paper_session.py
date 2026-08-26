@@ -10,6 +10,7 @@ import pytest
 
 from fxlab.config import CostConfig, CostDefaults
 from fxlab.execution.broker import AccountInfo, Tick
+from fxlab.execution.event_ledger import AuditEventType, EventLedger
 from fxlab.execution.market_data import MarketDataStream
 from fxlab.execution.order_manager import ExecutionIntent, ExecutionResultKind, OrderManager
 from fxlab.execution.paper_broker import PaperBroker
@@ -121,7 +122,11 @@ def make_session(
         limits or RiskLimits(max_open_positions=5, max_trades_per_day=5),
         PipSizes(),
     )
-    manager = OrderManager(broker, risk)
+    ledger = EventLedger(
+        "test-paper-session",
+        time_provider=lambda: datetime(2026, 8, 25, 10, 0, tzinfo=UTC),
+    )
+    manager = OrderManager(broker, risk, ledger)
     session = PaperTradingSession(
         broker,
         replay,
@@ -130,6 +135,7 @@ def make_session(
         manager,
         risk,
         execution_policy,
+        ledger,
     )
     return session, risk, broker
 
@@ -145,6 +151,83 @@ def test_start_poll_stop_and_idempotent_lifecycle() -> None:
     session.stop()
     assert not broker.is_connected()
     assert session.poll_once().reason == "session_not_running"
+
+
+def test_audit_lifecycle_market_and_account_ordering() -> None:
+    session, _, _ = make_session(setup=NoSignalSetup())
+    session.start()
+    session.poll_once()
+    session.stop()
+    types = [event.event_type for event in session.event_ledger.events()]
+    assert types[0] is AuditEventType.SESSION_STARTED
+    assert types[-1] is AuditEventType.SESSION_STOPPED
+    assert types.index(AuditEventType.MARKET_EVENT) < types.index(
+        AuditEventType.ACCOUNT_OBSERVED
+    )
+
+
+def test_audit_signal_policy_intent_and_order_chain() -> None:
+    session, _, _ = make_session()
+    session.start()
+    result = session.poll_once()
+    assert result.kind is CycleKind.PROCESSED
+    types = [event.event_type for event in session.event_ledger.events()]
+    ordered = [
+        AuditEventType.MARKET_EVENT,
+        AuditEventType.SIGNAL_EMITTED,
+        AuditEventType.EXECUTION_INTENT_CREATED,
+        AuditEventType.RISK_APPROVED,
+        AuditEventType.ORDER_SUBMISSION_ATTEMPTED,
+        AuditEventType.ORDER_SUBMITTED,
+        AuditEventType.ORDER_FILLED,
+        AuditEventType.POSITION_OPENED,
+        AuditEventType.RESERVATION_RELEASED,
+    ]
+    assert [types.index(item) for item in ordered] == sorted(
+        types.index(item) for item in ordered
+    )
+    correlated = [
+        event
+        for event in session.event_ledger.events()
+        if event.correlation.client_order_id is not None
+    ]
+    assert len({event.correlation.client_order_id for event in correlated}) == 1
+
+
+def test_audit_policy_decline_and_failure() -> None:
+    declined, _, _ = make_session(execution_policy=lambda signal, context: None)
+    declined.start()
+    assert declined.poll_once().kind is CycleKind.POLICY_DECLINED
+    assert AuditEventType.SIGNAL_DECLINED in {
+        event.event_type for event in declined.event_ledger.events()
+    }
+
+    def broken_policy(signal, context):
+        raise RuntimeError("policy failed")
+
+    failed, _, _ = make_session(execution_policy=broken_policy)
+    failed.start()
+    assert failed.poll_once().reason == "execution_policy_failure"
+    assert AuditEventType.EXECUTION_POLICY_FAILED in {
+        event.event_type for event in failed.event_ledger.events()
+    }
+
+
+def test_ledger_failure_disables_future_session_execution() -> None:
+    session, _, broker = make_session()
+    session.start()
+
+    def fail_store(event) -> None:
+        raise OSError("ledger unavailable")
+
+    session.event_ledger._store_event = fail_store  # type: ignore[method-assign]
+    first = session.poll_once()
+    assert first.kind is CycleKind.FAILED
+    assert first.reason == "audit_unavailable"
+    submitted = len(broker.get_account_info().open_positions)
+    second = session.poll_once()
+    assert second.reason == "audit_unavailable"
+    assert len(broker.get_account_info().open_positions) == submitted
 
 
 def test_chronological_replay_and_no_lookahead() -> None:
@@ -323,6 +406,14 @@ def test_session_forwards_automatic_net_loss_exactly_once() -> None:
     assert risk.consecutive_losses == 1
     session.poll_once()
     assert risk.consecutive_losses == 1
+    close_events = [
+        event
+        for event in session.event_ledger.events()
+        if event.event_type is AuditEventType.POSITION_CLOSED
+    ]
+    assert len(close_events) == 1
+    assert close_events[0].payload["net_realized_pnl"] < 0
+    assert close_events[0].correlation.close_order_id is not None
 
 
 def test_manual_close_notifies_risk_and_is_idempotent() -> None:
@@ -388,6 +479,10 @@ def test_loss_kill_switch_blocks_same_cycle_signal() -> None:
     assert result.signals == ()
     assert risk.kill_switch_reason is KillSwitchReason.MAX_CONSECUTIVE_LOSSES
     assert risk.daily_trades == 1
+    assert sum(
+        event.event_type is AuditEventType.KILL_SWITCH_TRIGGERED
+        for event in session.event_ledger.events()
+    ) == 1
 
 
 def test_non_positive_paper_equity_is_rejected_by_risk_engine() -> None:

@@ -3,6 +3,14 @@
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .event_ledger import (
+        AuditComponent,
+        AuditEvent,
+        AuditEventType,
+        AuditLedgerError,
+        EventCorrelation,
+        EventLedger,
+    )
     from .order_manager import (
         ExecutionIntent,
         ExecutionResult,
@@ -21,6 +29,12 @@ if TYPE_CHECKING:
     )
 
 __all__ = [
+    "AuditComponent",
+    "AuditEvent",
+    "AuditEventType",
+    "AuditLedgerError",
+    "EventCorrelation",
+    "EventLedger",
     "ExecutionIntent",
     "ExecutionResult",
     "ExecutionResultKind",
@@ -41,9 +55,9 @@ __all__ = [
 
 def __getattr__(name: str) -> Any:
     if name in __all__:
-        from . import order_manager, paper_broker, paper_session
+        from . import event_ledger, order_manager, paper_broker, paper_session
 
-        for module in (order_manager, paper_broker, paper_session):
+        for module in (event_ledger, order_manager, paper_broker, paper_session):
             if hasattr(module, name):
                 return getattr(module, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

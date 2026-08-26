@@ -20,6 +20,7 @@ from fxlab.execution.broker import (
     OrderStatus,
     Tick,
 )
+from fxlab.execution.event_ledger import AuditEventType, EventLedger
 from fxlab.execution.signal_engine import SignalEvent
 from fxlab.risk import (
     KillSwitchReason,
@@ -165,10 +166,16 @@ class RiskSpy:
 
 def manager(
     risk_result: RiskDecision | RiskRejection | None = None,
+    *,
+    ledger: EventLedger | None = None,
 ) -> tuple[OrderManager, FakeBroker, RiskSpy]:
     broker = FakeBroker()
     risk = RiskSpy(risk_result or decision())
-    return OrderManager(broker=broker, risk_engine=risk), broker, risk  # type: ignore[arg-type]
+    return (
+        OrderManager(broker=broker, risk_engine=risk, event_ledger=ledger),
+        broker,
+        risk,
+    )  # type: ignore[arg-type]
 
 
 def intent(event: SignalEvent | None = None, **changes: object) -> ExecutionIntent:
@@ -443,6 +450,79 @@ def test_confirmation_requires_filled_status():
     order_manager.refresh_order_status(client_id)
     assert order_manager.confirm_position_reflected(client_id) is False
     assert risk.released == []
+
+
+def test_audit_records_risk_and_submission_ordering() -> None:
+    ledger = EventLedger("order-audit")
+    order_manager, _, _ = manager(ledger=ledger)
+    result = order_manager.submit(intent(), current_time=NOW)
+    assert result.kind is ExecutionResultKind.SUBMITTED
+    assert [event.event_type for event in ledger.events()] == [
+        AuditEventType.RISK_APPROVED,
+        AuditEventType.ORDER_SUBMISSION_ATTEMPTED,
+        AuditEventType.ORDER_SUBMITTED,
+    ]
+    assert ledger.events()[-1].correlation.broker_order_id == "broker-id-7"
+
+
+def test_audit_records_risk_rejection_without_submission() -> None:
+    rejected = RiskRejection("daily_limit", "daily limit", signal(), None, None)
+    ledger = EventLedger("order-rejection")
+    order_manager, broker, _ = manager(rejected, ledger=ledger)
+    result = order_manager.submit(intent(), current_time=NOW)
+    assert result.kind is ExecutionResultKind.RISK_REJECTED
+    assert broker.submitted == []
+    assert [event.event_type for event in ledger.events()] == [
+        AuditEventType.RISK_REJECTED
+    ]
+
+
+def test_unchanged_status_is_not_audited_twice() -> None:
+    ledger = EventLedger("status-audit")
+    order_manager, broker, _, client_id = submit_success()
+    order_manager.event_ledger = ledger
+    broker.status_result = {"status": "filled"}
+    order_manager.refresh_order_status(client_id, current_time=NOW)
+    order_manager.refresh_order_status(client_id, current_time=NOW)
+    assert [event.event_type for event in ledger.events()] == [
+        AuditEventType.ORDER_FILLED
+    ]
+
+
+def test_audit_failure_before_broker_call_releases_and_prevents_submit() -> None:
+    ledger = EventLedger("before-failure")
+    original = ledger._store_event
+
+    def fail_attempt(event) -> None:
+        if event.event_type is AuditEventType.ORDER_SUBMISSION_ATTEMPTED:
+            raise OSError("ledger unavailable")
+        original(event)
+
+    ledger._store_event = fail_attempt  # type: ignore[method-assign]
+    order_manager, broker, risk = manager(ledger=ledger)
+    result = order_manager.submit(intent(), current_time=NOW)
+    assert result.reason == "audit_failure_before_submission"
+    assert broker.submitted == []
+    assert risk.released == ["client-risk-id"]
+
+
+def test_audit_failure_after_broker_call_is_indeterminate() -> None:
+    ledger = EventLedger("after-failure")
+    original = ledger._store_event
+
+    def fail_acknowledgement(event) -> None:
+        if event.event_type is AuditEventType.ORDER_SUBMITTED:
+            raise OSError("ledger unavailable")
+        original(event)
+
+    ledger._store_event = fail_acknowledgement  # type: ignore[method-assign]
+    order_manager, broker, risk = manager(ledger=ledger)
+    result = order_manager.submit(intent(), current_time=NOW)
+    assert result.kind is ExecutionResultKind.INDETERMINATE
+    assert result.reason == "audit_failure_after_submission"
+    assert len(broker.submitted) == 1
+    assert risk.released == []
+    assert risk.kill_reasons == [KillSwitchReason.POSITION_RECONCILIATION_FAILED]
 
 
 def test_concurrent_confirmation_releases_exactly_once():
