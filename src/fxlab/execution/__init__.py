@@ -1,5 +1,28 @@
-"""Execution adapters (Phase 8+). Not in P1.
+"""Public execution-layer contracts."""
 
-Abstract BrokerAdapter with a paper-trading implementation using the cost model;
-a live adapter (OANDA v20 / MetaTrader5 — TBD) is added only at P9.
-"""
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .order_manager import (
+        ExecutionIntent,
+        ExecutionResult,
+        ExecutionResultKind,
+        OrderManager,
+        OrderRecord,
+    )
+
+__all__ = [
+    "ExecutionIntent",
+    "ExecutionResult",
+    "ExecutionResultKind",
+    "OrderManager",
+    "OrderRecord",
+]
+
+
+def __getattr__(name: str) -> Any:
+    if name in __all__:
+        from . import order_manager
+
+        return getattr(order_manager, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
