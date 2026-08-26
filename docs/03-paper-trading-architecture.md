@@ -1,7 +1,7 @@
 # Paper-Trading Infrastructure Architecture
 
-**Date:** 2026-08-25  
-**Status:** DESIGN PHASE (not yet implemented)  
+**Date:** 2026-08-26
+**Status:** IMPLEMENTED THROUGH PHASE 7; CURRENT ROADMAP ACTIVE
 **Prerequisites:** Research layer frozen at P4 NO-GO; no validated strategy exists  
 **Scope:** Trading-system infrastructure only — NO strategy creation, NO test window access
 
@@ -9,6 +9,236 @@
 > `docs/04-foundation-repair-decisions.md` supersede this draft wherever it discusses
 > market-data closure/overlap, SignalEngine duplicate scope, or ownership of future
 > execution-intent and risk concerns. No research-layer contract is changed.
+
+> **Current-roadmap notice (2026-08-26):** The roadmap below records the actual
+> implementation state and supersedes the original draft sequencing in §§5, 7–10,
+> and 12. Those later sections remain as historical design context, not current claims.
+
+## Current master roadmap
+
+### Completed execution foundation
+
+| Phase | Scope | Status |
+|---|---|---|
+| 1 | Broker contracts | **DONE** |
+| 2 | Market data stream | **DONE** |
+| 3 | Signal engine | **DONE** |
+| 4 | Risk engine | **DONE** |
+| 5 | Order manager | **DONE** |
+| 6 | Paper session and deterministic historical replay | **DONE** |
+| 7 | Economic paper execution and accounting | **DONE** |
+
+Phase 7 provides mark-to-market and realized PnL, balance/equity accounting,
+finite negative economic balances, deterministic closing, close-only SL/TP execution,
+configured transaction costs, immutable close events, and RiskEngine trade-close
+notification.
+
+Current limitations are explicit:
+
+- Monetary PnL uses a fixed `$10` pip-value-per-lot simplification. It is not universal
+  account-currency conversion and may approximate JPY and cross-currency results.
+- Historical replay observes one quote at each bar close; it makes no intrabar ordering
+  claim.
+- Margin and leverage are not modeled.
+- Runtime state is in memory only; there is no persistence or restart recovery.
+- No live broker is implemented.
+- No dynamic symbol/account-currency conversion exists.
+
+### Reliability and application track
+
+#### Phase 8 — Event ledger / immutable execution audit
+
+Add an append-only runtime event ledger with session and correlation IDs. The event
+vocabulary should cover, at minimum:
+
+`SESSION_STARTED`, `MARKET_EVENT`, `SIGNAL_EMITTED`, `SIGNAL_DECLINED`,
+`RISK_APPROVED`, `RISK_REJECTED`, `KILL_SWITCH_TRIGGERED`, `ORDER_SUBMITTED`,
+`ORDER_FILLED`, `ORDER_REJECTED`, `ORDER_CANCELLED`, `POSITION_OPENED`,
+`POSITION_MARKED`, `POSITION_CLOSED`, `RECONCILIATION_FAILED`, and `SESSION_STOPPED`.
+
+This ledger is not implemented yet.
+
+#### Phase 9 — Checkpoint and crash recovery
+
+Persist and reconstruct operational state: session ID, latest processed market timestamp,
+account state, open positions, pending orders, risk counters, peak and daily-start equity,
+kill-switch state, approved IDs, and reservations. Resume must verify configuration and
+software-version identity. Incompatible state must fail closed; there is no silent
+recovery.
+
+#### Phase 10 — Reconciliation engine
+
+Compare internal order/position state with authoritative broker account, order, and
+position state. Any mismatch freezes new entries, triggers
+`POSITION_RECONCILIATION_FAILED`, records an event, and requires controlled resolution.
+
+#### Phase 11 — Market-data provider abstraction
+
+Introduce a normalized provider boundary:
+
+```text
+provider-specific data
+    -> FXLAB canonical data contract
+    -> research and execution consumers
+```
+
+Potential providers include Dukascopy, HistoricalReplay, an optional OpenBB adapter,
+and broker market-data providers. OpenBB must not become a hard dependency.
+
+#### Phase 12 — Broker capability system / demo broker adapter
+
+Declare capabilities explicitly: market, limit, and stop orders; native SL/TP; hedging;
+netting; partial close; and client-order IDs. PaperBroker remains the first implementation.
+A real or demo external adapter follows only after this boundary is stable.
+
+#### Phase 13 — Runtime control plane
+
+Runtime states are `RUNNING`, `PAUSED`, `KILL_SWITCHED`,
+`RECONCILIATION_REQUIRED`, and `STOPPED`. Operator controls cover status, pause, resume,
+stop, manual kill switch, and inspection of orders, positions, and risk. `PAUSED` blocks
+new entries while monitoring and reconciliation continue.
+
+#### Phase 14 — CLI application runner
+
+Keep application logic outside the CLI. Potential commands are:
+
+- `fxlab paper replay`
+- `fxlab paper start`
+- `fxlab paper status`
+- `fxlab paper stop`
+- `fxlab paper orders`
+- `fxlab paper positions`
+- `fxlab paper events`
+
+#### Phase 15 — Monitoring dashboard
+
+Build only after runtime correctness is stable. Present account balance, equity, realized
+and unrealized PnL, drawdown; risk loss, consecutive losses, kill switch, reservations;
+positions, orders, broker health, data freshness, reconciliation health, and latest event.
+
+#### Phases 16–20 — Later execution realism and operations
+
+| Phase | Planned scope |
+|---|---|
+| 16 | External data connectors and optional OpenBB adapter |
+| 17 | External broker adapters |
+| 18 | Dynamic pip value, account-currency conversion, leverage/margin, partial fills, latency, richer slippage, and variable spread |
+| 19 | Deployment, secrets, and operational hardening |
+| 20 | Explicit live-readiness audit |
+
+None of Phases 8–20 is implemented by this roadmap update.
+
+### Edge / performance research track
+
+The execution roadmap and the research roadmap are separate workstreams. Current
+research status is:
+
+- Models A–F failed P4 robustness.
+- Multi-asset TSMOM failed P4 robustness.
+- No validated trading edge currently exists.
+- Improving infrastructure does not automatically improve win rate or expectancy.
+
+The objective is positive **out-of-sample expectancy after realistic costs**, with
+acceptable drawdown and sufficient observations. Win rate alone is not the target.
+Every assessment must report trade count, win rate, average win, average loss, payoff
+ratio, expectancy, profit factor, Sharpe or another appropriate risk-adjusted measure,
+maximum drawdown, cost drag, regime/sub-period stability, and cross-market stability.
+
+#### Research R1 — Freeze execution infrastructure baseline
+
+After the reliability-critical simulator is trustworthy, freeze its assumptions and
+version. Every research result references the execution-model version or commit hash.
+
+#### Research R2 — Candidate mechanism registry
+
+Before testing, register the hypothesis, economic or structural prior, exact entry and
+exit rules, SL/TP rule, timeframe, universe, expected failure mode, and predefined
+acceptance gate. Do not tune until a mechanism first demonstrates profitability under
+the predefined evaluation.
+
+#### Research R3 — Candidate generation
+
+Investigate genuinely different mechanisms rather than minor parameter variants.
+Candidate classes may include cross-sectional/relative-value, volatility regime,
+trend/regime-conditioned behavior, carry or rate differential where proper data exists,
+mean reversion, momentum, session/microstructure effects, and portfolio diversification.
+Rejected SMC results are not evidence for a new mechanism.
+
+#### Research R4 — Train/validation testing
+
+Use train and validation data only. Include spread, commission, slippage, +50% cost
+stress, walk-forward validation, cross-pair or cross-instrument validation, leakage
+tests, and future-invariance tests. The test window remains sealed.
+
+#### Research R5 — Statistical robustness
+
+Require enough observations and examine confidence intervals, appropriate t-statistics
+or uncertainty estimates, parameter sensitivity, sub-period consistency, regime
+dependence, and multiple-comparison risk. One lucky parameter cell is not promotable.
+
+#### Research R6 — Untouched test gate
+
+Only a mechanism passing all earlier gates may open the sealed test set once under the
+research charter. Do not retune after observing the test result.
+
+#### Research R7 — Deterministic paper forward validation
+
+Run a validated strategy through the actual paper-execution system. Compare expected
+backtest behavior with realized paper behavior, including signal and execution
+differences, cost differences, missed trades, drawdown differences, latency, and data
+problems.
+
+#### Research R8 — Live-demo forward validation
+
+Only a strategy that survives deterministic paper validation may enter a broker
+demo/practice environment. This stage uses no real money.
+
+#### Research R9 — Live-readiness gate
+
+There is no automatic promotion. Live readiness eventually requires validated positive
+expectancy, acceptable drawdown, execution realism, sufficient sample size, paper-forward
+consistency, no unresolved reconciliation defects, stable risk controls, operational
+recovery, and broker-capability verification.
+
+### AI / agent policy
+
+AI may later summarize experiments, discover research questions, explain failures,
+classify market context, collect news or macro context, generate hypotheses, and compare
+experiments. AI does not receive authority to bypass validation or risk controls.
+
+```text
+LLM says BUY -> execute trade
+```
+
+is not an allowed architecture. Every AI-produced mechanism must pass the same
+deterministic research gates. No AI trading mechanism is implemented now.
+
+### External project lessons
+
+These projects are architectural references only:
+
+- **Fincept:** broker modularity, terminal/monitoring separation, and paper/live
+  execution boundaries.
+- **OpenBB:** standardized provider abstraction, normalized data contracts, and
+  connect-once/consume-many architecture.
+- **TradingAgents:** verified/as-of data access, decision logging, recovery/checkpoint
+  concepts, and AI kept research-oriented rather than treated as proof of edge.
+- **Paperclip:** immutable activity history, approvals and governance, pause/kill
+  controls, recovery, budget/cost controls, and an operational control plane.
+
+Their strategies are not copied, and popularity or repository stars are not evidence of
+profitability.
+
+### Master rules
+
+> **INFRASTRUCTURE CONFIDENCE != TRADING EDGE**
+
+> **AI RESEARCH != PERMISSION TO TRADE**
+
+The system may progress toward live execution only when a strategy independently passes
+the research gates. Architecture improvements are described by the properties they
+guarantee; no artificial confidence percentages are assigned without an explicitly
+defined measurement.
 
 ---
 

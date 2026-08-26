@@ -4,6 +4,10 @@
 **Status:** Approved foundation clarification  
 **Scope:** Execution-layer foundations only; the research layer remains frozen
 
+> **Implementation status (2026-08-26):** These foundation decisions have been
+> implemented. Execution Phases 1–7 are complete; the current roadmap is maintained in
+> `docs/03-paper-trading-architecture.md`.
+
 ## Market-data closure watermark
 
 A bar is closed only when:
@@ -36,17 +40,16 @@ its own state. There is no global, singleton, file, database, cross-process, or 
 durable duplicate state.
 
 `SignalEvent` remains directional only. Its contract is unchanged and does not carry
-entry, stop-loss, or take-profit prices. A future execution-intent layer owns entry,
+entry, stop-loss, or take-profit prices. The execution-intent layer owns entry,
 stop-loss, and take-profit construction.
 
-## Future Phase 4 dependencies and state
+## Phase 4 dependencies and state
 
-Phase 4 has not started. When approved, symbol pip-size lookup will use
-`CostConfig.pip_size_for(symbol)`, not `CostModel.pip_size_for(symbol)`.
+The implemented RiskEngine uses `CostConfig.pip_size_for(symbol)`, not
+`CostModel.pip_size_for(symbol)`, for symbol pip-size lookup.
 
-The first `RiskEngine` version will use in-memory session state only. It will make no
-restart-durability claim; persistence and recovery semantics require a separate future
-decision and approval.
+The first `RiskEngine` version uses in-memory session state only. It makes no
+restart-durability claim; persistence and recovery are planned separately in Phase 9.
 
 ## Research integrity
 
