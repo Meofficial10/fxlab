@@ -52,6 +52,7 @@ def configuration_fingerprint(
         "timeframe": session.replay.timeframe,
         "execution_policy_id": execution_policy_id.strip(),
         "replay_dataset_fingerprint": session.replay.dataset_fingerprint,
+        "market_data_provider": session.replay.provider_compatibility_snapshot(),
     }
     return hashlib.sha256(_canonical_json(document).encode()).hexdigest()
 

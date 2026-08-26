@@ -42,6 +42,11 @@ class AuditEventType(StrEnum):
     RECONCILIATION_STARTED = "reconciliation_started"
     RECONCILIATION_RESOLVED = "reconciliation_resolved"
     RECONCILIATION_UNRESOLVED = "reconciliation_unresolved"
+    DATA_PROVIDER_SELECTED = "data_provider_selected"
+    DATA_PROVIDER_FAILED = "data_provider_failed"
+    DATA_PROVIDER_FALLBACK = "data_provider_fallback"
+    DATA_STALE = "data_stale"
+    DATASET_BOUND = "dataset_bound"
     RUNTIME_FAILURE = "runtime_failure"
 
 
@@ -54,6 +59,7 @@ class AuditComponent(StrEnum):
     ORDER_MANAGER = "order_manager"
     PAPER_BROKER = "paper_broker"
     RECONCILIATION_ENGINE = "reconciliation_engine"
+    MARKET_DATA_PROVIDER = "market_data_provider"
 
 
 class AuditLedgerError(RuntimeError):

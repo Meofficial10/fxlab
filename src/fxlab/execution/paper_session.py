@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import struct
 from collections.abc import Mapping
@@ -13,6 +14,7 @@ from typing import Protocol
 
 import pandas as pd
 
+from ..data.provider import ProvenanceQuality
 from ..data.schema import OHLCV, timeframe_to_timedelta
 from ..risk.engine import KillSwitchReason, RiskEngine
 from .broker import AccountInfo, OrderStatus, Tick
@@ -78,12 +80,24 @@ class HistoricalBarReplay:
 
     bars_by_symbol: Mapping[str, pd.DataFrame]
     timeframe: str
+    provider_id: str = "historical-replay"
+    provider_version: str = "1"
+    normalization_version: str = "1"
+    provenance_quality: ProvenanceQuality = ProvenanceQuality.SYNTHETIC
     _events: tuple[Tick, ...] = field(init=False, repr=False)
     _cursor: int = field(default=0, init=False)
     _stopped: bool = field(default=False, init=False)
     _dataset_fingerprint: str = field(init=False, repr=False)
+    _dataset_id: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        for name in ("provider_id", "provider_version", "normalization_version"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be non-empty")
+            object.__setattr__(self, name, value.strip())
+        if not isinstance(self.provenance_quality, ProvenanceQuality):
+            raise ValueError("provenance_quality must be a ProvenanceQuality")
         delta = timeframe_to_timedelta(self.timeframe)
         digest = hashlib.sha256(b"fxlab-replay-dataset-v1\0")
         digest.update(self.timeframe.encode("utf-8") + b"\0")
@@ -118,6 +132,17 @@ class HistoricalBarReplay:
         events.sort(key=lambda tick: (tick.timestamp.astimezone(UTC), tick.symbol))
         self._events = tuple(events)
         self._dataset_fingerprint = digest.hexdigest()
+        identity = {
+            "format": 1,
+            "provider_id": self.provider_id,
+            "provider_version": self.provider_version,
+            "normalization_version": self.normalization_version,
+            "content_hash": self._dataset_fingerprint,
+            "timeframe": self.timeframe,
+        }
+        self._dataset_id = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
 
     @property
     def exhausted(self) -> bool:
@@ -126,6 +151,23 @@ class HistoricalBarReplay:
     @property
     def dataset_fingerprint(self) -> str:
         return self._dataset_fingerprint
+
+    @property
+    def dataset_id(self) -> str:
+        return self._dataset_id
+
+    def provider_compatibility_snapshot(self) -> dict[str, object]:
+        return {
+            "provider_id": self.provider_id,
+            "provider_version": self.provider_version,
+            "capabilities": ["deterministic_replay", "point_in_time", "replay_events"],
+            "mapping_identity": "canonical-v1",
+            "normalization_version": self.normalization_version,
+            "freshness_policy": "replay-clock-v1",
+            "fallback_policy": "none",
+            "dataset_id": self.dataset_id,
+            "content_hash": self.dataset_fingerprint,
+        }
 
     def next_tick(self, *, until: datetime | None = None) -> Tick | None:
         if self._stopped or self.exhausted:
@@ -225,6 +267,32 @@ class PaperTradingSession:
                 component=AuditComponent.PAPER_SESSION,
                 payload={"runtime_id": self.runtime_id},
             )
+            self._append(
+                AuditEventType.DATA_PROVIDER_SELECTED,
+                occurred_at=self.event_ledger.now(),
+                component=AuditComponent.MARKET_DATA_PROVIDER,
+                payload={
+                    "provider_id": self.replay.provider_id,
+                    "provider_version": self.replay.provider_version,
+                    "normalization_version": self.replay.normalization_version,
+                    "fallback_policy": "none",
+                },
+            )
+            self._append(
+                AuditEventType.DATASET_BOUND,
+                occurred_at=self.event_ledger.now(),
+                component=AuditComponent.MARKET_DATA_PROVIDER,
+                payload={
+                    "provider_id": self.replay.provider_id,
+                    "provider_version": self.replay.provider_version,
+                    "dataset_id": self.replay.dataset_id,
+                    "content_hash": self.replay.dataset_fingerprint,
+                    "normalization_version": self.replay.normalization_version,
+                    "symbols": tuple(sorted(self.replay.bars_by_symbol)),
+                    "timeframe": self.replay.timeframe,
+                    "provenance_quality": self.replay.provenance_quality.value,
+                },
+            )
         except AuditLedgerError:
             self.broker.disconnect()
             self._audit_failed = True
@@ -280,6 +348,9 @@ class PaperTradingSession:
                     "ask": tick.ask,
                     "mid": tick.mid,
                     "timestamp": tick.timestamp,
+                    "provider_id": self.replay.provider_id,
+                    "dataset_id": self.replay.dataset_id,
+                    "normalization_version": self.replay.normalization_version,
                 },
             )
             self.market_data.on_tick(tick)

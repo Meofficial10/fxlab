@@ -15,6 +15,8 @@ from threading import Lock
 
 import pandas as pd
 
+from ..data.provider import BarQuery, CanonicalInstrument, ProviderRoute
+from ..data.providers import ProviderGateway
 from ..data.schema import OHLCV, timeframe_to_offset, timeframe_to_timedelta
 from .broker import BrokerAdapter, Tick
 
@@ -36,6 +38,8 @@ class MarketDataStream:
     symbols: list[str]
     tick_buffer_size: int = 1000
     time_provider: Callable[[], datetime] = field(default=_utc_now, repr=False)
+    historical_gateway: ProviderGateway | None = field(default=None, repr=False)
+    historical_route: ProviderRoute | None = field(default=None, repr=False)
 
     # Master stream lock for dynamic symbol registration
     _stream_lock: Lock = field(default_factory=Lock, init=False)
@@ -48,6 +52,8 @@ class MarketDataStream:
     _bar_cache: dict[tuple[str, str], pd.DataFrame] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
+        if (self.historical_gateway is None) != (self.historical_route is None):
+            raise ValueError("historical_gateway and historical_route must be supplied together")
         self._stream_lock = Lock()
         for sym in self.symbols:
             self._tick_buffers[sym] = deque(maxlen=self.tick_buffer_size)
@@ -146,7 +152,28 @@ class MarketDataStream:
         Combines historical bars from the broker with real-time aggregated tick bars,
         filtering out any currently-forming (unclosed) bar.
         """
-        hist_bars = self.broker.get_historical_bars(symbol, tf, count)
+        with self._locks.get(symbol, Lock()):
+            ticks = list(self._tick_buffers.get(symbol, []))
+
+        tf_delta = timeframe_to_timedelta(tf)
+        watermark = self._authoritative_watermark(ticks)
+        if self.historical_gateway is not None and self.historical_route is not None:
+            query = BarQuery(
+                CanonicalInstrument(symbol),
+                tf,
+                (watermark - (tf_delta * count)).to_pydatetime(),
+                watermark.to_pydatetime(),
+                watermark.to_pydatetime(),
+            )
+            dataset = self.historical_gateway.fetch_bars(self.historical_route, query)
+            hist_bars = dataset.frame
+            hist_bars.attrs.update(
+                provider_id=dataset.provenance.provider_id,
+                dataset_id=dataset.provenance.dataset_id,
+                normalization_version=dataset.provenance.normalization_version,
+            )
+        else:
+            hist_bars = self.broker.get_historical_bars(symbol, tf, count)
         if not hist_bars.empty:
             hist_bars = hist_bars.copy()
             if hist_bars.index.tz is None:
@@ -154,11 +181,6 @@ class MarketDataStream:
             else:
                 hist_bars.index = hist_bars.index.tz_convert("UTC")
 
-        with self._locks.get(symbol, Lock()):
-            ticks = list(self._tick_buffers.get(symbol, []))
-
-        tf_delta = timeframe_to_timedelta(tf)
-        watermark = self._authoritative_watermark(ticks)
         tick_bars = self._aggregate_ticks_to_bars(ticks, tf, symbol)
 
         # Neither broker history nor reconstructed ticks prove closure on their own.

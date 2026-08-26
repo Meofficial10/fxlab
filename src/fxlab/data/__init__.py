@@ -1,1 +1,53 @@
-"""Data ingestion, canonical candle schema, validation, and resampling (Phase 1)."""
+"""Canonical data contracts, local providers, ingestion, and validation."""
+
+from .provider import (
+    BarDataset,
+    BarQuery,
+    CanonicalInstrument,
+    DataProvenance,
+    HistoricalBarsProvider,
+    LatestTickProvider,
+    ProvenanceQuality,
+    ProviderCapability,
+    ProviderDescriptor,
+    ProviderFailure,
+    ProviderFailureCategory,
+    ProviderRoute,
+    ReplayEventProvider,
+    TickQuery,
+    TickSnapshot,
+)
+from .providers import (
+    HistoricalReplayProvider,
+    InMemoryBarProvider,
+    LocalParquetProvider,
+    ProviderGateway,
+    ProviderGatewayError,
+    ProviderRegistry,
+    SymbolAliasMap,
+)
+
+__all__ = [
+    "BarDataset",
+    "BarQuery",
+    "CanonicalInstrument",
+    "DataProvenance",
+    "HistoricalBarsProvider",
+    "HistoricalReplayProvider",
+    "InMemoryBarProvider",
+    "LatestTickProvider",
+    "LocalParquetProvider",
+    "ProviderCapability",
+    "ProviderDescriptor",
+    "ProviderFailure",
+    "ProviderFailureCategory",
+    "ProviderGateway",
+    "ProviderGatewayError",
+    "ProviderRegistry",
+    "ProviderRoute",
+    "ProvenanceQuality",
+    "ReplayEventProvider",
+    "SymbolAliasMap",
+    "TickQuery",
+    "TickSnapshot",
+]
