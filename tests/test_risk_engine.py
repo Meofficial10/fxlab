@@ -65,6 +65,17 @@ def account(equity: float = 10_000.0, positions: list[Position] | None = None) -
     )
 
 
+def corrupted_account(equity: object) -> AccountInfo:
+    """Simulate malformed runtime state that bypassed the public DTO constructor."""
+    snapshot = object.__new__(AccountInfo)
+    object.__setattr__(snapshot, "balance", 10_000.0)
+    object.__setattr__(snapshot, "equity", equity)
+    object.__setattr__(snapshot, "margin_used", 0.0)
+    object.__setattr__(snapshot, "margin_available", equity)
+    object.__setattr__(snapshot, "open_positions", [])
+    return snapshot
+
+
 def position(**changes: object) -> Position:
     values = {
         "symbol": "EURUSD",
@@ -332,7 +343,7 @@ def test_invalid_account_object_is_rejected(bad_account: object):
 
 @pytest.mark.parametrize("equity", [0.0, -1.0, nan, inf, -inf])
 def test_invalid_equity_is_rejected(equity: float):
-    assert_rejected(evaluate(engine(), account=account(equity)), "invalid_equity")
+    assert_rejected(evaluate(engine(), account=corrupted_account(equity)), "invalid_equity")
 
 
 def test_open_positions_must_be_a_list():
@@ -507,7 +518,7 @@ def test_engine_configuration_is_immutable_after_validation(field: str):
 
 def test_huge_integer_inputs_fail_closed_or_raise_configuration_value_error():
     huge = 10**10_000
-    assert_rejected(evaluate(engine(), account=account(huge)), "invalid_equity")
+    assert_rejected(evaluate(engine(), account=corrupted_account(huge)), "invalid_equity")
     assert_rejected(evaluate(engine(), entry_price=huge), "invalid_entry_price")
     assert_rejected(engine().on_trade_closed(huge), "invalid_realized_pnl")
     with pytest.raises(ValueError):

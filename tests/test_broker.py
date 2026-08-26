@@ -157,8 +157,28 @@ def test_account_info_instantiation_and_validation():
     assert len(acc.open_positions) == 1
     assert acc.open_positions[0].position_id == "pos_456"
 
-    with pytest.raises(ValueError, match="Account balance cannot be negative"):
-        AccountInfo(balance=-10.0, equity=0.0, margin_used=0.0, margin_available=0.0)
+    negative = AccountInfo(
+        balance=-10.0,
+        equity=-12.0,
+        margin_used=0.0,
+        margin_available=-12.0,
+    )
+    assert negative.balance == -10.0
+    assert negative.equity == -12.0
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("field", ["balance", "equity", "margin_used", "margin_available"])
+def test_account_info_rejects_non_finite_values(field: str, value: float):
+    values = {
+        "balance": 100.0,
+        "equity": 100.0,
+        "margin_used": 0.0,
+        "margin_available": 100.0,
+    }
+    values[field] = value
+    with pytest.raises(ValueError, match="finite number"):
+        AccountInfo(**values)
 
 
 def test_account_info_default_open_positions():

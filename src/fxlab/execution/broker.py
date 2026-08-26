@@ -7,6 +7,7 @@ future live broker implementations to be swapped seamlessly.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -69,8 +70,16 @@ class AccountInfo:
     open_positions: list[Position] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        if self.balance < 0:
-            raise ValueError(f"Account balance cannot be negative, got {self.balance}")
+        for name in ("balance", "equity", "margin_used", "margin_available"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"Account {name} must be a finite number")
+            try:
+                finite = math.isfinite(float(value))
+            except (OverflowError, TypeError, ValueError):
+                finite = False
+            if not finite:
+                raise ValueError(f"Account {name} must be a finite number")
 
 
 @dataclass

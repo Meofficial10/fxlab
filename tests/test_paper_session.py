@@ -8,7 +8,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from fxlab.execution.broker import Tick
+from fxlab.config import CostConfig, CostDefaults
+from fxlab.execution.broker import AccountInfo, Tick
 from fxlab.execution.market_data import MarketDataStream
 from fxlab.execution.order_manager import ExecutionIntent, ExecutionResultKind, OrderManager
 from fxlab.execution.paper_broker import PaperBroker
@@ -19,7 +20,7 @@ from fxlab.execution.paper_session import (
     PaperTradingSession,
 )
 from fxlab.execution.signal_engine import SignalEngine, SignalEvent
-from fxlab.risk import KillSwitchReason, RiskEngine, RiskLimits
+from fxlab.risk import KillSwitchReason, RiskEngine, RiskLimits, RiskRejection
 
 
 class PipSizes:
@@ -41,6 +42,15 @@ class NoSignalSetup:
         return np.array([], dtype=int), np.array([], dtype=int)
 
 
+class FirstSignalSetup:
+    name = "first_signal"
+
+    def generate(self, bars: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        if len(bars) == 1:
+            return np.array([0]), np.array([1])
+        return np.array([], dtype=int), np.array([], dtype=int)
+
+
 def bars(periods: int = 2) -> pd.DataFrame:
     index = pd.date_range("2026-08-25 10:00", periods=periods, freq="5min", tz="UTC")
     close = np.arange(periods, dtype=float) * 0.001 + 1.1000
@@ -56,6 +66,27 @@ def bars(periods: int = 2) -> pd.DataFrame:
     )
 
 
+def bars_from_closes(closes: list[float]) -> pd.DataFrame:
+    frame = bars(len(closes))
+    frame["open"] = closes
+    frame["high"] = np.asarray(closes) + 0.0005
+    frame["low"] = np.asarray(closes) - 0.0005
+    frame["close"] = closes
+    return frame
+
+
+def zero_costs() -> CostConfig:
+    return CostConfig(
+        default=CostDefaults(
+            spread_pips=0.0,
+            commission_per_lot_roundturn=0.0,
+            slippage_pips_base=0.0,
+            slippage_vol_coeff=0.0,
+            latency_bars=1,
+        )
+    )
+
+
 def policy(signal: SignalEvent, context: MarketContext) -> ExecutionIntent:
     assert context.closed_bars.index.max() + pd.Timedelta(minutes=5) <= context.current_time
     return ExecutionIntent(signal, sl_price=context.tick.bid - 0.001, tp_price=None)
@@ -67,9 +98,14 @@ def make_session(
     execution_policy=policy,
     source: pd.DataFrame | None = None,
     broker_type=PaperBroker,
+    limits: RiskLimits | None = None,
+    costs: CostConfig | None = None,
 ) -> tuple[PaperTradingSession, RiskEngine, PaperBroker]:
     frame = source if source is not None else bars()
-    broker = broker_type(historical_bars={("EURUSD", "M5"): frame})
+    broker = broker_type(
+        historical_bars={("EURUSD", "M5"): frame},
+        cost_config=costs,
+    )
     replay = HistoricalBarReplay({"EURUSD": frame}, "M5")
     market_data = MarketDataStream(
         broker=broker,
@@ -82,7 +118,7 @@ def make_session(
         timeframe="M5",
     )
     risk = RiskEngine(
-        RiskLimits(max_open_positions=5, max_trades_per_day=5),
+        limits or RiskLimits(max_open_positions=5, max_trades_per_day=5),
         PipSizes(),
     )
     manager = OrderManager(broker, risk)
@@ -265,3 +301,113 @@ def test_replay_close_quote_is_zero_spread_without_microstructure() -> None:
     event = replay.next_tick()
     assert isinstance(event, Tick)
     assert event.bid == event.ask == event.mid
+
+
+def test_session_forwards_automatic_net_loss_exactly_once() -> None:
+    frame = bars_from_closes([1.1, 1.08, 1.07])
+
+    def stop_policy(signal: SignalEvent, context: MarketContext) -> ExecutionIntent:
+        return ExecutionIntent(signal, sl_price=1.09)
+
+    session, risk, _ = make_session(
+        setup=FirstSignalSetup(),
+        execution_policy=stop_policy,
+        source=frame,
+        costs=zero_costs(),
+    )
+    session.start()
+    session.poll_once()
+    closed = session.poll_once()
+    assert len(closed.closes) == 1
+    assert closed.closes[0].net_realized_pnl < 0
+    assert risk.consecutive_losses == 1
+    session.poll_once()
+    assert risk.consecutive_losses == 1
+
+
+def test_manual_close_notifies_risk_and_is_idempotent() -> None:
+    session, risk, broker = make_session(
+        setup=FirstSignalSetup(),
+        source=bars(1),
+        costs=zero_costs(),
+    )
+    risk.on_trade_closed(-1.0)
+    session.start()
+    session.poll_once()
+    position_id = broker.get_account_info().open_positions[0].position_id
+    close = session.close_position(position_id)
+    assert close is not None
+    assert close.net_realized_pnl == pytest.approx(0.0)
+    assert risk.consecutive_losses == 0
+    assert session.close_position(position_id) is None
+    assert risk.consecutive_losses == 0
+
+
+def test_winning_close_resets_consecutive_losses() -> None:
+    frame = bars_from_closes([1.1, 1.102])
+
+    def target_policy(signal: SignalEvent, context: MarketContext) -> ExecutionIntent:
+        return ExecutionIntent(signal, sl_price=1.09, tp_price=1.101)
+
+    session, risk, _ = make_session(
+        setup=FirstSignalSetup(),
+        execution_policy=target_policy,
+        source=frame,
+        costs=zero_costs(),
+    )
+    risk.on_trade_closed(-1.0)
+    session.start()
+    session.poll_once()
+    result = session.poll_once()
+    assert result.closes[0].net_realized_pnl > 0
+    assert risk.consecutive_losses == 0
+
+
+def test_loss_kill_switch_blocks_same_cycle_signal() -> None:
+    frame = bars_from_closes([1.1, 1.08])
+
+    def stop_policy(signal: SignalEvent, context: MarketContext) -> ExecutionIntent:
+        return ExecutionIntent(signal, sl_price=1.09)
+
+    limits = RiskLimits(
+        max_open_positions=5,
+        max_trades_per_day=5,
+        max_consecutive_losses=1,
+    )
+    session, risk, _ = make_session(
+        execution_policy=stop_policy,
+        source=frame,
+        limits=limits,
+        costs=zero_costs(),
+    )
+    session.start()
+    session.poll_once()
+    result = session.poll_once()
+    assert result.kind is CycleKind.FAILED
+    assert result.closes
+    assert result.signals == ()
+    assert risk.kill_switch_reason is KillSwitchReason.MAX_CONSECUTIVE_LOSSES
+    assert risk.daily_trades == 1
+
+
+def test_non_positive_paper_equity_is_rejected_by_risk_engine() -> None:
+    risk = RiskEngine(RiskLimits(), PipSizes())
+    negative = AccountInfo(-1.0, -1.0, 0.0, -1.0)
+    event = SignalEvent(
+        setup_name="test",
+        symbol="EURUSD",
+        timeframe="M5",
+        side=1,
+        signal_time=datetime(2026, 8, 25, 10, 5, tzinfo=UTC),
+        signal_bar_index=0,
+    )
+    result = risk.evaluate(
+        event,
+        entry_price=1.1,
+        sl_price=1.09,
+        tp_price=None,
+        account=negative,
+        current_time=event.signal_time,
+    )
+    assert isinstance(result, RiskRejection)
+    assert result.reason == "invalid_equity"

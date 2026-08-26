@@ -10,7 +10,7 @@ if TYPE_CHECKING:
         OrderManager,
         OrderRecord,
     )
-    from .paper_broker import OrderCorrelation, PaperBroker
+    from .paper_broker import CloseReason, OrderCorrelation, PaperBroker, PositionClose
     from .paper_session import (
         CycleKind,
         ExecutionPolicy,
@@ -28,6 +28,8 @@ __all__ = [
     "OrderRecord",
     "OrderCorrelation",
     "PaperBroker",
+    "CloseReason",
+    "PositionClose",
     "CycleKind",
     "ExecutionPolicy",
     "HistoricalBarReplay",

@@ -16,7 +16,7 @@ from ..risk.engine import KillSwitchReason, RiskEngine
 from .broker import OrderStatus, Tick
 from .market_data import MarketDataStream
 from .order_manager import ExecutionIntent, ExecutionResult, ExecutionResultKind, OrderManager
-from .paper_broker import PaperBroker
+from .paper_broker import PaperBroker, PositionClose
 from .signal_engine import SignalEngine, SignalEvent
 
 
@@ -52,6 +52,7 @@ class PaperCycleResult:
     tick: Tick | None = None
     signals: tuple[SignalEvent, ...] = ()
     executions: tuple[ExecutionResult, ...] = ()
+    closes: tuple[PositionClose, ...] = ()
     reason: str = ""
     message: str = ""
 
@@ -169,6 +170,7 @@ class PaperTradingSession:
                     current_time,
                 )
             self.market_data.on_tick(tick)
+            closes = self._drain_close_events()
             account = self.broker.get_account_info()
         except Exception:
             return _cycle_failure(
@@ -181,6 +183,7 @@ class PaperTradingSession:
                 kind=CycleKind.FAILED,
                 current_time=current_time,
                 tick=tick,
+                closes=closes,
                 reason=account_rejection.reason,
                 message=account_rejection.message,
             )
@@ -232,11 +235,46 @@ class PaperTradingSession:
         executions.extend(self._refresh_and_reconcile())
         if executions:
             return PaperCycleResult(
-                CycleKind.PROCESSED, current_time, tick, signals, tuple(executions)
+                CycleKind.PROCESSED,
+                current_time,
+                tick,
+                signals,
+                tuple(executions),
+                closes,
             )
         if declined:
-            return PaperCycleResult(CycleKind.POLICY_DECLINED, current_time, tick, signals)
-        return PaperCycleResult(CycleKind.NO_SIGNAL, current_time, tick, signals)
+            return PaperCycleResult(
+                CycleKind.POLICY_DECLINED,
+                current_time,
+                tick,
+                signals,
+                closes=closes,
+            )
+        return PaperCycleResult(
+            CycleKind.NO_SIGNAL,
+            current_time,
+            tick,
+            signals,
+            closes=closes,
+        )
+
+    def close_position(self, position_id: str) -> PositionClose | None:
+        """Manually close a paper position and notify risk exactly once."""
+        if not self._started or self._stopped:
+            return None
+        close_order_id = self.broker.close_position(position_id)
+        if close_order_id is None:
+            return None
+        events = self._drain_close_events()
+        close = next(
+            (event for event in events if event.close_order_id == close_order_id),
+            None,
+        )
+        if close is not None:
+            self.risk_engine.check_account_state(
+                self.broker.get_account_info(), close.close_time
+            )
+        return close
 
     def stop(self) -> None:
         if self._stopped:
@@ -281,6 +319,12 @@ class PaperTradingSession:
                 )
                 results.append(_reconciliation_failure(result))
         return results
+
+    def _drain_close_events(self) -> tuple[PositionClose, ...]:
+        events = self.broker.drain_close_events()
+        for event in events:
+            self.risk_engine.on_trade_closed(event.net_realized_pnl)
+        return events
 
 
 def _positive_float(value: object) -> float | None:
