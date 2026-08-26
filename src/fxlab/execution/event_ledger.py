@@ -39,6 +39,9 @@ class AuditEventType(StrEnum):
     POSITION_CLOSED = "position_closed"
     RESERVATION_RELEASED = "reservation_released"
     RECONCILIATION_FAILED = "reconciliation_failed"
+    RECONCILIATION_STARTED = "reconciliation_started"
+    RECONCILIATION_RESOLVED = "reconciliation_resolved"
+    RECONCILIATION_UNRESOLVED = "reconciliation_unresolved"
     RUNTIME_FAILURE = "runtime_failure"
 
 
@@ -50,6 +53,7 @@ class AuditComponent(StrEnum):
     RISK_ENGINE = "risk_engine"
     ORDER_MANAGER = "order_manager"
     PAPER_BROKER = "paper_broker"
+    RECONCILIATION_ENGINE = "reconciliation_engine"
 
 
 class AuditLedgerError(RuntimeError):

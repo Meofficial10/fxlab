@@ -153,6 +153,13 @@ def test_separate_ledgers_have_independent_session_history() -> None:
     assert first.events()[0].session_id != second.events()[0].session_id
 
 
+def test_reconciliation_audit_contract_is_stable() -> None:
+    assert AuditEventType.RECONCILIATION_STARTED.value == "reconciliation_started"
+    assert AuditEventType.RECONCILIATION_RESOLVED.value == "reconciliation_resolved"
+    assert AuditEventType.RECONCILIATION_UNRESOLVED.value == "reconciliation_unresolved"
+    assert AuditComponent.RECONCILIATION_ENGINE.value == "reconciliation_engine"
+
+
 def test_correlation_validation() -> None:
     with pytest.raises(ValueError, match="non-empty"):
         EventCorrelation(position_id=" ")

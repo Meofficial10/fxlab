@@ -229,6 +229,28 @@ def test_unsafe_event_tail_requires_reconciliation(tmp_path, event_type) -> None
         restored.start()
 
 
+def test_resolved_audit_without_checkpoint_is_not_a_recovery_commit(tmp_path) -> None:
+    path, session, store, _ = checkpoint_live_session(tmp_path)
+    session.event_ledger.append(
+        AuditEventType.RECONCILIATION_RESOLVED,
+        occurred_at=datetime(2026, 8, 25, 10, 7, tzinfo=UTC),
+        component=AuditComponent.RECONCILIATION_ENGINE,
+        payload={
+            "reconciliation_id": "reconcile-interrupted",
+            "reason": "state_reconciled",
+            "applied_actions": (),
+            "new_session_id": "new-session",
+        },
+    )
+    store.close()
+    restored, reopened = make_session(path)
+    result = recover(
+        restored, reopened, software_version="1.0", execution_policy_id="policy-v1"
+    )
+    assert result.state is RecoveryState.RECONCILIATION_REQUIRED
+    assert restored.recovery_required
+
+
 def test_missing_checkpoint_fails_without_fresh_start(tmp_path) -> None:
     session, store = make_session(tmp_path / "empty.sqlite")
     result = recover(

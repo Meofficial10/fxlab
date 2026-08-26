@@ -94,6 +94,44 @@ def create_checkpoint(
     return checkpoint
 
 
+def create_reconciliation_checkpoint(
+    session: PaperTradingSession,
+    store: SQLiteEventStore,
+    *,
+    software_version: str,
+    execution_policy_id: str,
+    created_at: datetime | None = None,
+) -> StoredCheckpoint:
+    """Commit a reconciled terminal session while retaining its execution gate.
+
+    This is intentionally narrower than ``create_checkpoint``: the reconciliation
+    gate and its latched kill switch remain in the damaged session, while every
+    other safe-point invariant must pass.
+    """
+    if not isinstance(software_version, str) or not software_version.strip():
+        raise ValueError("software_version must be a non-empty string")
+    if session.event_ledger.session_id != store.session_id:
+        raise UnsafeCheckpointError("session_mismatch")
+    if session.event_ledger.durable_store is not store:
+        raise UnsafeCheckpointError("durable_store_mismatch")
+    if not session.recovery_required or not session.risk_engine.kill_switch_active:
+        raise UnsafeCheckpointError("reconciliation_gate_not_latched")
+    _validate_safe_point(session, allow_reconciliation_gate=True)
+    checkpoint = StoredCheckpoint(
+        session_id=store.session_id,
+        created_at=(created_at or datetime.now(UTC)).astimezone(UTC),
+        last_event_sequence=store.last_sequence(),
+        software_version=software_version.strip(),
+        configuration_fingerprint=configuration_fingerprint(
+            session, execution_policy_id=execution_policy_id
+        ),
+        replay_dataset_fingerprint=session.replay.dataset_fingerprint,
+        state=_session_state_snapshot(session),
+    )
+    store.store_checkpoint(checkpoint)
+    return checkpoint
+
+
 def recover(
     session: PaperTradingSession,
     store: SQLiteEventStore,
@@ -147,6 +185,13 @@ def recover(
                 "durable events exist after the latest safe checkpoint",
                 checkpoint.last_event_sequence,
             )
+        if session.recovery_required:
+            return RecoveryResult(
+                RecoveryState.RECONCILIATION_REQUIRED,
+                "reconciliation_required",
+                "checkpoint belongs to a terminated reconciled session",
+                checkpoint.last_event_sequence,
+            )
         return RecoveryResult(
             RecoveryState.RECOVERED,
             "recovered",
@@ -170,10 +215,19 @@ def recover(
         return _fail_session(session, "unsupported_recovery_state")
 
 
-def _validate_safe_point(session: PaperTradingSession) -> None:
+def validate_reconciliation_safe_point(session: PaperTradingSession) -> None:
+    """Validate all safe-point invariants except the intentional recovery gate."""
+    if not session.recovery_required or not session.risk_engine.kill_switch_active:
+        raise UnsafeCheckpointError("reconciliation_gate_not_latched")
+    _validate_safe_point(session, allow_reconciliation_gate=True)
+
+
+def _validate_safe_point(
+    session: PaperTradingSession, *, allow_reconciliation_gate: bool = False
+) -> None:
     if session.order_manager.audit_failed or session.snapshot_state()["audit_failed"]:
         raise UnsafeCheckpointError("audit_integrity_lost")
-    if session.recovery_required:
+    if session.recovery_required and not allow_reconciliation_gate:
         raise UnsafeCheckpointError("reconciliation_required")
     if session.broker.has_pending_close_events:
         raise UnsafeCheckpointError("undrained_close_events")
@@ -203,6 +257,16 @@ def _validate_safe_point(session: PaperTradingSession) -> None:
     }
     if broker_positions != session_positions:
         raise UnsafeCheckpointError("position_correlation_mismatch")
+
+
+def _session_state_snapshot(session: PaperTradingSession) -> dict[str, object]:
+    return {
+        "risk": session.risk_engine.snapshot_state(),
+        "orders": session.order_manager.snapshot_state(),
+        "broker": session.broker.snapshot_state(),
+        "replay": session.replay.snapshot_state(),
+        "session": session.snapshot_state(),
+    }
 
 
 def _failed(reason: str) -> RecoveryResult:

@@ -28,12 +28,20 @@ if TYPE_CHECKING:
         PaperCycleResult,
         PaperTradingSession,
     )
+    from .reconciliation import (
+        ReconciliationEngine,
+        ReconciliationPlan,
+        ReconciliationResult,
+        ReconciliationStatus,
+    )
     from .recovery import (
         RecoveryResult,
         RecoveryState,
         UnsafeCheckpointError,
         create_checkpoint,
+        create_reconciliation_checkpoint,
         recover,
+        validate_reconciliation_safe_point,
     )
 
 __all__ = [
@@ -49,7 +57,13 @@ __all__ = [
     "RecoveryState",
     "UnsafeCheckpointError",
     "create_checkpoint",
+    "create_reconciliation_checkpoint",
     "recover",
+    "validate_reconciliation_safe_point",
+    "ReconciliationEngine",
+    "ReconciliationPlan",
+    "ReconciliationResult",
+    "ReconciliationStatus",
     "ExecutionIntent",
     "ExecutionResult",
     "ExecutionResultKind",
@@ -76,6 +90,7 @@ def __getattr__(name: str) -> Any:
             order_manager,
             paper_broker,
             paper_session,
+            reconciliation,
             recovery,
         )
 
@@ -85,6 +100,7 @@ def __getattr__(name: str) -> Any:
             order_manager,
             paper_broker,
             paper_session,
+            reconciliation,
             recovery,
         ):
             if hasattr(module, name):
