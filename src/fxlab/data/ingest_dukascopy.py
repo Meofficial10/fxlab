@@ -4,17 +4,26 @@ Two sources:
   * ``synthetic`` — a deterministic, offline, geometric-random-walk generator used by
     the test suite and for running the pipeline without a network. It is NOT market
     data and must never be used to make any performance claim.
-  * ``dukascopy`` — real free tick/OHLC data via the optional ``dukascopy-python`` extra.
-
-The dukascopy adapter is classified UNPROVEN until exercised against the live API
-(constant names are resolved defensively at call time).
+  * ``dukascopy`` — external historical BID bars through the bounded Phase 16
+    provider boundary.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 
+from .dukascopy_provider import (
+    DUKASCOPY_MAPPING_FINGERPRINT,
+    DukascopyConnectorSettings,
+    DukascopyHistoricalBarsProvider,
+    DukascopyHttpTransport,
+    DukascopyTransport,
+)
+from .provider import BarQuery, CanonicalInstrument, ProviderCapability, ProviderRoute
+from .providers import ProviderGateway, ProviderRegistry
 from .schema import ensure_bars, timeframe_to_offset
 
 # --------------------------------------------------------------------------- synthetic
@@ -66,68 +75,52 @@ def generate_synthetic_bars(
     return ensure_bars(df, symbol, timeframe)
 
 
-# --------------------------------------------------------------------------- dukascopy
-
-_DUKA_INTERVAL = {
-    "M1": "INTERVAL_MIN_1", "M5": "INTERVAL_MIN_5", "M15": "INTERVAL_MIN_15",
-    "M30": "INTERVAL_MIN_30", "H1": "INTERVAL_HOUR_1", "H4": "INTERVAL_HOUR_4",
-    "D1": "INTERVAL_DAY_1",
-}
-# Core cross-asset panel for the multi-asset TSMOM build (return-space, vol-scaled portfolio).
-# Deliberately restricted to LIQUID instruments with a uniform, well-understood cost regime
-# (crypto and thin/short-history instruments are excluded on purpose). Constant names verified
-# against dukascopy-python 4.0.1's ``instruments`` module.
-_DUKA_INSTRUMENT = {
-    # FX majors
-    "EURUSD": "INSTRUMENT_FX_MAJORS_EUR_USD",
-    "GBPUSD": "INSTRUMENT_FX_MAJORS_GBP_USD",
-    "USDJPY": "INSTRUMENT_FX_MAJORS_USD_JPY",
-    "AUDUSD": "INSTRUMENT_FX_MAJORS_AUD_USD",
-    "USDCAD": "INSTRUMENT_FX_MAJORS_USD_CAD",
-    "USDCHF": "INSTRUMENT_FX_MAJORS_USD_CHF",
-    "NZDUSD": "INSTRUMENT_FX_MAJORS_NZD_USD",
-    # Metals
-    "XAUUSD": "INSTRUMENT_FX_METALS_XAU_USD",
-    "XAGUSD": "INSTRUMENT_FX_METALS_XAG_USD",
-    # Energy (E_Brent = Brent crude, E_Light = WTI/light crude CFDs)
-    "BRENT": "INSTRUMENT_CMD_ENERGY_E_BRENT",
-    "WTI": "INSTRUMENT_CMD_ENERGY_E_LIGHT",
-    # Equity indices (CFDs)
-    "SPX500": "INSTRUMENT_IDX_AMERICA_E_SANDP_500",
-    "NAS100": "INSTRUMENT_IDX_AMERICA_E_NQ_100",
-    "GER40": "INSTRUMENT_IDX_EUROPE_E_DAAX",
-}
-
-
 def fetch_dukascopy(
-    symbol: str, timeframe: str, start: str, end: str, offer_side: str = "bid"
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: str,
+    offer_side: str = "bid",
+    *,
+    transport: DukascopyTransport | None = None,
+    settings: DukascopyConnectorSettings | None = None,
 ) -> pd.DataFrame:
-    """Fetch real bars from Dukascopy. Requires the optional extra: ``uv sync --extra data``."""
-    try:
-        import dukascopy_python
-        from dukascopy_python import instruments as duka_instruments
-    except ImportError as exc:  # pragma: no cover - network/optional path
-        raise RuntimeError(
-            "dukascopy-python is not installed. Run: python -m uv sync --extra data"
-        ) from exc
+    """Fetch validated historical BID bars through the Phase 11 provider gateway."""
+    if offer_side.strip().lower() != "bid":
+        raise ValueError("Phase 16 supports Dukascopy BID bars only")
+    start_at, end_at = _explicit_utc(start, "start"), _explicit_utc(end, "end")
+    query = BarQuery(
+        CanonicalInstrument(symbol),
+        timeframe,
+        start_at,
+        end_at,
+        end_at,
+    )
+    provider = DukascopyHistoricalBarsProvider(
+        transport or DukascopyHttpTransport(),
+        settings=settings or DukascopyConnectorSettings(),
+    )
+    registry = ProviderRegistry()
+    registry.register(provider)
+    registry.freeze()
+    route = ProviderRoute(
+        provider.descriptor.provider_id,
+        ProviderCapability.HISTORICAL_BARS,
+        mapping_identity=DUKASCOPY_MAPPING_FINGERPRINT,
+        normalization_version=provider.descriptor.normalization_version,
+    )
+    dataset = ProviderGateway(registry).fetch_bars(route, query)
+    return dataset.frame
 
-    if symbol not in _DUKA_INSTRUMENT:
-        raise ValueError(f"no Dukascopy instrument mapping for {symbol!r}")
-    interval = getattr(dukascopy_python, _DUKA_INTERVAL[timeframe])
-    instrument = getattr(duka_instruments, _DUKA_INSTRUMENT[symbol])
-    side = (
-        dukascopy_python.OFFER_SIDE_BID
-        if offer_side == "bid"
-        else dukascopy_python.OFFER_SIDE_ASK
-    )
-    raw = dukascopy_python.fetch(
-        instrument,
-        interval,
-        side,
-        pd.Timestamp(start).to_pydatetime(),
-        pd.Timestamp(end).to_pydatetime(),
-    )
-    return ensure_bars(raw, symbol, timeframe)
+
+def _explicit_utc(value: str, field_name: str) -> datetime:
+    try:
+        parsed = pd.Timestamp(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field_name} must include an explicit timezone")
+    return parsed.tz_convert("UTC").to_pydatetime()
 
 
 # --------------------------------------------------------------------------- dispatch

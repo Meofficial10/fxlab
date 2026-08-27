@@ -17,6 +17,7 @@ from fxlab.data import (
 )
 from fxlab.execution.event_ledger import AuditComponent, AuditEventType
 from fxlab.execution.market_data import MarketDataStream
+from fxlab.execution.paper_session import HistoricalBarReplay
 from test_market_data import MockBroker
 from test_paper_session import NoSignalSetup, make_session
 
@@ -92,3 +93,17 @@ def test_replay_provider_identity_changes_dataset_identity() -> None:
     assert first.replay.provider_compatibility_snapshot() != (
         second.replay.provider_compatibility_snapshot()
     )
+
+
+def test_external_provider_mapping_identity_is_bound_into_replay_compatibility() -> None:
+    replay = HistoricalBarReplay(
+        {"EURUSD": bars()},
+        "M5",
+        provider_id="dukascopy",
+        provider_version="1",
+        normalization_version="dukascopy_bid_v1",
+        mapping_identity="a" * 64,
+    )
+    snapshot = replay.provider_compatibility_snapshot()
+    assert snapshot["mapping_identity"] == "a" * 64
+    assert snapshot["fallback_policy"] == "none"

@@ -7,10 +7,13 @@ from datetime import UTC, datetime
 
 import numpy as np
 import pandas as pd
+import pytest
 from typer.testing import CliRunner
 
+import fxlab.cli as cli_module
 from fxlab.cli import app
 from fxlab.config import load_config
+from fxlab.data import ProviderFailure, ProviderFailureCategory, ProviderGatewayError
 from fxlab.data.store import save_bars
 from fxlab.execution.app import ReplayRequest, run_foreground_replay
 
@@ -60,6 +63,44 @@ def test_existing_commands_and_paper_commands_are_registered() -> None:
         assert command in paper.output
     for invalid in ("start", "pause", "resume", "stop", "emergency-stop", "reconcile"):
         assert f" {invalid} " not in paper.output
+
+
+def test_dukascopy_ingest_failure_is_concise_and_sanitized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    config = load_config().model_copy(update={"data_dir": str(tmp_path)})
+    monkeypatch.setattr(cli_module, "load_config", lambda: config)
+
+    def fail(*_args: object, **_kwargs: object) -> pd.DataFrame:
+        raise ProviderGatewayError(
+            ProviderFailure(
+                ProviderFailureCategory.TRANSIENT,
+                "network_unavailable",
+                "dukascopy",
+                retryable=True,
+            )
+        )
+
+    monkeypatch.setattr(cli_module, "ingest_data", fail)
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "--pair",
+            "EURUSD",
+            "--tf",
+            "M5",
+            "--source",
+            "dukascopy",
+            "--from",
+            "2026-01-01T00:00:00+00:00",
+            "--to",
+            "2026-01-02T00:00:00+00:00",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "transient:network_unavailable" in result.output
+    assert "traceback" not in result.output.lower()
 
 
 def test_all_paper_command_help_is_available() -> None:

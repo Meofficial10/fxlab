@@ -1,5 +1,17 @@
 """Canonical data contracts, local providers, ingestion, and validation."""
 
+from .dukascopy_provider import (
+    DUKASCOPY_MAPPING_FINGERPRINT,
+    DUKASCOPY_SYMBOLS,
+    DUKASCOPY_TIMEFRAMES,
+    DukascopyConnectorSettings,
+    DukascopyHistoricalBarsProvider,
+    DukascopyHttpTransport,
+    DukascopyPage,
+    DukascopyTransport,
+    DukascopyTransportFailure,
+    symbol_mapping_fingerprint,
+)
 from .provider import (
     BarDataset,
     BarQuery,
@@ -32,6 +44,15 @@ __all__ = [
     "BarQuery",
     "CanonicalInstrument",
     "DataProvenance",
+    "DUKASCOPY_MAPPING_FINGERPRINT",
+    "DUKASCOPY_SYMBOLS",
+    "DUKASCOPY_TIMEFRAMES",
+    "DukascopyConnectorSettings",
+    "DukascopyHistoricalBarsProvider",
+    "DukascopyHttpTransport",
+    "DukascopyPage",
+    "DukascopyTransport",
+    "DukascopyTransportFailure",
     "HistoricalBarsProvider",
     "HistoricalReplayProvider",
     "InMemoryBarProvider",
@@ -50,4 +71,5 @@ __all__ = [
     "SymbolAliasMap",
     "TickQuery",
     "TickSnapshot",
+    "symbol_mapping_fingerprint",
 ]

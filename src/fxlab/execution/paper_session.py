@@ -109,6 +109,7 @@ class HistoricalBarReplay:
     provider_version: str = "1"
     normalization_version: str = "1"
     provenance_quality: ProvenanceQuality = ProvenanceQuality.SYNTHETIC
+    mapping_identity: str = "canonical-v1"
     _events: tuple[Tick, ...] = field(init=False, repr=False)
     _cursor: int = field(default=0, init=False)
     _stopped: bool = field(default=False, init=False)
@@ -116,7 +117,12 @@ class HistoricalBarReplay:
     _dataset_id: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        for name in ("provider_id", "provider_version", "normalization_version"):
+        for name in (
+            "provider_id",
+            "provider_version",
+            "normalization_version",
+            "mapping_identity",
+        ):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be non-empty")
@@ -186,7 +192,7 @@ class HistoricalBarReplay:
             "provider_id": self.provider_id,
             "provider_version": self.provider_version,
             "capabilities": ["deterministic_replay", "point_in_time", "replay_events"],
-            "mapping_identity": "canonical-v1",
+            "mapping_identity": self.mapping_identity,
             "normalization_version": self.normalization_version,
             "freshness_policy": "replay-clock-v1",
             "fallback_policy": "none",

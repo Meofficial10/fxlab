@@ -500,3 +500,15 @@ def test_broker_connection_state_does_not_change_recovery_identity(tmp_path) -> 
         restored, reopened, software_version="1.0", execution_policy_id="policy-v1"
     )
     assert result.recovered
+
+
+def test_recovery_rejects_provider_mapping_identity_change(tmp_path) -> None:
+    path, _, store, _ = checkpoint_live_session(tmp_path)
+    store.close()
+    restored, reopened = make_session(path)
+    restored.replay.mapping_identity = "b" * 64
+    result = recover(
+        restored, reopened, software_version="1.0", execution_policy_id="policy-v1"
+    )
+    assert result.state is RecoveryState.FAILED
+    assert result.reason == "configuration_mismatch"

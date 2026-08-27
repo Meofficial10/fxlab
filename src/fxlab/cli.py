@@ -22,6 +22,7 @@ from .backtest.metrics import compute_metrics
 from .config import load_config
 from .costs.model import CostModel
 from .data.ingest_dukascopy import ingest as ingest_data
+from .data.providers import ProviderGatewayError
 from .data.resample import resample_ohlcv
 from .data.schema import _TF_MINUTES
 from .data.store import load_bars, save_bars
@@ -120,8 +121,15 @@ def ingest(
         for t in tfs:
             frames[t] = base if t == base_tf else resample_ohlcv(base, t)
     else:
-        for t in tfs:
-            frames[t] = ingest_data(pair, t, source=src, start=frm, end=to)
+        try:
+            for t in tfs:
+                frames[t] = ingest_data(pair, t, source=src, start=frm, end=to)
+        except ProviderGatewayError as exc:
+            console.print(f"[red]ingest failed[/red] {exc}")
+            raise typer.Exit(2) from None
+        except ValueError:
+            console.print("[red]ingest failed[/red] configuration:invalid_request")
+            raise typer.Exit(2) from None
 
     failed = False
     for t, df in frames.items():
