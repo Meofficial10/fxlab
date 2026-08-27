@@ -17,6 +17,7 @@ from fxlab.execution.app import (
     ReplayRequest,
     assemble_observation_replay,
     inspect_events,
+    monitor_recovered,
     recover_snapshot,
     run_foreground_replay,
 )
@@ -212,3 +213,26 @@ def test_failed_cycle_stops_foreground_runner(tmp_path, monkeypatch) -> None:
     assert result.exit_code is AppExitCode.RUNTIME_FAILURE
     assert result.reason == "cycle_failed"
     assert calls == 1
+
+
+def test_recovered_monitor_is_read_only_and_never_labelled_live(tmp_path) -> None:
+    request = _request(tmp_path, session_id="monitor-app")
+    assert run_foreground_replay(request, load_config()).exit_code is AppExitCode.SUCCESS
+    store = SQLiteEventStore(request.store_path, request.session_id)
+    try:
+        before_events = store.load_events()
+        before_checkpoint = store.load_latest_checkpoint()
+    finally:
+        store.close()
+    result = monitor_recovered(request, load_config(), event_limit=3)
+    assert result.available
+    assert result.snapshot is not None
+    assert result.snapshot.source.value == "recovered_snapshot"
+    assert result.snapshot.source.value != "live_runtime"
+    assert len(result.snapshot.recent_events) <= 3
+    store = SQLiteEventStore(request.store_path, request.session_id)
+    try:
+        assert store.load_events() == before_events
+        assert store.load_latest_checkpoint() == before_checkpoint
+    finally:
+        store.close()

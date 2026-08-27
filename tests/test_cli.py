@@ -56,14 +56,14 @@ def test_existing_commands_and_paper_commands_are_registered() -> None:
     assert root.exit_code == 0
     for command in ("info", "ingest", "validate-data", "label", "split", "backtest"):
         assert command in root.output
-    for command in ("replay", "recover", "events", "status", "orders", "positions"):
+    for command in ("replay", "recover", "events", "status", "orders", "positions", "monitor"):
         assert command in paper.output
     for invalid in ("start", "pause", "resume", "stop", "emergency-stop", "reconcile"):
         assert f" {invalid} " not in paper.output
 
 
 def test_all_paper_command_help_is_available() -> None:
-    for command in ("replay", "recover", "events", "status", "orders", "positions"):
+    for command in ("replay", "recover", "events", "status", "orders", "positions", "monitor"):
         result = runner.invoke(app, ["paper", command, "--help"])
         assert result.exit_code == 0, result.output
 
@@ -158,3 +158,16 @@ def test_help_exposes_no_policy_import_or_strategy_selection() -> None:
     assert "--policy" not in lowered
     assert "--setup" not in lowered
     assert "--source" not in lowered
+
+
+def test_monitor_json_is_recovered_snapshot_never_live(tmp_path) -> None:
+    args = _base(tmp_path)
+    replay = runner.invoke(app, ["paper", "replay", *args, "--observe-only"])
+    assert replay.exit_code == 0, replay.output
+    result = runner.invoke(app, ["paper", "monitor", *args, "--event-limit", "2", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["source"] == "recovered_snapshot"
+    assert payload["label"] == "RECOVERED SNAPSHOT"
+    assert len(payload["recent_events"]) <= 2
+    assert "live" not in payload["label"].lower()

@@ -31,6 +31,8 @@ from .execution.app import (
     PaperAppError,
     ReplayRequest,
     inspect_events,
+    monitor_recovered,
+    monitoring_result_to_dict,
     recover_snapshot,
     run_foreground_replay,
 )
@@ -734,6 +736,66 @@ def paper_events(
             f"{event['sequence']:>6} {event['timestamp']} {event['event_type']} "
             f"{event['component']} correlation={event['correlation']} payload={event['payload']}"
         )
+
+
+@paper_app.command("monitor")
+def paper_monitor(
+    session_id: str = typer.Option(..., "--session-id"),
+    store: Annotated[Path, typer.Option("--store")] = ...,
+    data_dir: Annotated[Path, typer.Option("--data-dir")] = ...,
+    symbol: str = typer.Option(..., "--symbol"),
+    timeframe: str = typer.Option(..., "--timeframe"),
+    start: str = typer.Option(..., "--start"),
+    end: str = typer.Option(..., "--end"),
+    as_of: str = typer.Option(..., "--as-of"),
+    event_limit: int = typer.Option(10, "--event-limit", min=1),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Show a one-shot recovered dashboard, never live process state."""
+    request = _paper_request(
+        session_id=session_id,
+        store=store,
+        data_dir=data_dir,
+        symbol=symbol,
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        as_of=as_of,
+    )
+    try:
+        result = monitor_recovered(request, load_config(), event_limit=event_limit)
+    except PaperAppError as exc:
+        _app_failure(exc)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    payload = monitoring_result_to_dict(result)
+    if json_output:
+        typer.echo(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    elif result.snapshot is not None:
+        snapshot = result.snapshot
+        console.print(f"[bold]{snapshot.label}[/bold]")
+        console.print(f"session_id: {snapshot.session_id}")
+        for heading, value in (
+            ("RUNTIME", payload["runtime"]),
+            ("ACCOUNT", payload["account"]),
+            ("RISK", payload["risk"]),
+            ("PROVIDER", payload["provider"]),
+            ("BROKER", payload["broker"]),
+            ("POSITIONS", payload["positions"]),
+            ("ORDERS", payload["orders"]),
+            ("RECOVERY", payload["recovery"]),
+            ("RECENT EVENTS", payload["recent_events"]),
+        ):
+            console.print(f"[bold]{heading}[/bold]")
+            console.print(value)
+    else:
+        _json_or_human(payload, json_output=False)
+    if result.snapshot is not None and (
+        result.snapshot.recovery.status == RecoveryState.RECONCILIATION_REQUIRED.value
+    ):
+        raise typer.Exit(int(AppExitCode.RECONCILIATION_REQUIRED))
+    if not result.available:
+        raise typer.Exit(int(AppExitCode.RECOVERY_FAILURE))
 
 
 if __name__ == "__main__":

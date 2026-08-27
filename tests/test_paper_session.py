@@ -160,6 +160,26 @@ def test_start_poll_stop_and_idempotent_lifecycle() -> None:
     assert session.poll_once().reason == "session_not_running"
 
 
+def test_monitoring_snapshot_preserves_exact_order_position_correlation() -> None:
+    session, _, _ = make_session()
+    session.start()
+    cycle = session.poll_once()
+    assert cycle.executions
+    snapshot = session.monitoring_snapshot()
+    assert len(snapshot.orders) == 1
+    assert len(snapshot.positions) == 1
+    order = snapshot.orders[0]
+    position = snapshot.positions[0]
+    assert order.client_order_id == position.client_order_id
+    assert order.broker_order_id == position.broker_order_id
+    assert position.position_id.startswith("paper-position::")
+    assert order.sl_price is not None
+    assert order.reservation_released is True
+    assert snapshot.risk.reservation_count == 0
+    assert snapshot.risk.approved_order_count == 1
+    session.stop()
+
+
 def test_pause_blocks_new_risk_but_continues_market_maintenance() -> None:
     policy_calls = 0
 

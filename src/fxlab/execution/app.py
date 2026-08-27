@@ -27,6 +27,13 @@ from ..risk.engine import RiskEngine, RiskLimits
 from .durable_event_store import DurableStoreError, SQLiteEventStore
 from .event_ledger import AuditEvent, AuditEventType, EventLedger
 from .market_data import MarketDataStream
+from .monitoring import (
+    MonitoringResult,
+    MonitoringSource,
+    monitoring_to_dict,
+    project_audit_events,
+    project_recovered_session,
+)
 from .order_manager import ExecutionIntent, OrderManager
 from .paper_broker import PaperBroker
 from .paper_session import (
@@ -35,7 +42,13 @@ from .paper_session import (
     MarketContext,
     PaperTradingSession,
 )
-from .recovery import RecoveryResult, UnsafeCheckpointError, create_checkpoint, recover
+from .recovery import (
+    RecoveryResult,
+    RecoveryState,
+    UnsafeCheckpointError,
+    create_checkpoint,
+    recover,
+)
 from .runtime_control import RuntimeState
 from .signal_engine import SignalEngine, SignalEvent
 
@@ -453,6 +466,63 @@ def inspect_events(
         return tuple(_event_snapshot(event) for event in events)
     finally:
         store.close()
+
+
+def monitor_recovered(
+    request: ReplayRequest,
+    config: AppConfig,
+    *,
+    event_limit: int = 10,
+) -> MonitoringResult:
+    """Build one verified read-only operational snapshot from durable state."""
+    if isinstance(event_limit, bool) or not isinstance(event_limit, int) or event_limit < 1:
+        raise ValueError("event_limit must be a positive integer")
+    app = assemble_observation_replay(request, config, fresh=False)
+    try:
+        result = recover(
+            app.session,
+            app.store,
+            software_version=app.software_version,
+            execution_policy_id=app.execution_policy_id,
+        )
+        if result.state is RecoveryState.FAILED:
+            return MonitoringResult(
+                False,
+                MonitoringSource.UNAVAILABLE,
+                None,
+                result.reason,
+                result.message,
+            )
+        try:
+            app.store.verify_integrity()
+            events = app.store.load_events()
+        except (DurableStoreError, OSError, ValueError) as exc:
+            raise PaperAppError(
+                "store_integrity_failed",
+                "durable event store could not be verified",
+                AppExitCode.RECOVERY_FAILURE,
+            ) from exc
+        snapshot = project_recovered_session(
+            app.session,
+            result,
+            latest_event_sequence=app.store.last_sequence(),
+            recent_events=project_audit_events(events, limit=event_limit),
+        )
+        return MonitoringResult(True, snapshot.source, snapshot)
+    finally:
+        app.close()
+
+
+def monitoring_result_to_dict(result: MonitoringResult) -> dict[str, object]:
+    """Serialize an explicit monitoring result without generic traversal."""
+    if result.snapshot is None:
+        return {
+            "available": result.available,
+            "source": result.source.value,
+            "reason": result.reason,
+            "message": result.message,
+        }
+    return {"available": result.available, **monitoring_to_dict(result.snapshot)}
 
 
 def _status_snapshot(app: PaperApplication, result: RecoveryResult) -> dict[str, object]:

@@ -20,6 +20,7 @@ import pandas as pd
 
 if TYPE_CHECKING:
     from .durable_event_store import SQLiteEventStore
+    from .monitoring import MonitoringSnapshot
 
 from ..data.provider import (
     ProvenanceQuality,
@@ -874,6 +875,13 @@ class PaperTradingSession:
 
     def risk_state_snapshot(self) -> Mapping[str, object]:
         return MappingProxyType(deepcopy(self.risk_engine.snapshot_state()))
+
+    def monitoring_snapshot(self) -> MonitoringSnapshot:
+        """Capture one immutable live view at a serialized cycle boundary."""
+        from .monitoring import project_live_session
+
+        with self._cycle_lock:
+            return project_live_session(self)
 
     @property
     def recovery_required(self) -> bool:
