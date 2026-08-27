@@ -3,6 +3,19 @@
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .app import (
+        OBSERVE_ONLY_POLICY_ID,
+        AppExitCode,
+        PaperAppError,
+        PaperApplication,
+        PaperAppResult,
+        RecoveredSnapshot,
+        ReplayRequest,
+        assemble_observation_replay,
+        inspect_events,
+        recover_snapshot,
+        run_foreground_replay,
+    )
     from .broker_capabilities import (
         BrokerCapability,
         BrokerCapabilityProvider,
@@ -61,6 +74,17 @@ if TYPE_CHECKING:
     )
 
 __all__ = [
+    "OBSERVE_ONLY_POLICY_ID",
+    "AppExitCode",
+    "PaperApplication",
+    "PaperAppError",
+    "PaperAppResult",
+    "RecoveredSnapshot",
+    "ReplayRequest",
+    "assemble_observation_replay",
+    "inspect_events",
+    "recover_snapshot",
+    "run_foreground_replay",
     "AuditComponent",
     "BrokerCapability",
     "BrokerCapabilityProvider",
@@ -113,6 +137,7 @@ __all__ = [
 def __getattr__(name: str) -> Any:
     if name in __all__:
         from . import (
+            app,
             broker_capabilities,
             durable_event_store,
             event_ledger,
@@ -125,6 +150,7 @@ def __getattr__(name: str) -> Any:
         )
 
         for module in (
+            app,
             broker_capabilities,
             durable_event_store,
             event_ledger,

@@ -6,7 +6,10 @@ Everything runs offline with ``--synthetic``; real data uses the ``dukascopy`` s
 
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Annotated
 
 import numpy as np
 import pandas as pd
@@ -23,6 +26,16 @@ from .data.resample import resample_ohlcv
 from .data.schema import _TF_MINUTES
 from .data.store import load_bars, save_bars
 from .data.validate import validate_bars
+from .execution.app import (
+    AppExitCode,
+    PaperAppError,
+    ReplayRequest,
+    inspect_events,
+    recover_snapshot,
+    run_foreground_replay,
+)
+from .execution.event_ledger import AuditEventType
+from .execution.recovery import RecoveryState
 from .experiment.log import hash_bars, log_experiment
 from .labeling.triple_barrier import apply_triple_barrier
 from .setups.model_a_sweep_reversal import ModelASweepReversal
@@ -50,6 +63,11 @@ _SETUPS = {
 }
 
 app = typer.Typer(add_completion=False, help="fxlab — forex research platform (Phase 1).")
+paper_app = typer.Typer(
+    add_completion=False,
+    help="Deterministic local paper-replay and durable-state inspection.",
+)
+app.add_typer(paper_app, name="paper")
 console = Console()
 
 
@@ -420,6 +438,302 @@ def backtest(
         f"[dim]logged -> {registry}  (data_hash={data_hash}). "
         "HYPOTHESIS baseline; expectancy net of costs is the only target, never win rate.[/dim]"
     )
+
+
+def _utc_option(value: str, option_name: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise typer.BadParameter(
+            f"{option_name} must be an ISO-8601 datetime"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise typer.BadParameter(f"{option_name} must be timezone-aware")
+    return parsed.astimezone(UTC)
+
+
+def _paper_request(
+    *,
+    session_id: str,
+    store: Path,
+    data_dir: Path,
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: str,
+    as_of: str,
+    observe_only: bool = True,
+) -> ReplayRequest:
+    try:
+        return ReplayRequest(
+            session_id=session_id,
+            store_path=store,
+            data_dir=data_dir,
+            symbol=symbol,
+            timeframe=timeframe,
+            start=_utc_option(start, "--start"),
+            end=_utc_option(end, "--end"),
+            as_of=_utc_option(as_of, "--as-of"),
+            observe_only=observe_only,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _json_or_human(payload: dict[str, object], *, json_output: bool) -> None:
+    if json_output:
+        typer.echo(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        return
+    for key, value in payload.items():
+        console.print(f"{key}: {value}")
+
+
+def _app_failure(error: PaperAppError) -> None:
+    console.print(f"[red]{error.reason}[/red]: {error.message}")
+    raise typer.Exit(int(error.exit_code))
+
+
+def _snapshot_exit(state: RecoveryState) -> AppExitCode:
+    if state is RecoveryState.RECOVERED:
+        return AppExitCode.SUCCESS
+    if state is RecoveryState.RECONCILIATION_REQUIRED:
+        return AppExitCode.RECONCILIATION_REQUIRED
+    return AppExitCode.RECOVERY_FAILURE
+
+
+@paper_app.command("replay")
+def paper_replay(
+    session_id: str = typer.Option(..., "--session-id"),
+    store: Annotated[Path, typer.Option("--store")] = ...,
+    data_dir: Annotated[Path, typer.Option("--data-dir")] = ...,
+    symbol: str = typer.Option(..., "--symbol"),
+    timeframe: str = typer.Option(..., "--timeframe"),
+    start: str = typer.Option(..., "--start"),
+    end: str = typer.Option(..., "--end"),
+    as_of: str = typer.Option(..., "--as-of"),
+    observe_only: bool = typer.Option(False, "--observe-only"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Run a fresh foreground replay with no executable trading strategy."""
+    if not observe_only:
+        console.print(
+            "[red]Phase 14 observation-only replay requires explicit --observe-only.[/red]"
+        )
+        raise typer.Exit(int(AppExitCode.USAGE))
+    request = _paper_request(
+        session_id=session_id,
+        store=store,
+        data_dir=data_dir,
+        symbol=symbol,
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        as_of=as_of,
+        observe_only=True,
+    )
+    try:
+        result = run_foreground_replay(request, load_config())
+    except PaperAppError as exc:
+        _app_failure(exc)
+    payload = {
+        "mode": "observation-only",
+        "session_id": result.session_id,
+        "state": result.state,
+        "reason": result.reason,
+        "cycles": result.cycles,
+        "checkpoint_sequence": result.checkpoint_sequence,
+    }
+    _json_or_human(payload, json_output=json_output)
+    if result.exit_code:
+        raise typer.Exit(int(result.exit_code))
+
+
+def _recovered(
+    *,
+    session_id: str,
+    store: Path,
+    data_dir: Path,
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: str,
+    as_of: str,
+):
+    request = _paper_request(
+        session_id=session_id,
+        store=store,
+        data_dir=data_dir,
+        symbol=symbol,
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        as_of=as_of,
+    )
+    try:
+        return recover_snapshot(request, load_config())
+    except PaperAppError as exc:
+        _app_failure(exc)
+
+
+@paper_app.command("recover")
+def paper_recover(
+    session_id: str = typer.Option(..., "--session-id"),
+    store: Annotated[Path, typer.Option("--store")] = ...,
+    data_dir: Annotated[Path, typer.Option("--data-dir")] = ...,
+    symbol: str = typer.Option(..., "--symbol"),
+    timeframe: str = typer.Option(..., "--timeframe"),
+    start: str = typer.Option(..., "--start"),
+    end: str = typer.Option(..., "--end"),
+    as_of: str = typer.Option(..., "--as-of"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Validate and restore a durable snapshot without starting execution."""
+    snapshot = _recovered(
+        session_id=session_id, store=store, data_dir=data_dir, symbol=symbol,
+        timeframe=timeframe, start=start, end=end, as_of=as_of,
+    )
+    payload = {
+        "label": snapshot.label,
+        "session_id": session_id,
+        "state": snapshot.recovery.state.value,
+        "reason": snapshot.recovery.reason,
+        "checkpoint_sequence": snapshot.recovery.checkpoint_sequence,
+    }
+    _json_or_human(payload, json_output=json_output)
+    code = _snapshot_exit(snapshot.recovery.state)
+    if code:
+        raise typer.Exit(int(code))
+
+
+def _paper_snapshot_command(
+    section: str,
+    *,
+    session_id: str,
+    store: Path,
+    data_dir: Path,
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: str,
+    as_of: str,
+    json_output: bool,
+) -> None:
+    snapshot = _recovered(
+        session_id=session_id, store=store, data_dir=data_dir, symbol=symbol,
+        timeframe=timeframe, start=start, end=end, as_of=as_of,
+    )
+    code = _snapshot_exit(snapshot.recovery.state)
+    if code:
+        payload = {
+            "label": snapshot.label,
+            "session_id": session_id,
+            "state": snapshot.recovery.state.value,
+            "reason": snapshot.recovery.reason,
+        }
+        _json_or_human(payload, json_output=json_output)
+        raise typer.Exit(int(code))
+    value: object
+    if section == "status":
+        value = snapshot.status
+    elif section == "orders":
+        value = snapshot.orders
+    else:
+        value = snapshot.positions
+    payload = {"label": snapshot.label, "session_id": session_id, section: value}
+    _json_or_human(payload, json_output=json_output)
+
+
+@paper_app.command("status")
+def paper_status(
+    session_id: str = typer.Option(..., "--session-id"),
+    store: Annotated[Path, typer.Option("--store")] = ...,
+    data_dir: Annotated[Path, typer.Option("--data-dir")] = ...,
+    symbol: str = typer.Option(..., "--symbol"),
+    timeframe: str = typer.Option(..., "--timeframe"),
+    start: str = typer.Option(..., "--start"),
+    end: str = typer.Option(..., "--end"),
+    as_of: str = typer.Option(..., "--as-of"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Show a recovered checkpoint snapshot, never live process state."""
+    _paper_snapshot_command(
+        "status", session_id=session_id, store=store, data_dir=data_dir,
+        symbol=symbol, timeframe=timeframe, start=start, end=end, as_of=as_of,
+        json_output=json_output,
+    )
+
+
+@paper_app.command("orders")
+def paper_orders(
+    session_id: str = typer.Option(..., "--session-id"),
+    store: Annotated[Path, typer.Option("--store")] = ...,
+    data_dir: Annotated[Path, typer.Option("--data-dir")] = ...,
+    symbol: str = typer.Option(..., "--symbol"),
+    timeframe: str = typer.Option(..., "--timeframe"),
+    start: str = typer.Option(..., "--start"),
+    end: str = typer.Option(..., "--end"),
+    as_of: str = typer.Option(..., "--as-of"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Show read-only orders from a compatible recovered checkpoint."""
+    _paper_snapshot_command(
+        "orders", session_id=session_id, store=store, data_dir=data_dir,
+        symbol=symbol, timeframe=timeframe, start=start, end=end, as_of=as_of,
+        json_output=json_output,
+    )
+
+
+@paper_app.command("positions")
+def paper_positions(
+    session_id: str = typer.Option(..., "--session-id"),
+    store: Annotated[Path, typer.Option("--store")] = ...,
+    data_dir: Annotated[Path, typer.Option("--data-dir")] = ...,
+    symbol: str = typer.Option(..., "--symbol"),
+    timeframe: str = typer.Option(..., "--timeframe"),
+    start: str = typer.Option(..., "--start"),
+    end: str = typer.Option(..., "--end"),
+    as_of: str = typer.Option(..., "--as-of"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Show read-only positions from a compatible recovered checkpoint."""
+    _paper_snapshot_command(
+        "positions", session_id=session_id, store=store, data_dir=data_dir,
+        symbol=symbol, timeframe=timeframe, start=start, end=end, as_of=as_of,
+        json_output=json_output,
+    )
+
+
+@paper_app.command("events")
+def paper_events(
+    session_id: str = typer.Option(..., "--session-id"),
+    store: Annotated[Path, typer.Option("--store")] = ...,
+    limit: int | None = typer.Option(None, "--limit", min=1),
+    event_type: str | None = typer.Option(None, "--event-type"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Verify and inspect durable audit events without mutating the store."""
+    selected = None
+    if event_type is not None:
+        try:
+            selected = AuditEventType(event_type)
+        except ValueError as exc:
+            raise typer.BadParameter("--event-type must be an exact audit event value") from exc
+    try:
+        events = inspect_events(store, session_id, event_type=selected, limit=limit)
+    except PaperAppError as exc:
+        _app_failure(exc)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    payload = {"session_id": session_id, "events": events}
+    if json_output:
+        typer.echo(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        return
+    console.print(f"session_id: {session_id}")
+    for event in events:
+        console.print(
+            f"{event['sequence']:>6} {event['timestamp']} {event['event_type']} "
+            f"{event['component']} correlation={event['correlation']} payload={event['payload']}"
+        )
 
 
 if __name__ == "__main__":
