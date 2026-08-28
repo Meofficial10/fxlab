@@ -69,12 +69,21 @@ def test_live_snapshot_is_frozen_allow_listed_and_side_effect_free(tmp_path) -> 
         assert snapshot.account.balance == 10.0
         assert snapshot.account.realized_pnl == 0.0
         assert snapshot.account.realized_pnl_basis == "paper_broker_accounting_projection"
-        assert snapshot.account.margin_model == "unmodeled_paper_margin"
+        assert snapshot.account.account_currency == "USD"
+        assert snapshot.account.margin_model == "unmodeled-paper-margin-v1"
+        assert snapshot.account.margin_quality == "unmodeled-paper-margin"
+        assert snapshot.account.leverage_by_symbol == ()
+        assert len(snapshot.account.margin_model_identity) == 64
         assert snapshot.risk.reserved_exposure_by_symbol == ()
         assert snapshot.provider.provider_id == "local-parquet"
         assert snapshot.provider.canonical_symbols == ("EURUSD",)
         assert snapshot.broker.environment == "paper"
         assert snapshot.broker.connected is False
+        assert snapshot.broker.valuation_policy_version == "fx-point-in-time-v1"
+        assert len(snapshot.broker.instrument_catalog_fingerprint) == 64
+        assert snapshot.broker.latest_valuation_observation is None
+        assert snapshot.broker.valuation_health == "unobserved"
+        assert len(snapshot.broker.execution_model_fingerprint) == 64
         assert len(app.session.event_ledger.events()) == before_events
         assert not app.session.broker.is_connected()
         with pytest.raises(FrozenInstanceError):
@@ -97,6 +106,10 @@ def test_live_snapshot_tracks_runtime_replay_and_risk_without_mutation(tmp_path)
         assert snapshot.runtime.market_maintenance_enabled is True
         assert snapshot.provider.replay_cursor == 1
         assert snapshot.provider.last_timestamp == "2026-01-01T00:05:00+00:00"
+        assert snapshot.broker.latest_valuation_observation == (
+            "2026-01-01T00:05:00+00:00"
+        )
+        assert snapshot.broker.valuation_health == "available"
         assert snapshot.risk.daily_trade_count == 0
         assert snapshot.risk.approved_order_count == 0
         assert app.session.risk_engine.snapshot_state() == before
@@ -161,7 +174,8 @@ def test_monitoring_contract_rejects_nonfinite_values_and_malformed_ids() -> Non
         AccountMonitoringView(
             float("nan"), 1.0, 0.0, 1.0, 0.0,
             "paper_broker_accounting_projection", 0.0, 0,
-            "unmodeled_paper_margin",
+            "USD", "unmodeled-paper-margin-v1", "margin-id",
+            "unmodeled-paper-margin", (),
         )
     with pytest.raises(ValueError, match="client_order_id"):
         OrderMonitoringView(

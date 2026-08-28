@@ -10,7 +10,7 @@ from enum import StrEnum
 from threading import Lock
 
 from ..risk.engine import KillSwitchReason, RiskDecision, RiskEngine, RiskRejection
-from .broker import BrokerAdapter, BrokerOrderRejected, OrderRequest, OrderStatus, Tick
+from .broker import AccountInfo, BrokerAdapter, BrokerOrderRejected, OrderRequest, OrderStatus, Tick
 from .broker_capabilities import (
     CURRENT_ORDER_MANAGER_REQUIREMENTS,
     BrokerEnvironment,
@@ -24,6 +24,7 @@ from .event_ledger import (
     deterministic_signal_id,
 )
 from .signal_engine import SignalEvent
+from .valuation import InstrumentValuationProvider, PipValuation, ValuationFailure
 
 
 class ExecutionResultKind(StrEnum):
@@ -177,6 +178,18 @@ class OrderManager:
                 "broker account snapshot could not be obtained",
             )
 
+        valuation_result = self._pip_valuation(intent.signal, account, current_utc)
+        if isinstance(valuation_result, ExecutionResult):
+            if not self._audit_execution_failure(
+                intent.signal, current_utc, valuation_result.reason
+            ):
+                return _failure(
+                    ExecutionResultKind.EXECUTION_REJECTED,
+                    "audit_failure_before_submission",
+                    "valuation rejection could not be audited",
+                )
+            return valuation_result
+
         risk_result = self.risk_engine.evaluate(
             intent.signal,
             entry_price=entry_price,
@@ -184,6 +197,7 @@ class OrderManager:
             tp_price=intent.tp_price,
             account=account,
             current_time=current_utc,
+            pip_valuation=valuation_result,
         )
         if isinstance(risk_result, RiskRejection):
             correlation = _signal_correlation(
@@ -235,6 +249,10 @@ class OrderManager:
                 "sl_price": risk_result.sl_price,
                 "tp_price": risk_result.tp_price,
                 "modeled_monetary_risk": risk_result.modeled_monetary_risk,
+                "account_currency": risk_result.account_currency,
+                "pip_value_per_lot": risk_result.pip_value_per_lot,
+                "valuation_id": risk_result.valuation_id,
+                "valuation_observation_time": risk_result.valuation_observation_time,
             },
         ):
             self.risk_engine.release_approval(risk_result.order_id)
@@ -645,6 +663,60 @@ class OrderManager:
             correlation=_signal_correlation(signal),
             payload={"reason": reason},
         )
+
+    def _pip_valuation(
+        self,
+        signal: SignalEvent,
+        account: object,
+        current_utc: datetime,
+    ) -> PipValuation | ExecutionResult:
+        if not isinstance(account, AccountInfo):
+            return _failure(
+                ExecutionResultKind.EXECUTION_REJECTED,
+                "instrument_valuation_invalid",
+                "account snapshot cannot support instrument valuation",
+            )
+        if not isinstance(self.broker, InstrumentValuationProvider):
+            return _failure(
+                ExecutionResultKind.EXECUTION_REJECTED,
+                "instrument_valuation_unavailable",
+                "broker does not provide point-in-time instrument valuation",
+            )
+        try:
+            valuation = self.broker.pip_valuation(
+                signal.symbol,
+                account.currency,
+                current_utc,
+            )
+        except ValuationFailure as exc:
+            reason = (
+                "account_currency_unsupported"
+                if exc.reason == "account_currency_unsupported"
+                else "instrument_valuation_unavailable"
+            )
+            return _failure(
+                ExecutionResultKind.EXECUTION_REJECTED,
+                reason,
+                "broker could not provide compatible point-in-time valuation",
+            )
+        except Exception:
+            return _failure(
+                ExecutionResultKind.EXECUTION_REJECTED,
+                "instrument_valuation_unavailable",
+                "broker valuation provider is unavailable",
+            )
+        if (
+            not isinstance(valuation, PipValuation)
+            or valuation.canonical_symbol != signal.symbol.strip().upper()
+            or valuation.account_currency != account.currency
+            or valuation.as_of != current_utc
+        ):
+            return _failure(
+                ExecutionResultKind.EXECUTION_REJECTED,
+                "instrument_valuation_invalid",
+                "broker returned incompatible valuation evidence",
+            )
+        return valuation
 
     def _submission_indeterminate(
         self, occurred_at: datetime, correlation: EventCorrelation, reason: str

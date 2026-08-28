@@ -39,7 +39,11 @@ class DummyBroker:
 
     def get_account_info(self) -> AccountInfo:
         return AccountInfo(
-            balance=10000.0, equity=10000.0, margin_used=0.0, margin_available=10000.0
+            balance=10000.0,
+            equity=10000.0,
+            margin_used=0.0,
+            margin_available=10000.0,
+            currency="USD",
         )
 
     def submit_order(self, order: OrderRequest) -> str:
@@ -151,8 +155,10 @@ def test_account_info_instantiation_and_validation():
         equity=9990.0,
         margin_used=1000.0,
         margin_available=8990.0,
+        currency="USD",
         open_positions=[pos],
     )
+    assert acc.currency == "USD"
     assert acc.balance == 10000.0
     assert len(acc.open_positions) == 1
     assert acc.open_positions[0].position_id == "pos_456"
@@ -162,6 +168,7 @@ def test_account_info_instantiation_and_validation():
         equity=-12.0,
         margin_used=0.0,
         margin_available=-12.0,
+        currency="USD",
     )
     assert negative.balance == -10.0
     assert negative.equity == -12.0
@@ -175,6 +182,7 @@ def test_account_info_rejects_non_finite_values(field: str, value: float):
         "equity": 100.0,
         "margin_used": 0.0,
         "margin_available": 100.0,
+        "currency": "USD",
     }
     values[field] = value
     with pytest.raises(ValueError, match="finite number"):
@@ -182,8 +190,22 @@ def test_account_info_rejects_non_finite_values(field: str, value: float):
 
 
 def test_account_info_default_open_positions():
-    acc = AccountInfo(balance=5000.0, equity=5000.0, margin_used=0.0, margin_available=5000.0)
+    acc = AccountInfo(
+        balance=5000.0,
+        equity=5000.0,
+        margin_used=0.0,
+        margin_available=5000.0,
+        currency="USD",
+    )
     assert acc.open_positions == []
+
+
+def test_account_currency_is_mandatory_and_strictly_canonical() -> None:
+    with pytest.raises(TypeError):
+        AccountInfo(balance=1.0, equity=1.0, margin_used=0.0, margin_available=1.0)
+    for currency in ("", "usd", "US1", " USD", 123, True):
+        with pytest.raises(ValueError, match="currency"):
+            AccountInfo(1.0, 1.0, 0.0, 1.0, currency)  # type: ignore[arg-type]
 
 
 def test_order_request_validation():

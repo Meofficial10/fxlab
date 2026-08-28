@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,7 @@ from fxlab.execution.event_ledger import (
     EventCorrelation,
     EventLedger,
 )
+from fxlab.execution.margin import UnmodeledPaperMargin
 from fxlab.execution.market_data import MarketDataStream
 from fxlab.execution.order_manager import OrderManager
 from fxlab.execution.paper_broker import PaperBroker
@@ -23,6 +24,7 @@ from fxlab.execution.paper_session import HistoricalBarReplay, PaperTradingSessi
 from fxlab.execution.reconciliation import ReconciliationEngine, ReconciliationStatus
 from fxlab.execution.recovery import RecoveryState, create_checkpoint, recover
 from fxlab.execution.signal_engine import SignalEngine
+from fxlab.execution.valuation import approved_fx_instrument_catalog
 from fxlab.risk import KillSwitchReason, RiskEngine, RiskLimits
 
 NOW = datetime(2026, 8, 25, 10, 10, tzinfo=UTC)
@@ -59,7 +61,15 @@ def make_session(path, session_id: str) -> tuple[PaperTradingSession, SQLiteEven
     frame = bars()
     store = SQLiteEventStore(path, session_id)
     ledger = EventLedger(session_id, time_provider=lambda: NOW, durable_store=store)
-    broker = PaperBroker(historical_bars={("EURUSD", "M5"): frame})
+    broker = PaperBroker(
+        "USD",
+        approved_fx_instrument_catalog(),
+        timedelta(minutes=5),
+        "fx-point-in-time-v1",
+        UnmodeledPaperMargin("USD"),
+        "USD",
+        historical_bars={("EURUSD", "M5"): frame},
+    )
     replay = HistoricalBarReplay({"EURUSD": frame}, "M5")
     market = MarketDataStream(
         broker, ["EURUSD"], time_provider=lambda: datetime(1990, 1, 1, tzinfo=UTC)

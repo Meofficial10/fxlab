@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import IntEnum
 from pathlib import Path
 from typing import Any
@@ -26,6 +26,7 @@ from ..data.providers import LocalParquetProvider, ProviderGateway, ProviderRegi
 from ..risk.engine import RiskEngine, RiskLimits
 from .durable_event_store import DurableStoreError, SQLiteEventStore
 from .event_ledger import AuditEvent, AuditEventType, EventLedger
+from .margin import UnmodeledPaperMargin
 from .market_data import MarketDataStream
 from .monitoring import (
     MonitoringResult,
@@ -51,6 +52,7 @@ from .recovery import (
 )
 from .runtime_control import RuntimeState
 from .signal_engine import SignalEngine, SignalEvent
+from .valuation import ValuationFailure, approved_fx_instrument_catalog
 
 OBSERVE_ONLY_POLICY_ID = "observe-only-v1"
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -214,11 +216,25 @@ def assemble_observation_replay(
         normalization_version=descriptor.normalization_version,
         provenance_quality=dataset.provenance.provenance_quality,
     )
+    catalog = approved_fx_instrument_catalog()
+    try:
+        catalog.specification(request.symbol)
+    except ValuationFailure as exc:
+        raise PaperAppError(
+            "instrument_unsupported",
+            "symbol is outside the approved Phase 18 FX instrument catalog",
+            AppExitCode.USAGE if fresh else AppExitCode.RECOVERY_FAILURE,
+        ) from exc
     broker = PaperBroker(
+        account_currency="USD",
+        instrument_catalog=catalog,
+        valuation_max_age=timedelta(minutes=5),
+        valuation_policy_version="fx-point-in-time-v1",
+        margin_model=UnmodeledPaperMargin("USD"),
+        commission_currency="USD",
         initial_balance=config.risk.starting_equity,
         historical_bars={(request.symbol, request.timeframe): frame},
         cost_config=config.costs,
-        pip_value_per_lot=10.0,
     )
     risk = RiskEngine(
         RiskLimits(
@@ -232,7 +248,6 @@ def assemble_observation_replay(
         ),
         pip_size_resolver=config.costs,
         lot_step=0.01,
-        pip_value_per_lot=10.0,
     )
     try:
         store = SQLiteEventStore(path, request.session_id)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -17,6 +17,7 @@ from fxlab.execution.broker_capabilities import (
     BrokerEnvironment,
 )
 from fxlab.execution.event_ledger import AuditEventType, EventLedger
+from fxlab.execution.margin import UnmodeledPaperMargin
 from fxlab.execution.market_data import MarketDataStream
 from fxlab.execution.order_manager import ExecutionIntent, ExecutionResultKind, OrderManager
 from fxlab.execution.paper_broker import PaperBroker
@@ -28,6 +29,7 @@ from fxlab.execution.paper_session import (
 )
 from fxlab.execution.runtime_control import RuntimeControlReason, RuntimeState
 from fxlab.execution.signal_engine import SignalEngine, SignalEvent
+from fxlab.execution.valuation import approved_fx_instrument_catalog
 from fxlab.risk import KillSwitchReason, RiskEngine, RiskLimits, RiskRejection
 
 
@@ -111,6 +113,12 @@ def make_session(
 ) -> tuple[PaperTradingSession, RiskEngine, PaperBroker]:
     frame = source if source is not None else bars()
     broker = broker_type(
+        account_currency="USD",
+        instrument_catalog=approved_fx_instrument_catalog(),
+        valuation_max_age=timedelta(minutes=5),
+        valuation_policy_version="fx-point-in-time-v1",
+        margin_model=UnmodeledPaperMargin("USD"),
+        commission_currency="USD",
         historical_bars={("EURUSD", "M5"): frame},
         cost_config=costs,
     )
@@ -375,7 +383,7 @@ def test_descriptor_mutation_during_runtime_fails_closed(monkeypatch) -> None:
     session.start()
     changed = BrokerDescriptor(
         "fxlab-paper",
-        "2",
+        "3",
         BrokerEnvironment.PAPER,
         session.broker.broker_descriptor.capabilities,
         True,
@@ -405,6 +413,14 @@ def test_audit_lifecycle_market_and_account_ordering() -> None:
     assert types.index(AuditEventType.MARKET_EVENT) < types.index(
         AuditEventType.ACCOUNT_OBSERVED
     )
+    account = next(
+        event
+        for event in session.event_ledger.events()
+        if event.event_type is AuditEventType.ACCOUNT_OBSERVED
+    )
+    assert account.payload["currency"] == "USD"
+    assert account.payload["margin_quality"] == "unmodeled-paper-margin"
+    assert len(account.payload["margin_model_identity"]) == 64
 
 
 def test_audit_signal_policy_intent_and_order_chain() -> None:
@@ -433,6 +449,21 @@ def test_audit_signal_policy_intent_and_order_chain() -> None:
         if event.correlation.client_order_id is not None
     ]
     assert len({event.correlation.client_order_id for event in correlated}) == 1
+    risk_approved = next(
+        event
+        for event in session.event_ledger.events()
+        if event.event_type is AuditEventType.RISK_APPROVED
+    )
+    assert risk_approved.payload["account_currency"] == "USD"
+    assert risk_approved.payload["pip_value_per_lot"] == 10.0
+    assert len(risk_approved.payload["valuation_id"]) == 64
+    opened = next(
+        event
+        for event in session.event_ledger.events()
+        if event.event_type is AuditEventType.POSITION_OPENED
+    )
+    assert opened.payload["currency"] == "USD"
+    assert opened.payload["actual_entry_price"] > 0
 
 
 def test_audit_policy_decline_and_failure() -> None:
@@ -608,7 +639,7 @@ def test_resume_rechecks_bound_broker_descriptor(monkeypatch) -> None:
     session.pause()
     changed = BrokerDescriptor(
         "fxlab-paper",
-        "2",
+        "3",
         BrokerEnvironment.PAPER,
         session.broker.broker_descriptor.capabilities,
         True,
@@ -746,6 +777,8 @@ def test_session_forwards_automatic_net_loss_exactly_once() -> None:
     ]
     assert len(close_events) == 1
     assert close_events[0].payload["net_realized_pnl"] < 0
+    assert close_events[0].payload["currency"] == "USD"
+    assert len(close_events[0].payload["valuation_id"]) == 64
     assert close_events[0].correlation.close_order_id is not None
 
 
@@ -820,7 +853,7 @@ def test_loss_kill_switch_blocks_same_cycle_signal() -> None:
 
 def test_non_positive_paper_equity_is_rejected_by_risk_engine() -> None:
     risk = RiskEngine(RiskLimits(), PipSizes())
-    negative = AccountInfo(-1.0, -1.0, 0.0, -1.0)
+    negative = AccountInfo(-1.0, -1.0, 0.0, -1.0, "USD")
     event = SignalEvent(
         setup_name="test",
         symbol="EURUSD",
@@ -836,6 +869,7 @@ def test_non_positive_paper_equity_is_rejected_by_risk_engine() -> None:
         tp_price=None,
         account=negative,
         current_time=event.signal_time,
+        pip_valuation=object(),  # invalid equity is rejected before valuation inspection
     )
     assert isinstance(result, RiskRejection)
     assert result.reason == "invalid_equity"

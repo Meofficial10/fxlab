@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -17,10 +17,12 @@ from fxlab.execution.broker_capabilities import (
     required_capabilities_for_order,
 )
 from fxlab.execution.event_ledger import AuditEventType, EventLedger
+from fxlab.execution.margin import UnmodeledPaperMargin
 from fxlab.execution.oanda_demo_broker import OandaDemoBroker
 from fxlab.execution.order_manager import ExecutionIntent, ExecutionResultKind, OrderManager
 from fxlab.execution.paper_broker import PaperBroker
 from fxlab.execution.signal_engine import SignalEvent
+from fxlab.execution.valuation import approved_fx_instrument_catalog
 from test_order_manager import FakeBroker, RiskSpy, decision
 
 PAPER_CAPABILITIES = frozenset(
@@ -31,6 +33,17 @@ PAPER_CAPABILITIES = frozenset(
         BrokerCapability.CLIENT_ORDER_IDS,
     }
 )
+
+
+def paper_broker() -> PaperBroker:
+    return PaperBroker(
+        "USD",
+        approved_fx_instrument_catalog(),
+        timedelta(minutes=5),
+        "fx-point-in-time-v1",
+        UnmodeledPaperMargin("USD"),
+        "USD",
+    )
 
 
 def descriptor(
@@ -91,7 +104,7 @@ def test_fingerprint_is_stable_and_set_order_independent() -> None:
 
 
 def test_runtime_protocol_requires_explicit_descriptor() -> None:
-    assert isinstance(PaperBroker(), BrokerCapabilityProvider)
+    assert isinstance(paper_broker(), BrokerCapabilityProvider)
     assert not isinstance(object(), BrokerCapabilityProvider)
 
 
@@ -117,7 +130,7 @@ def test_order_without_protective_prices_does_not_require_native_sl_tp() -> None
 
 
 def test_paper_broker_declares_exact_stable_capabilities() -> None:
-    broker = PaperBroker()
+    broker = paper_broker()
     initial = broker.broker_descriptor
     assert initial.capabilities == PAPER_CAPABILITIES
     assert initial.environment is BrokerEnvironment.PAPER
@@ -130,7 +143,7 @@ def test_paper_broker_declares_exact_stable_capabilities() -> None:
 def test_oanda_demo_broker_declares_exact_external_capabilities() -> None:
     descriptor = OandaDemoBroker("practice-account", "private-token").broker_descriptor
     assert descriptor.broker_id == "oanda-v20"
-    assert descriptor.implementation_version == "1"
+    assert descriptor.implementation_version == "2"
     assert descriptor.environment is BrokerEnvironment.DEMO
     assert descriptor.capabilities == PAPER_CAPABILITIES
     assert descriptor.deterministic is False

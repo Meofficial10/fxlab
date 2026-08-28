@@ -35,7 +35,11 @@ class DummyBroker:
 
     def get_account_info(self) -> AccountInfo:
         return AccountInfo(
-            balance=10000.0, equity=10000.0, margin_used=0.0, margin_available=10000.0
+            balance=10000.0,
+            equity=10000.0,
+            margin_used=0.0,
+            margin_available=10000.0,
+            currency="USD",
         )
 
     def submit_order(self, order: OrderRequest) -> str:

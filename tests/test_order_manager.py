@@ -29,6 +29,13 @@ from fxlab.execution.broker_capabilities import (
 )
 from fxlab.execution.event_ledger import AuditComponent, AuditEventType, EventLedger
 from fxlab.execution.signal_engine import SignalEvent
+from fxlab.execution.valuation import (
+    FxInstrumentCatalog,
+    FxValuationEngine,
+    InstrumentSpec,
+    PipValuation,
+    ValuationFailure,
+)
 from fxlab.risk import (
     KillSwitchReason,
     RiskDecision,
@@ -39,6 +46,11 @@ from fxlab.risk import (
 
 NOW = datetime(2026, 8, 25, 11, 0, tzinfo=UTC)
 SIGNAL_TIME = NOW - timedelta(minutes=5)
+VALUATION_ENGINE = FxValuationEngine(
+    FxInstrumentCatalog(
+        (InstrumentSpec("EURUSD", "fx", "EUR", "USD", 0.0001, 100_000, "1"),)
+    )
+)
 
 
 def signal(**changes: object) -> SignalEvent:
@@ -60,6 +72,7 @@ def account() -> AccountInfo:
         equity=10_000.0,
         margin_used=0.0,
         margin_available=10_000.0,
+        currency="USD",
     )
 
 
@@ -86,6 +99,10 @@ def decision(event: SignalEvent | None = None, **changes: object) -> RiskDecisio
         "tp_price": 1.1200,
         "pip_size": 0.0001,
         "stop_pips": 100.0,
+        "account_currency": "USD",
+        "pip_value_per_lot": 10.0,
+        "valuation_id": "valuation-test-id",
+        "valuation_observation_time": None,
         "monetary_risk_budget": 400.0,
         "modeled_monetary_risk": 370.0,
         "approved_at": NOW,
@@ -106,6 +123,12 @@ class FakeBroker:
         self.status_result: object = {"status": "pending"}
         self.submitted: list[OrderRequest] = []
         self.status_queries: list[str] = []
+        self.valuation_result: object = VALUATION_ENGINE.pip_valuation(
+            "EURUSD", "USD", NOW, ()
+        )
+        self.valuation_error: Exception | None = None
+        self.valuation_calls: list[tuple[str, str, datetime]] = []
+        self.account_calls = 0
 
     @property
     def broker_descriptor(self) -> BrokerDescriptor:
@@ -130,9 +153,18 @@ class FakeBroker:
         return self.latest_tick  # type: ignore[return-value]
 
     def get_account_info(self) -> AccountInfo:
+        self.account_calls += 1
         if self.account_error is not None:
             raise self.account_error
         return self.account
+
+    def pip_valuation(
+        self, symbol: str, account_currency: str, as_of: datetime
+    ) -> PipValuation:
+        self.valuation_calls.append((symbol, account_currency, as_of))
+        if self.valuation_error is not None:
+            raise self.valuation_error
+        return self.valuation_result  # type: ignore[return-value]
 
     def submit_order(self, order: OrderRequest) -> str:
         self.submitted.append(order)
@@ -258,6 +290,47 @@ def test_long_uses_ask_and_forwards_explicit_prices_and_account_unchanged():
     assert kwargs["tp_price"] == 1.12
     assert kwargs["account"] is broker.account
     assert kwargs["current_time"] == NOW
+    assert kwargs["pip_valuation"] is broker.valuation_result
+    assert broker.valuation_calls == [("EURUSD", "USD", NOW)]
+
+
+def test_missing_valuation_provider_fails_before_risk_or_submission(monkeypatch) -> None:
+    order_manager, broker, risk = manager()
+    monkeypatch.delattr(FakeBroker, "pip_valuation")
+    result = order_manager.submit(intent(), current_time=NOW)
+    assert result.reason == "instrument_valuation_unavailable"
+    assert broker.account_calls == 1
+    assert risk.calls == []
+    assert broker.submitted == []
+
+
+def test_valuation_exception_fails_before_risk_or_submission() -> None:
+    order_manager, broker, risk = manager()
+    broker.valuation_error = ValuationFailure("conversion_quote_missing")
+    result = order_manager.submit(intent(), current_time=NOW)
+    assert result.reason == "instrument_valuation_unavailable"
+    assert len(broker.valuation_calls) == 1
+    assert risk.calls == []
+    assert broker.submitted == []
+
+
+def test_unsupported_account_currency_has_stable_rejection() -> None:
+    order_manager, broker, risk = manager()
+    broker.valuation_error = ValuationFailure("account_currency_unsupported")
+    result = order_manager.submit(intent(), current_time=NOW)
+    assert result.reason == "account_currency_unsupported"
+    assert risk.calls == []
+    assert broker.submitted == []
+
+
+@pytest.mark.parametrize("malformed", [None, object(), "10", 10.0])
+def test_malformed_valuation_fails_before_risk_or_submission(malformed: object) -> None:
+    order_manager, broker, risk = manager()
+    broker.valuation_result = malformed
+    result = order_manager.submit(intent(), current_time=NOW)
+    assert result.reason == "instrument_valuation_invalid"
+    assert risk.calls == []
+    assert broker.submitted == []
 
 
 def test_short_uses_bid():

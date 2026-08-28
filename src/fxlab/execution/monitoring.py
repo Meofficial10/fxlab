@@ -57,7 +57,11 @@ class AccountMonitoringView:
     realized_pnl_basis: str
     unrealized_pnl: float
     open_position_count: int
+    account_currency: str
     margin_model: str
+    margin_model_identity: str
+    margin_quality: str
+    leverage_by_symbol: tuple[tuple[str, float], ...]
 
     def __post_init__(self) -> None:
         _finite_fields(
@@ -168,6 +172,11 @@ class BrokerMonitoringView:
     descriptor_fingerprint: str
     connected: bool
     compatibility_state: str
+    valuation_policy_version: str
+    instrument_catalog_fingerprint: str
+    latest_valuation_observation: str | None
+    valuation_health: str
+    execution_model_fingerprint: str
 
 
 @dataclass(frozen=True)
@@ -342,6 +351,7 @@ def _project_session(
     provider_state = session.replay.provider_compatibility_snapshot()
     descriptor = session.broker.broker_descriptor
     descriptor_state = descriptor.compatibility_snapshot()
+    economic = session.broker.economic_monitoring_snapshot()
     positions = tuple(account.open_positions)
     correlations = {
         item["position_id"]: item
@@ -403,7 +413,14 @@ def _project_session(
             "paper_broker_accounting_projection",
             unrealized,
             len(positions),
-            "unmodeled_paper_margin",
+            str(economic["account_currency"]),
+            str(economic["margin_model"]),
+            str(economic["margin_model_identity"]),
+            str(economic["margin_quality"]),
+            tuple(
+                (str(symbol), float(leverage))
+                for symbol, leverage in economic["margin_leverage"]
+            ),
         ),
         risk=RiskMonitoringView(
             peak,
@@ -449,6 +466,15 @@ def _project_session(
             descriptor.fingerprint,
             session.broker.is_connected(),
             compatibility,
+            str(economic["valuation_policy_version"]),
+            str(economic["instrument_catalog_fingerprint"]),
+            (
+                str(economic["latest_valuation_observation"])
+                if economic["latest_valuation_observation"] is not None
+                else None
+            ),
+            str(economic["valuation_health"]),
+            str(economic["execution_model_fingerprint"]),
         ),
         recovery=RecoveryMonitoringView(
             recovery.state.value if recovery is not None else None,

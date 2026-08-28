@@ -22,6 +22,7 @@ from .broker_capabilities import (
     BrokerDescriptor,
     BrokerEnvironment,
 )
+from .valuation import FxInstrumentCatalog, FxValuationEngine, InstrumentSpec, PipValuation
 
 OANDA_PRACTICE_AUTHORITY = "https://api-fxpractice.oanda.com"
 OANDA_SYMBOLS: Mapping[str, str] = MappingProxyType(
@@ -38,10 +39,17 @@ _OANDA_CANONICAL_BY_NATIVE = MappingProxyType(
 _CONTRACT_UNITS = Decimal("100000")
 _CLIENT_ID_PATTERN = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _MAX_RESPONSE_BYTES = 1_048_576
+_OANDA_CATALOG = FxInstrumentCatalog(
+    tuple(
+        InstrumentSpec(symbol, "fx", symbol[:3], "USD", 0.0001, 100_000, "1")
+        for symbol in sorted(OANDA_SYMBOLS)
+    )
+)
+_OANDA_VALUATION = FxValuationEngine(_OANDA_CATALOG, max_age=timedelta(seconds=5))
 
 _OANDA_DESCRIPTOR = BrokerDescriptor(
     broker_id="oanda-v20",
-    implementation_version="1",
+    implementation_version="2",
     environment=BrokerEnvironment.DEMO,
     capabilities=frozenset(
         {
@@ -272,6 +280,22 @@ class OandaDemoBroker:
         )
         account = _validated_account(response, self._account_id)
         return _account_info(account)
+
+    def pip_valuation(
+        self, symbol: str, account_currency: str, as_of: datetime
+    ) -> PipValuation:
+        canonical = _canonical_symbol(symbol)
+        if canonical is None:
+            raise ValueError("unsupported_oanda_symbol")
+        if account_currency != "USD":
+            from .valuation import ValuationFailure
+
+            raise ValuationFailure("account_currency_unsupported")
+        self._require_connected()
+        with self._lock:
+            if OANDA_SYMBOLS[canonical] not in self._instrument_meta:
+                raise RuntimeError("oanda_instrument_metadata_unavailable")
+        return _OANDA_VALUATION.pip_valuation(canonical, "USD", as_of, ())
 
     def submit_order(self, order: OrderRequest) -> str:
         self._require_connected()
@@ -614,7 +638,14 @@ def _account_info(account: Mapping[str, object]) -> AccountInfo:
     ):
         raise RuntimeError("oanda_account_invalid")
     positions = tuple(_position_from_trade(item) for item in trades)
-    return AccountInfo(balance, equity, margin_used, margin_available, list(positions))
+    return AccountInfo(
+        balance,
+        equity,
+        margin_used,
+        margin_available,
+        "USD",
+        list(positions),
+    )
 
 
 def _position_from_trade(raw: object) -> Position:

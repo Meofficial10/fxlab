@@ -19,8 +19,10 @@ from typing import Literal, Protocol, runtime_checkable
 
 from ..execution.broker import AccountInfo, Position
 from ..execution.signal_engine import SignalEvent
+from ..execution.valuation import PipValuation
 
 _TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
+_EVIDENCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 @runtime_checkable
@@ -113,6 +115,10 @@ class RiskDecision:
     tp_price: float | None
     pip_size: float
     stop_pips: float
+    account_currency: str
+    pip_value_per_lot: float
+    valuation_id: str
+    valuation_observation_time: datetime | None
     monetary_risk_budget: float
     modeled_monetary_risk: float
     approved_at: datetime
@@ -129,6 +135,7 @@ class RiskDecision:
             "sl_price",
             "pip_size",
             "stop_pips",
+            "pip_value_per_lot",
             "monetary_risk_budget",
             "modeled_monetary_risk",
         )
@@ -139,6 +146,24 @@ class RiskDecision:
             raise ValueError("tp_price must be finite and > 0 when supplied")
         if _aware_utc(self.approved_at) is None:
             raise ValueError("approved_at must be timezone-aware")
+        if not isinstance(self.account_currency, str) or not re.fullmatch(
+            r"[A-Z]{3}", self.account_currency
+        ):
+            raise ValueError("account_currency must be an uppercase three-letter code")
+        if not isinstance(self.valuation_id, str) or not _EVIDENCE_PATTERN.fullmatch(
+            self.valuation_id
+        ):
+            raise ValueError("valuation_id must be a safe identifier")
+        if self.valuation_observation_time is not None and _aware_utc(
+            self.valuation_observation_time
+        ) is None:
+            raise ValueError("valuation_observation_time must be timezone-aware")
+        if (
+            self.valuation_observation_time is not None
+            and self.valuation_observation_time.astimezone(UTC)
+            > self.approved_at.astimezone(UTC)
+        ):
+            raise ValueError("valuation observation cannot follow approval")
         if self.modeled_monetary_risk > self.monetary_risk_budget:
             raise ValueError("modeled_monetary_risk cannot exceed its budget")
 
@@ -156,7 +181,6 @@ class RiskEngine:
     limits: RiskLimits = field(default_factory=RiskLimits)
     pip_size_resolver: PipSizeResolver | None = None
     lot_step: float = 0.01
-    pip_value_per_lot: float = 10.0
 
     _kill_switch_active: bool = field(default=False, init=False)
     _kill_switch_reason: KillSwitchReason | None = field(default=None, init=False)
@@ -177,7 +201,6 @@ class RiskEngine:
             "limits",
             "pip_size_resolver",
             "lot_step",
-            "pip_value_per_lot",
         }
         if name in configuration_fields and getattr(self, "_configuration_locked", False):
             raise AttributeError(f"{name} is immutable after RiskEngine construction")
@@ -188,8 +211,6 @@ class RiskEngine:
             raise ValueError("limits must be a RiskLimits instance")
         if not _is_positive_finite(self.lot_step):
             raise ValueError("lot_step must be finite and > 0")
-        if not _is_positive_finite(self.pip_value_per_lot):
-            raise ValueError("pip_value_per_lot must be finite and > 0")
         self._configuration_locked = True
 
     @property
@@ -275,7 +296,6 @@ class RiskEngine:
         snapshot: dict[str, object] = {
             "limits": asdict(self.limits),
             "lot_step": self.lot_step,
-            "pip_value_per_lot": self.pip_value_per_lot,
         }
         if symbols is not None:
             if self.pip_size_resolver is None:
@@ -311,6 +331,7 @@ class RiskEngine:
         tp_price: float | None,
         account: AccountInfo | None,
         current_time: datetime,
+        pip_valuation: PipValuation,
     ) -> RiskDecision | RiskRejection:
         """Evaluate caller-owned execution prices without performing broker operations."""
         signal_error = _validate_signal(signal)
@@ -328,6 +349,15 @@ class RiskEngine:
         if account_error is not None:
             return account_error
         assert isinstance(account, AccountInfo)
+
+        valuation_error = _validate_pip_valuation(
+            pip_valuation,
+            signal,
+            account,
+            current_utc,
+        )
+        if valuation_error is not None:
+            return valuation_error
 
         with self._lock:
             state_error = self._update_and_check_state_locked(
@@ -357,7 +387,9 @@ class RiskEngine:
             / Decimal(100)
         )
         stop_pips_decimal = abs(entry_decimal - stop_decimal) / pip_decimal
-        denominator_decimal = stop_pips_decimal * Decimal(str(self.pip_value_per_lot))
+        denominator_decimal = stop_pips_decimal * Decimal(
+            str(pip_valuation.pip_value_per_lot)
+        )
         raw_lots_decimal = risk_budget_decimal / denominator_decimal
         stop_pips = float(stop_pips_decimal)
         risk_budget = float(risk_budget_decimal)
@@ -482,6 +514,10 @@ class RiskEngine:
                 tp_price=take_profit,
                 pip_size=pip_size,
                 stop_pips=stop_pips,
+                account_currency=pip_valuation.account_currency,
+                pip_value_per_lot=pip_valuation.pip_value_per_lot,
+                valuation_id=pip_valuation.valuation_id,
+                valuation_observation_time=pip_valuation.observation_time,
                 monetary_risk_budget=risk_budget,
                 modeled_monetary_risk=modeled_risk,
                 approved_at=current_utc,
@@ -795,6 +831,39 @@ def _validate_account(
             return _reject(
                 "invalid_position", "open_positions contains a malformed Position", signal
             )
+    return None
+
+
+def _validate_pip_valuation(
+    valuation: object,
+    signal: SignalEvent,
+    account: AccountInfo,
+    current_utc: datetime,
+) -> RiskRejection | None:
+    if not isinstance(valuation, PipValuation):
+        return _reject(
+            "invalid_pip_valuation",
+            "pip valuation must be an immutable PipValuation",
+            signal,
+        )
+    if valuation.canonical_symbol != _canonical_symbol(signal.symbol):
+        return _reject(
+            "invalid_pip_valuation",
+            "pip valuation instrument does not match the signal",
+            signal,
+        )
+    if valuation.account_currency != account.currency:
+        return _reject(
+            "invalid_pip_valuation",
+            "pip valuation currency does not match the account",
+            signal,
+        )
+    if valuation.as_of != current_utc:
+        return _reject(
+            "invalid_pip_valuation",
+            "pip valuation as_of does not match the evaluation time",
+            signal,
+        )
     return None
 
 

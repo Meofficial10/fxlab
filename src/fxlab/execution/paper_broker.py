@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections.abc import Mapping
 from dataclasses import InitVar, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from threading import Lock
@@ -15,16 +17,31 @@ import pandas as pd
 from ..config import CostConfig
 from ..costs.model import CostModel
 from ..data.schema import OHLCV, timeframe_to_timedelta
-from .broker import AccountInfo, OrderRequest, OrderStatus, Position, Tick
+from .broker import (
+    AccountInfo,
+    BrokerOrderRejected,
+    OrderRequest,
+    OrderStatus,
+    Position,
+    Tick,
+)
 from .broker_capabilities import (
     BrokerCapability,
     BrokerDescriptor,
     BrokerEnvironment,
 )
+from .margin import MarginExposure, MarginResult, PaperMarginModel
+from .valuation import (
+    ConversionQuote,
+    FxInstrumentCatalog,
+    FxValuationEngine,
+    PipValuation,
+    ValuationFailure,
+)
 
 _PAPER_BROKER_DESCRIPTOR = BrokerDescriptor(
     broker_id="fxlab-paper",
-    implementation_version="1",
+    implementation_version="2",
     environment=BrokerEnvironment.PAPER,
     capabilities=frozenset(
         {
@@ -69,6 +86,8 @@ class PositionClose:
     gross_pnl: float
     commission: float
     net_realized_pnl: float
+    account_currency: str
+    valuation_id: str
     close_time: datetime
     reason: CloseReason
 
@@ -87,14 +106,18 @@ class PaperBroker:
     """Immediate-fill paper broker driven only by externally accepted replay ticks.
 
     The configured CostModel supplies fallback spread, base slippage, and commission.
-    The fixed monetary pip value is the same simplified convention used by RiskEngine;
-    it is not universal account-currency conversion for JPY pairs or FX crosses.
+    All monetary valuation is explicit, point-in-time, and account-currency aware.
     """
 
+    account_currency: str
+    instrument_catalog: InitVar[FxInstrumentCatalog]
+    valuation_max_age: InitVar[timedelta]
+    valuation_policy_version: str
+    margin_model: InitVar[PaperMarginModel]
+    commission_currency: str
     initial_balance: float = 10_000.0
     historical_bars: InitVar[Mapping[tuple[str, str], pd.DataFrame] | None] = None
     cost_config: InitVar[CostConfig | None] = None
-    pip_value_per_lot: float = 10.0
 
     _connected: bool = field(default=False, init=False)
     _subscriptions: set[str] = field(default_factory=set, init=False)
@@ -107,6 +130,8 @@ class PaperBroker:
         default_factory=dict, init=False, repr=False
     )
     _cost_config: CostConfig = field(init=False, repr=False)
+    _valuation_engine: FxValuationEngine = field(init=False, repr=False)
+    _margin_model: PaperMarginModel = field(init=False, repr=False)
     _cost_models: dict[str, CostModel] = field(default_factory=dict, init=False, repr=False)
     _balance: float = field(init=False)
     _equity: float = field(init=False)
@@ -115,15 +140,37 @@ class PaperBroker:
 
     def __post_init__(
         self,
+        instrument_catalog: FxInstrumentCatalog,
+        valuation_max_age: timedelta,
+        margin_model: PaperMarginModel,
         historical_bars: Mapping[tuple[str, str], pd.DataFrame] | None,
         cost_config: CostConfig | None,
     ) -> None:
+        if (
+            not isinstance(self.account_currency, str)
+            or len(self.account_currency) != 3
+            or not self.account_currency.isalpha()
+            or not self.account_currency.isupper()
+        ):
+            raise ValueError("account_currency must be an uppercase three-letter code")
+        if self.commission_currency != self.account_currency:
+            raise ValueError("commission_currency must match account_currency")
         if not _positive_finite(self.initial_balance):
             raise ValueError("initial_balance must be finite and positive")
-        if not _positive_finite(self.pip_value_per_lot):
-            raise ValueError("pip_value_per_lot must be finite and positive")
+        if not isinstance(instrument_catalog, FxInstrumentCatalog):
+            raise ValueError("instrument_catalog must be an FxInstrumentCatalog")
+        if not isinstance(margin_model, PaperMarginModel):
+            raise ValueError("margin_model must implement PaperMarginModel")
+        if margin_model.descriptor.account_currency != self.account_currency:
+            raise ValueError("margin model currency must match account_currency")
         if cost_config is not None and not isinstance(cost_config, CostConfig):
             raise ValueError("cost_config must be a CostConfig")
+        self._valuation_engine = FxValuationEngine(
+            instrument_catalog,
+            max_age=valuation_max_age,
+            policy_version=self.valuation_policy_version,
+        )
+        self._margin_model = margin_model
         self._cost_config = cost_config or CostConfig()
         self._balance = float(self.initial_balance)
         self._equity = float(self.initial_balance)
@@ -187,7 +234,14 @@ class PaperBroker:
             ):
                 return False
             self._latest_ticks[symbol] = tick
-            self._mark_symbol_locked(symbol, tick)
+            try:
+                self._mark_symbol_locked(symbol, tick)
+            except Exception:
+                if previous is None:
+                    self._latest_ticks.pop(symbol, None)
+                else:
+                    self._latest_ticks[symbol] = previous
+                raise
             return True
 
     def get_latest_tick(self, symbol: str) -> Tick | None:
@@ -201,13 +255,28 @@ class PaperBroker:
             ]
             balance = self._balance
             equity = self._equity
+            margin = self._margin_locked(equity)
         return AccountInfo(
             balance=balance,
             equity=equity,
-            margin_used=0.0,
-            margin_available=equity,
+            margin_used=margin.margin_used,
+            margin_available=margin.margin_available,
+            currency=self.account_currency,
             open_positions=positions,
         )
+
+    def pip_valuation(
+        self, symbol: str, account_currency: str, as_of: datetime
+    ) -> PipValuation:
+        with self._lock:
+            if account_currency != self.account_currency:
+                raise ValuationFailure("account_currency_unsupported")
+            return self._valuation_engine.pip_valuation(
+                _canonical_symbol(symbol),
+                account_currency,
+                as_of,
+                self._conversion_quotes_locked(),
+            )
 
     def submit_order(self, order: OrderRequest) -> str:
         if not isinstance(order, OrderRequest):
@@ -230,10 +299,6 @@ class PaperBroker:
             fill_price = self._modeled_fill_locked(tick, order.side, entry=True)
             broker_id = f"paper-order::{client_id}"
             position_id = f"paper-position::{client_id}"
-            correlation = OrderCorrelation(client_id, broker_id, position_id)
-            self._correlations[client_id] = correlation
-            self._client_by_broker_id[broker_id] = client_id
-            self._statuses[broker_id] = OrderStatus.FILLED
             position = Position(
                 symbol=symbol,
                 side=order.side,
@@ -245,8 +310,39 @@ class PaperBroker:
             )
             exit_fill = self._modeled_fill_locked(tick, order.side, entry=False)
             position.unrealized_pnl = self._net_pnl_locked(
-                position, exit_fill, cost_model
+                position,
+                exit_fill,
+                cost_model,
+                tick.timestamp.astimezone(UTC),
             )[2]
+            projected = tuple(
+                MarginExposure(
+                    item.position.symbol,
+                    item.position.size,
+                    item.position.side,
+                )
+                for item in self._positions.values()
+            ) + (MarginExposure(symbol, float(order.size), order.side),)
+            projected_equity = float(
+                Decimal(str(self._equity))
+                + Decimal(str(position.unrealized_pnl))
+            )
+            try:
+                margin = self._margin_model.calculate(
+                    projected,
+                    equity=projected_equity,
+                    as_of=tick.timestamp,
+                    valuation=self._valuation_engine,
+                    quotes=self._conversion_quotes_locked(),
+                )
+            except (ValueError, ValuationFailure) as exc:
+                raise BrokerOrderRejected("margin_valuation_unavailable") from exc
+            if not margin.sufficient:
+                raise BrokerOrderRejected("insufficient_margin")
+            correlation = OrderCorrelation(client_id, broker_id, position_id)
+            self._correlations[client_id] = correlation
+            self._client_by_broker_id[broker_id] = client_id
+            self._statuses[broker_id] = OrderStatus.FILLED
             self._positions[position_id] = _PaperPosition(
                 position=position,
                 client_entry_order_id=client_id,
@@ -347,16 +443,62 @@ class PaperBroker:
             }
 
     def configuration_snapshot(self, symbols: list[str]) -> dict[str, object]:
-        return {
+        snapshot = {
             "broker_descriptor": self.broker_descriptor.compatibility_snapshot(),
             "initial_balance": self.initial_balance,
-            "pip_value_per_lot": self.pip_value_per_lot,
+            "account_currency": self.account_currency,
+            "commission_currency": self.commission_currency,
+            "instrument_catalog_fingerprint": self._valuation_engine.catalog.fingerprint,
+            "valuation_policy_version": self._valuation_engine.policy_version,
+            "conversion_freshness_seconds": self._valuation_engine.max_age.total_seconds(),
+            "margin_model_identity": self._margin_model.descriptor.fingerprint,
+            "margin_model": self._margin_model.descriptor.model_id,
+            "margin_quality": self._margin_model.descriptor.quality,
+            "margin_leverage": self._margin_model.descriptor.leverage_by_symbol,
+            "fill_timing_policy": "immediate-v1",
+            "partial_fill_policy": "none-v1",
+            "spread_policy": "tick-or-cost-fallback-v1",
+            "slippage_policy": "deterministic-base-norm-vol-zero-v1",
             "cost_config": self._cost_config.model_dump(mode="json"),
             "pip_sizes": {
                 symbol: self._cost_config.pip_size_for(symbol)
                 for symbol in sorted({_canonical_symbol(item) for item in symbols})
             },
         }
+        snapshot["execution_model_fingerprint"] = hashlib.sha256(
+            json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return snapshot
+
+    def economic_monitoring_snapshot(self) -> dict[str, object]:
+        """Return only immutable primitive Phase 18 model identities and health."""
+        with self._lock:
+            latest = max(
+                (tick.timestamp.astimezone(UTC) for tick in self._latest_ticks.values()),
+                default=None,
+            )
+            symbols = sorted(
+                set(self._valuation_engine.catalog.symbols)
+                & (
+                    set(self._latest_ticks)
+                    | {item.position.symbol for item in self._positions.values()}
+                )
+            )
+            configuration = self.configuration_snapshot(symbols)
+            return {
+                "account_currency": self.account_currency,
+                "valuation_policy_version": self._valuation_engine.policy_version,
+                "instrument_catalog_fingerprint": self._valuation_engine.catalog.fingerprint,
+                "margin_model_identity": self._margin_model.descriptor.fingerprint,
+                "margin_model": self._margin_model.descriptor.model_id,
+                "margin_quality": self._margin_model.descriptor.quality,
+                "margin_leverage": self._margin_model.descriptor.leverage_by_symbol,
+                "latest_valuation_observation": latest.isoformat() if latest else None,
+                "valuation_health": "available" if latest else "unobserved",
+                "execution_model_fingerprint": configuration[
+                    "execution_model_fingerprint"
+                ],
+            }
 
     def restore_state(self, state: Mapping[str, object]) -> None:
         """Atomically restore validated paper state without fills or PnL actions."""
@@ -407,6 +549,9 @@ class PaperBroker:
             )
             if any(not _nonnegative_finite(value) for value in values) or model.pip_size <= 0:
                 raise ValueError("cost model values must be finite and non-negative")
+            specification = self._valuation_engine.catalog.specification(symbol)
+            if float(model.pip_size) != float(specification.pip_size):
+                raise ValueError("cost pip size conflicts with instrument specification")
             self._cost_models[symbol] = model
         return self._cost_models[symbol]
 
@@ -429,6 +574,17 @@ class PaperBroker:
         return float(fill)
 
     def _mark_symbol_locked(self, symbol: str, tick: Tick) -> None:
+        prepared: list[
+            tuple[
+                str,
+                CloseReason | None,
+                float,
+                float,
+                float,
+                float,
+                str,
+            ]
+        ] = []
         for position_id in sorted(tuple(self._positions)):
             record = self._positions.get(position_id)
             if record is None or record.position.symbol != symbol:
@@ -446,14 +602,39 @@ class PaperBroker:
                 or (position.side == -1 and raw_exit <= record.tp_price)
             ):
                 reason = CloseReason.TAKE_PROFIT
-            if reason is not None:
-                self._close_position_locked(position_id, tick, reason)
-                continue
             exit_fill = self._modeled_fill_locked(tick, position.side, entry=False)
             model = self._cost_model_locked(symbol)
-            position.unrealized_pnl = self._net_pnl_locked(
-                position, exit_fill, model
-            )[2]
+            gross, commission, net, valuation_id = self._net_pnl_locked(
+                position,
+                exit_fill,
+                model,
+                tick.timestamp.astimezone(UTC),
+            )
+            prepared.append(
+                (
+                    position_id,
+                    reason,
+                    exit_fill,
+                    gross,
+                    commission,
+                    net,
+                    valuation_id,
+                )
+            )
+        for position_id, reason, exit_fill, gross, commission, net, valuation_id in prepared:
+            if reason is None:
+                self._positions[position_id].position.unrealized_pnl = net
+            else:
+                self._apply_close_locked(
+                    position_id,
+                    tick,
+                    reason,
+                    exit_fill,
+                    gross,
+                    commission,
+                    net,
+                    valuation_id,
+                )
         self._recompute_equity_locked()
 
     def _close_position_locked(
@@ -463,7 +644,38 @@ class PaperBroker:
         position = record.position
         model = self._cost_model_locked(position.symbol)
         exit_fill = self._modeled_fill_locked(tick, position.side, entry=False)
-        gross, commission, net = self._net_pnl_locked(position, exit_fill, model)
+        gross, commission, net, valuation_id = self._net_pnl_locked(
+            position,
+            exit_fill,
+            model,
+            tick.timestamp.astimezone(UTC),
+        )
+        self._apply_close_locked(
+            position_id,
+            tick,
+            reason,
+            exit_fill,
+            gross,
+            commission,
+            net,
+            valuation_id,
+        )
+        self._recompute_equity_locked()
+        return f"paper-close::{position_id}"
+
+    def _apply_close_locked(
+        self,
+        position_id: str,
+        tick: Tick,
+        reason: CloseReason,
+        exit_fill: float,
+        gross: float,
+        commission: float,
+        net: float,
+        valuation_id: str,
+    ) -> None:
+        record = self._positions[position_id]
+        position = record.position
         close_id = f"paper-close::{position_id}"
         del self._positions[position_id]
         self._balance = float(Decimal(str(self._balance)) + Decimal(str(net)))
@@ -481,30 +693,76 @@ class PaperBroker:
                 gross_pnl=gross,
                 commission=commission,
                 net_realized_pnl=net,
+                account_currency=self.account_currency,
+                valuation_id=valuation_id,
                 close_time=tick.timestamp.astimezone(UTC),
                 reason=reason,
             )
         )
-        self._recompute_equity_locked()
-        return close_id
 
     def _net_pnl_locked(
-        self, position: Position, exit_fill: float, model: CostModel
-    ) -> tuple[float, float, float]:
+        self,
+        position: Position,
+        exit_fill: float,
+        model: CostModel,
+        as_of: datetime,
+    ) -> tuple[float, float, float, str]:
+        specification = self._valuation_engine.catalog.specification(position.symbol)
         side = Decimal(position.side)
         price_move = Decimal(str(exit_fill)) - Decimal(str(position.entry_price))
-        pnl_pips = side * price_move / Decimal(str(model.pip_size))
-        gross = (
-            pnl_pips
-            * Decimal(str(self.pip_value_per_lot))
+        quote_currency_gross = float(
+            side
+            * price_move
+            * Decimal(str(specification.contract_units_per_lot))
             * Decimal(str(position.size))
         )
+        valuation = self._valuation_engine.pip_valuation(
+            position.symbol,
+            self.account_currency,
+            as_of,
+            self._conversion_quotes_locked(),
+        )
+        gross = Decimal(str(valuation.convert_signed(quote_currency_gross)))
         commission = Decimal(str(model.commission_cost(position.size)))
         net = gross - commission
         results = (float(gross), float(commission), float(net))
         if any(not math.isfinite(value) for value in results):
             raise ValueError("paper PnL must remain finite")
-        return results
+        return (*results, valuation.valuation_id)
+
+    def _conversion_quotes_locked(self) -> tuple[ConversionQuote, ...]:
+        return tuple(
+            ConversionQuote(
+                symbol,
+                tick.bid,
+                tick.ask,
+                tick.timestamp,
+                "paper-replay",
+            )
+            for symbol, tick in sorted(self._latest_ticks.items())
+            if symbol in self._valuation_engine.catalog.symbols
+        )
+
+    def _margin_locked(self, equity: float) -> MarginResult:
+        exposures = tuple(
+            MarginExposure(
+                item.position.symbol,
+                item.position.size,
+                item.position.side,
+            )
+            for item in self._positions.values()
+        )
+        as_of = max(
+            (tick.timestamp.astimezone(UTC) for tick in self._latest_ticks.values()),
+            default=datetime(1970, 1, 1, tzinfo=UTC),
+        )
+        return self._margin_model.calculate(
+            exposures,
+            equity=equity,
+            as_of=as_of,
+            valuation=self._valuation_engine,
+            quotes=self._conversion_quotes_locked(),
+        )
 
     def _recompute_equity_locked(self) -> None:
         unrealized = sum(

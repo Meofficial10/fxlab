@@ -37,6 +37,14 @@ if TYPE_CHECKING:
         EventCorrelation,
         EventLedger,
     )
+    from .margin import (
+        FixedLeveragePaperMargin,
+        MarginDescriptor,
+        MarginExposure,
+        MarginResult,
+        PaperMarginModel,
+        UnmodeledPaperMargin,
+    )
     from .monitoring import (
         AccountMonitoringView,
         AuditEventMonitoringView,
@@ -97,6 +105,16 @@ if TYPE_CHECKING:
         RuntimeControlResult,
         RuntimeState,
         RuntimeStatus,
+    )
+    from .valuation import (
+        ConversionQuote,
+        FxInstrumentCatalog,
+        FxValuationEngine,
+        InstrumentSpec,
+        InstrumentValuationProvider,
+        PipValuation,
+        ValuationFailure,
+        approved_fx_instrument_catalog,
     )
 
 __all__ = [
@@ -162,6 +180,12 @@ __all__ = [
     "RuntimeMonitoringView",
     "monitoring_to_dict",
     "project_audit_events",
+    "FixedLeveragePaperMargin",
+    "MarginDescriptor",
+    "MarginExposure",
+    "MarginResult",
+    "PaperMarginModel",
+    "UnmodeledPaperMargin",
     "OrderCorrelation",
     "PaperBroker",
     "CloseReason",
@@ -177,6 +201,14 @@ __all__ = [
     "RuntimeController",
     "RuntimeState",
     "RuntimeStatus",
+    "ConversionQuote",
+    "FxInstrumentCatalog",
+    "FxValuationEngine",
+    "InstrumentSpec",
+    "InstrumentValuationProvider",
+    "PipValuation",
+    "ValuationFailure",
+    "approved_fx_instrument_catalog",
     "inspect_broker_capabilities",
     "required_capabilities_for_order",
 ]
@@ -190,6 +222,7 @@ def __getattr__(name: str) -> Any:
             broker_capabilities,
             durable_event_store,
             event_ledger,
+            margin,
             monitoring,
             oanda_demo_broker,
             order_manager,
@@ -198,6 +231,7 @@ def __getattr__(name: str) -> Any:
             reconciliation,
             recovery,
             runtime_control,
+            valuation,
         )
 
         for module in (
@@ -207,6 +241,7 @@ def __getattr__(name: str) -> Any:
             durable_event_store,
             event_ledger,
             monitoring,
+            margin,
             order_manager,
             oanda_demo_broker,
             paper_broker,
@@ -214,6 +249,7 @@ def __getattr__(name: str) -> Any:
             reconciliation,
             recovery,
             runtime_control,
+            valuation,
         ):
             if hasattr(module, name):
                 return getattr(module, name)

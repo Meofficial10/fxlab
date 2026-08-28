@@ -12,6 +12,13 @@ import pytest
 from fxlab.config import CostConfig
 from fxlab.execution.broker import AccountInfo, Position
 from fxlab.execution.signal_engine import SignalEvent
+from fxlab.execution.valuation import (
+    ConversionQuote,
+    FxInstrumentCatalog,
+    FxValuationEngine,
+    InstrumentSpec,
+    PipValuation,
+)
 from fxlab.risk import (
     KillSwitchReason,
     PipSizeResolver,
@@ -22,6 +29,17 @@ from fxlab.risk import (
 )
 
 NOW = datetime(2026, 8, 25, 11, 0, tzinfo=UTC)
+
+VALUATION = FxValuationEngine(
+    FxInstrumentCatalog(
+        (
+            InstrumentSpec("EURUSD", "fx", "EUR", "USD", 0.0001, 100_000, "1"),
+            InstrumentSpec("GBPUSD", "fx", "GBP", "USD", 0.0001, 100_000, "1"),
+            InstrumentSpec("USDJPY", "fx", "USD", "JPY", 0.01, 100_000, "1"),
+        )
+    ),
+    max_age=timedelta(minutes=5),
+)
 
 
 class Resolver:
@@ -61,6 +79,7 @@ def account(equity: float = 10_000.0, positions: list[Position] | None = None) -
         equity=equity,
         margin_used=0.0,
         margin_available=equity,
+        currency="USD",
         open_positions=[] if positions is None else positions,
     )
 
@@ -72,6 +91,7 @@ def corrupted_account(equity: object) -> AccountInfo:
     object.__setattr__(snapshot, "equity", equity)
     object.__setattr__(snapshot, "margin_used", 0.0)
     object.__setattr__(snapshot, "margin_available", equity)
+    object.__setattr__(snapshot, "currency", "USD")
     object.__setattr__(snapshot, "open_positions", [])
     return snapshot
 
@@ -97,6 +117,7 @@ def engine(**changes: object) -> RiskEngine:
 
 
 def evaluate(risk_engine: RiskEngine, event: SignalEvent | None = None, **changes: object):
+    selected = event or signal()
     values = {
         "entry_price": 1.1000,
         "sl_price": 1.0950,
@@ -105,7 +126,26 @@ def evaluate(risk_engine: RiskEngine, event: SignalEvent | None = None, **change
         "current_time": NOW,
     }
     values.update(changes)
-    return risk_engine.evaluate(event or signal(), **values)
+    if "pip_valuation" not in values:
+        valuation_symbol = (
+            selected.symbol
+            if selected.symbol in VALUATION.catalog.symbols
+            else "EURUSD"
+        )
+        valuation_time = values["current_time"]
+        if not isinstance(valuation_time, datetime) or valuation_time.tzinfo is None:
+            valuation_time = NOW
+        values["pip_valuation"] = valuation_for(
+            valuation_symbol, valuation_time.astimezone(UTC)
+        )
+    return risk_engine.evaluate(selected, **values)
+
+
+def valuation_for(symbol: str, as_of: datetime = NOW) -> PipValuation:
+    quotes = (
+        ConversionQuote("USDJPY", 149.0, 150.0, as_of, "risk-test"),
+    ) if symbol == "USDJPY" else ()
+    return VALUATION.pip_valuation(symbol, "USD", as_of, quotes)
 
 
 def assert_rejected(result: object, reason: str) -> RiskRejection:
@@ -153,7 +193,46 @@ def test_normal_short_and_jpy_pip_sizing():
     assert isinstance(result, RiskDecision)
     assert result.pip_size == pytest.approx(0.01)
     assert result.stop_pips == pytest.approx(50.0)
-    assert result.size_lots == pytest.approx(0.2)
+    assert result.size_lots == pytest.approx(0.29)
+
+
+def test_dynamic_usdjpy_pip_value_changes_size_and_is_preserved_as_evidence() -> None:
+    event = signal(symbol="USDJPY")
+    valuation = valuation_for("USDJPY")
+    result = evaluate(
+        engine(),
+        event,
+        entry_price=150.0,
+        sl_price=149.5,
+        tp_price=151.0,
+        pip_valuation=valuation,
+    )
+    assert isinstance(result, RiskDecision)
+    assert result.size_lots == 0.29
+    assert result.pip_value_per_lot == pytest.approx(1000 / 149)
+    assert result.account_currency == "USD"
+    assert result.valuation_id == valuation.valuation_id
+    assert result.valuation_observation_time == NOW
+
+
+def test_invalid_valuation_rejects_before_counters_or_reservations() -> None:
+    risk = engine()
+    result = evaluate(risk, pip_valuation=object())
+    assert_rejected(result, "invalid_pip_valuation")
+    assert risk.daily_trades == 0
+    assert risk.reserved_position_count == 0
+
+
+def test_evaluate_has_no_implicit_fixed_pip_value_fallback() -> None:
+    with pytest.raises(TypeError):
+        engine().evaluate(
+            signal(),
+            entry_price=1.1,
+            sl_price=1.095,
+            tp_price=1.11,
+            account=account(),
+            current_time=NOW,
+        )
 
 
 def test_optional_take_profit_can_be_omitted():
@@ -411,6 +490,7 @@ def test_invalid_signal_object_is_rejected():
         tp_price=None,
         account=account(),
         current_time=NOW,
+        pip_valuation=valuation_for("EURUSD"),
     )
     assert_rejected(result, "invalid_signal")
 
@@ -499,7 +579,7 @@ def test_invalid_risk_limits_raise(field: str, value: object):
         RiskLimits(**{field: value})
 
 
-@pytest.mark.parametrize("field", ["lot_step", "pip_value_per_lot"])
+@pytest.mark.parametrize("field", ["lot_step"])
 @pytest.mark.parametrize("value", [0.0, -1.0, nan, inf, True])
 def test_invalid_engine_numeric_configuration_raises(field: str, value: object):
     with pytest.raises(ValueError):
@@ -508,7 +588,7 @@ def test_invalid_engine_numeric_configuration_raises(field: str, value: object):
 
 @pytest.mark.parametrize(
     "field",
-    ["limits", "pip_size_resolver", "lot_step", "pip_value_per_lot"],
+    ["limits", "pip_size_resolver", "lot_step"],
 )
 def test_engine_configuration_is_immutable_after_validation(field: str):
     risk_engine = engine()
@@ -834,6 +914,10 @@ def test_approval_discriminator_cannot_be_overridden_by_callers():
             tp_price=decision.tp_price,
             pip_size=decision.pip_size,
             stop_pips=decision.stop_pips,
+            account_currency=decision.account_currency,
+            pip_value_per_lot=decision.pip_value_per_lot,
+            valuation_id=decision.valuation_id,
+            valuation_observation_time=decision.valuation_observation_time,
             monetary_risk_budget=decision.monetary_risk_budget,
             modeled_monetary_risk=decision.modeled_monetary_risk,
             approved_at=decision.approved_at,

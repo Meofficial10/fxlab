@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from fxlab.config import CostConfig, CostDefaults
 from fxlab.execution.broker_capabilities import (
     BrokerCapability,
     BrokerDescriptor,
@@ -15,6 +16,7 @@ from fxlab.execution.broker_capabilities import (
 )
 from fxlab.execution.durable_event_store import SQLiteEventStore
 from fxlab.execution.event_ledger import AuditComponent, AuditEventType, EventLedger
+from fxlab.execution.margin import FixedLeveragePaperMargin, UnmodeledPaperMargin
 from fxlab.execution.market_data import MarketDataStream
 from fxlab.execution.order_manager import ExecutionIntent, OrderManager
 from fxlab.execution.paper_broker import PaperBroker
@@ -27,6 +29,11 @@ from fxlab.execution.recovery import (
 )
 from fxlab.execution.runtime_control import RuntimeState
 from fxlab.execution.signal_engine import SignalEngine, SignalEvent
+from fxlab.execution.valuation import (
+    FxInstrumentCatalog,
+    InstrumentSpec,
+    approved_fx_instrument_catalog,
+)
 from fxlab.risk import RiskEngine, RiskLimits
 
 
@@ -69,11 +76,26 @@ def make_session(
     source: pd.DataFrame | None = None,
     execution_policy=policy,
     policy_limits: RiskLimits | None = None,
+    account_currency: str = "USD",
+    instrument_catalog: FxInstrumentCatalog | None = None,
+    valuation_policy_version: str = "fx-point-in-time-v1",
+    valuation_max_age: timedelta = timedelta(minutes=5),
+    margin_model=None,
+    cost_config: CostConfig | None = None,
 ) -> tuple[PaperTradingSession, SQLiteEventStore]:
     frame = source if source is not None else bars()
     store = SQLiteEventStore(path, "recovery-session")
     ledger = EventLedger("recovery-session", durable_store=store)
-    broker = PaperBroker(historical_bars={("EURUSD", "M5"): frame})
+    broker = PaperBroker(
+        account_currency,
+        instrument_catalog or approved_fx_instrument_catalog(),
+        valuation_max_age,
+        valuation_policy_version,
+        margin_model or UnmodeledPaperMargin(account_currency),
+        account_currency,
+        historical_bars={("EURUSD", "M5"): frame},
+        cost_config=cost_config,
+    )
     replay = HistoricalBarReplay({"EURUSD": frame}, "M5")
     market = MarketDataStream(
         broker,
@@ -92,9 +114,9 @@ def make_session(
     return session, store
 
 
-def checkpoint_live_session(tmp_path):
+def checkpoint_live_session(tmp_path, **session_changes):
     path = tmp_path / "recovery.sqlite"
-    session, store = make_session(path)
+    session, store = make_session(path, **session_changes)
     session.start()
     session.poll_once()
     checkpoint = create_checkpoint(
@@ -457,7 +479,7 @@ def test_recovery_rejects_broker_capability_identity_changes(
     restored, reopened = make_session(path)
     base = restored.broker.broker_descriptor
     broker_id = "different-paper" if change == "broker_id" else base.broker_id
-    version = "2" if change == "implementation_version" else base.implementation_version
+    version = "3" if change == "implementation_version" else base.implementation_version
     environment = (
         BrokerEnvironment.DEMO
         if change == "demo"
@@ -500,6 +522,142 @@ def test_broker_connection_state_does_not_change_recovery_identity(tmp_path) -> 
         restored, reopened, software_version="1.0", execution_policy_id="policy-v1"
     )
     assert result.recovered
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"account_currency": "EUR"},
+        {
+            "instrument_catalog": FxInstrumentCatalog(
+                (
+                    InstrumentSpec(
+                        "EURUSD", "fx", "EUR", "USD", 0.0001, 100_000, "changed"
+                    ),
+                )
+            )
+        },
+        {"valuation_policy_version": "fx-point-in-time-v2"},
+        {"valuation_max_age": timedelta(minutes=6)},
+    ],
+)
+def test_recovery_rejects_phase18_valuation_identity_changes(
+    tmp_path, changes
+) -> None:
+    path, _, store, _ = checkpoint_live_session(tmp_path)
+    store.close()
+    restored, reopened = make_session(path, **changes)
+    result = recover(
+        restored, reopened, software_version="1.0", execution_policy_id="policy-v1"
+    )
+    assert result.state is RecoveryState.FAILED
+    assert result.reason == "configuration_mismatch"
+
+
+def test_recovery_rejects_phase18_margin_identity_change(tmp_path) -> None:
+    path, _, store, _ = checkpoint_live_session(tmp_path)
+    store.close()
+    restored, reopened = make_session(
+        path,
+        margin_model=FixedLeveragePaperMargin("USD", {"EURUSD": 30.0}),
+    )
+    result = recover(
+        restored, reopened, software_version="1.0", execution_policy_id="policy-v1"
+    )
+    assert result.state is RecoveryState.FAILED
+    assert result.reason == "configuration_mismatch"
+
+
+def test_recovery_rejects_phase18_leverage_change(tmp_path) -> None:
+    path, _, store, _ = checkpoint_live_session(
+        tmp_path,
+        margin_model=FixedLeveragePaperMargin("USD", {"EURUSD": 20.0}),
+    )
+    store.close()
+    restored, reopened = make_session(
+        path,
+        margin_model=FixedLeveragePaperMargin("USD", {"EURUSD": 30.0}),
+    )
+    result = recover(
+        restored, reopened, software_version="1.0", execution_policy_id="policy-v1"
+    )
+    assert result.state is RecoveryState.FAILED
+    assert result.reason == "configuration_mismatch"
+
+
+def test_recovery_rejects_phase18_spread_and_slippage_change(tmp_path) -> None:
+    path, _, store, _ = checkpoint_live_session(tmp_path)
+    store.close()
+    changed_costs = CostConfig(
+        default=CostDefaults(
+            spread_pips=0.9,
+            commission_per_lot_roundturn=7.0,
+            slippage_pips_base=0.4,
+            slippage_vol_coeff=0.1,
+            latency_bars=1,
+        )
+    )
+    restored, reopened = make_session(path, cost_config=changed_costs)
+    result = recover(
+        restored, reopened, software_version="1.0", execution_policy_id="policy-v1"
+    )
+    assert result.state is RecoveryState.FAILED
+    assert result.reason == "configuration_mismatch"
+
+
+def test_recovery_rejects_phase18_slippage_only_change(tmp_path) -> None:
+    baseline_costs = CostConfig(default=CostDefaults())
+    changed_costs = CostConfig(
+        default=CostDefaults(
+            spread_pips=baseline_costs.default.spread_pips,
+            commission_per_lot_roundturn=(
+                baseline_costs.default.commission_per_lot_roundturn
+            ),
+            slippage_pips_base=baseline_costs.default.slippage_pips_base + 0.1,
+            slippage_vol_coeff=baseline_costs.default.slippage_vol_coeff,
+            latency_bars=baseline_costs.default.latency_bars,
+        ),
+        stress_factor=baseline_costs.stress_factor,
+    )
+    assert changed_costs.default.spread_pips == baseline_costs.default.spread_pips
+    assert changed_costs.default.slippage_vol_coeff == (
+        baseline_costs.default.slippage_vol_coeff
+    )
+
+    path, _, store, _ = checkpoint_live_session(
+        tmp_path,
+        cost_config=baseline_costs,
+    )
+    store.close()
+    restored, reopened = make_session(path, cost_config=changed_costs)
+    result = recover(
+        restored, reopened, software_version="1.0", execution_policy_id="policy-v1"
+    )
+
+    assert result.state is RecoveryState.FAILED
+    assert result.reason == "configuration_mismatch"
+
+
+@pytest.mark.parametrize("policy", ["fill_timing_policy", "partial_fill_policy"])
+def test_recovery_rejects_phase18_fixed_execution_policy_change(
+    tmp_path, monkeypatch, policy: str
+) -> None:
+    path, _, store, _ = checkpoint_live_session(tmp_path)
+    store.close()
+    restored, reopened = make_session(path)
+    original = restored.broker.configuration_snapshot
+
+    def changed(symbols):
+        result = original(symbols)
+        result[policy] = "incompatible-v2"
+        return result
+
+    monkeypatch.setattr(restored.broker, "configuration_snapshot", changed)
+    result = recover(
+        restored, reopened, software_version="1.0", execution_policy_id="policy-v1"
+    )
+    assert result.state is RecoveryState.FAILED
+    assert result.reason == "configuration_mismatch"
 
 
 def test_recovery_rejects_provider_mapping_identity_change(tmp_path) -> None:

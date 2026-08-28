@@ -99,7 +99,7 @@ def test_oanda_descriptor_is_demo_only_and_minimal() -> None:
 
     descriptor = broker.broker_descriptor
     assert descriptor.broker_id == "oanda-v20"
-    assert descriptor.implementation_version == "1"
+    assert descriptor.implementation_version == "2"
     assert descriptor.environment is BrokerEnvironment.DEMO
     assert descriptor.deterministic is False
     assert descriptor.capabilities == frozenset(
@@ -134,6 +134,29 @@ def test_connect_validates_complete_practice_account_before_marking_connected() 
         "/v3/accounts/practice-account",
         "/v3/accounts/practice-account/instruments",
     ]
+
+
+@pytest.mark.parametrize("symbol", ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"])
+def test_verified_practice_metadata_provides_explicit_usd_pip_valuation(
+    symbol: str,
+) -> None:
+    broker, transport = connected_broker()
+    valuation = broker.pip_valuation(
+        symbol, "USD", datetime(2026, 8, 27, 10, 0, tzinfo=UTC)
+    )
+    assert valuation.canonical_symbol == symbol
+    assert valuation.account_currency == "USD"
+    assert valuation.quote_currency_pip_amount_per_lot == pytest.approx(
+        100_000 * 0.0001
+    )
+    assert valuation.pip_value_per_lot == pytest.approx(100_000 * 0.0001)
+    assert valuation.route_identity == "quote-equals-account"
+    assert len(transport.calls) == 2
+
+    with pytest.raises(RuntimeError, match="not_connected"):
+        OandaDemoBroker("practice-account", "private-token").pip_valuation(
+            symbol, "USD", datetime(2026, 8, 27, 10, 0, tzinfo=UTC)
+        )
 
 
 @pytest.mark.parametrize(
@@ -264,6 +287,7 @@ def test_account_and_open_trades_map_to_canonical_account_and_positions() -> Non
     assert account.equity == 10037.5
     assert account.margin_used == 250.0
     assert account.margin_available == 9787.5
+    assert account.currency == "USD"
     assert len(account.open_positions) == 1
     position = account.open_positions[0]
     assert position.position_id == "trade-77"

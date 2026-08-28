@@ -17,6 +17,7 @@ from typing import Protocol, runtime_checkable
 import pandas as pd
 
 _SAFE_BROKER_EVIDENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_CURRENCY_CODE = re.compile(r"^[A-Z]{3}$")
 
 
 class BrokerOrderRejected(RuntimeError):
@@ -86,6 +87,7 @@ class AccountInfo:
     equity: float
     margin_used: float
     margin_available: float
+    currency: str
     open_positions: list[Position] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -99,6 +101,8 @@ class AccountInfo:
                 finite = False
             if not finite:
                 raise ValueError(f"Account {name} must be a finite number")
+        if not isinstance(self.currency, str) or not _CURRENCY_CODE.fullmatch(self.currency):
+            raise ValueError("Account currency must be an uppercase three-letter code")
 
 
 @dataclass

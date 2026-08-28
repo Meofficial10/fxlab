@@ -1092,10 +1092,15 @@ class PaperTradingSession:
                 self._record_reconciliation_failure(client_id, current_time)
                 results.append(_reconciliation_failure(result))
                 continue
-            if any(
-                position.position_id == correlation.position_id
-                for position in account.open_positions
-            ):
+            reflected = next(
+                (
+                    position
+                    for position in account.open_positions
+                    if position.position_id == correlation.position_id
+                ),
+                None,
+            )
+            if reflected is not None:
                 event_correlation = EventCorrelation(
                     signal_id=client_id,
                     client_order_id=client_id,
@@ -1107,7 +1112,11 @@ class PaperTradingSession:
                     occurred_at=current_time,
                     component=AuditComponent.PAPER_BROKER,
                     correlation=event_correlation,
-                    payload={"status": record.status},
+                    payload={
+                        "status": record.status,
+                        "currency": account.currency,
+                        "actual_entry_price": reflected.entry_price,
+                    },
                 )
                 self._position_correlations[correlation.position_id] = event_correlation
                 self.order_manager.confirm_position_reflected(
@@ -1144,6 +1153,8 @@ class PaperTradingSession:
                     "gross_pnl": event.gross_pnl,
                     "commission": event.commission,
                     "net_realized_pnl": event.net_realized_pnl,
+                    "currency": event.account_currency,
+                    "valuation_id": event.valuation_id,
                     "close_reason": event.reason,
                     "close_timestamp": event.close_time,
                 },
@@ -1155,6 +1166,7 @@ class PaperTradingSession:
         return events
 
     def _record_account(self, account: AccountInfo, current_time: datetime) -> None:
+        economic = self.broker.economic_monitoring_snapshot()
         self._append(
             AuditEventType.ACCOUNT_OBSERVED,
             occurred_at=current_time,
@@ -1164,10 +1176,22 @@ class PaperTradingSession:
                 "equity": account.equity,
                 "margin_used": account.margin_used,
                 "margin_available": account.margin_available,
+                "currency": account.currency,
+                "margin_model_identity": economic["margin_model_identity"],
+                "margin_quality": economic["margin_quality"],
                 "open_position_count": len(account.open_positions),
             },
         )
         for position in account.open_positions:
+            position_tick = self.broker.get_latest_tick(position.symbol)
+            valuation_time = (
+                position_tick.timestamp if position_tick is not None else current_time
+            )
+            valuation = self.broker.pip_valuation(
+                position.symbol,
+                account.currency,
+                valuation_time,
+            )
             correlation = self._position_correlations.get(
                 position.position_id,
                 EventCorrelation(position_id=position.position_id),
@@ -1183,6 +1207,8 @@ class PaperTradingSession:
                     "size": position.size,
                     "entry_price": position.entry_price,
                     "unrealized_pnl": position.unrealized_pnl,
+                    "currency": account.currency,
+                    "valuation_id": valuation.valuation_id,
                 },
             )
 

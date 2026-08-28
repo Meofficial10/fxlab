@@ -9,10 +9,39 @@ import pandas as pd
 import pytest
 
 from fxlab.config import CostConfig, CostDefaults
-from fxlab.execution.broker import BrokerAdapter, OrderRequest, OrderStatus, Tick
+from fxlab.execution.broker import (
+    BrokerAdapter,
+    BrokerOrderRejected,
+    OrderRequest,
+    OrderStatus,
+    Tick,
+)
+from fxlab.execution.margin import FixedLeveragePaperMargin, UnmodeledPaperMargin
 from fxlab.execution.paper_broker import CloseReason, PaperBroker
+from fxlab.execution.valuation import FxInstrumentCatalog, InstrumentSpec, ValuationFailure
 
 NOW = datetime(2026, 8, 25, 10, 5, tzinfo=UTC)
+CATALOG = FxInstrumentCatalog(
+    (
+        InstrumentSpec("EURUSD", "fx", "EUR", "USD", 0.0001, 100_000, "1"),
+        InstrumentSpec("GBPUSD", "fx", "GBP", "USD", 0.0001, 100_000, "1"),
+        InstrumentSpec("USDJPY", "fx", "USD", "JPY", 0.01, 100_000, "1"),
+        InstrumentSpec("EURJPY", "fx", "EUR", "JPY", 0.01, 100_000, "1"),
+    )
+)
+
+
+def paper_broker(**changes: object) -> PaperBroker:
+    values = {
+        "account_currency": "USD",
+        "instrument_catalog": CATALOG,
+        "valuation_max_age": timedelta(minutes=5),
+        "valuation_policy_version": "fx-point-in-time-v1",
+        "margin_model": UnmodeledPaperMargin("USD"),
+        "commission_currency": "USD",
+    }
+    values.update(changes)
+    return PaperBroker(**values)  # type: ignore[arg-type]
 
 
 def tick(
@@ -47,7 +76,7 @@ def order(
 
 
 def connected_broker() -> PaperBroker:
-    broker = PaperBroker()
+    broker = paper_broker()
     broker.connect()
     broker.subscribe_market_data(["EURUSD"])
     return broker
@@ -72,7 +101,7 @@ def cost_config(
 def accounting_broker(
     *, initial_balance: float = 10_000.0, costs: CostConfig | None = None
 ) -> PaperBroker:
-    broker = PaperBroker(
+    broker = paper_broker(
         initial_balance=initial_balance,
         cost_config=costs or cost_config(),
     )
@@ -96,7 +125,7 @@ def bars() -> pd.DataFrame:
 
 
 def test_connection_lifecycle_and_protocol() -> None:
-    broker = PaperBroker()
+    broker = paper_broker()
     assert isinstance(broker, BrokerAdapter)
     assert not broker.is_connected()
     broker.connect()
@@ -116,7 +145,7 @@ def test_descriptor_stable_after_order_and_position_close() -> None:
 
 
 def test_accept_tick_requires_connection_and_subscription() -> None:
-    broker = PaperBroker()
+    broker = paper_broker()
     with pytest.raises(RuntimeError):
         broker.accept_tick(tick())
     broker.connect()
@@ -179,7 +208,7 @@ def test_account_snapshot_is_not_mutable_broker_state() -> None:
 
 
 def test_historical_bars_never_expose_future_rows() -> None:
-    broker = PaperBroker(historical_bars={("EURUSD", "M5"): bars()})
+    broker = paper_broker(historical_bars={("EURUSD", "M5"): bars()})
     broker.connect()
     broker.subscribe_market_data(["EURUSD"])
     assert broker.get_historical_bars("EURUSD", "M5", 10).empty
@@ -189,7 +218,7 @@ def test_historical_bars_never_expose_future_rows() -> None:
 
 
 def test_broker_has_no_persistence_or_network_surface() -> None:
-    broker = PaperBroker()
+    broker = paper_broker()
     assert not hasattr(broker, "save")
     assert not hasattr(broker, "load")
     assert not hasattr(broker, "request")
@@ -299,7 +328,25 @@ def test_cost_model_does_not_double_count_real_spread() -> None:
     broker = accounting_broker(costs=cost_config(spread=100.0))
     broker.accept_tick(tick(bid=1.0998, ask=1.1))
     broker.submit_order(order(sl_price=None))
-    assert broker.get_account_info().open_positions[0].entry_price == 1.1
+    position = broker.get_account_info().open_positions[0]
+    assert position.entry_price == 1.1
+
+    broker.accept_tick(
+        tick(
+            when=NOW + timedelta(minutes=5),
+            bid=1.1008,
+            ask=1.1010,
+        )
+    )
+    broker.close_position(position.position_id)
+    event = broker.drain_close_events()[0]
+
+    expected = (1.1008 - 1.1) * 100_000 * 0.25
+    assert event.exit_price == 1.1008
+    assert event.gross_pnl == pytest.approx(expected)
+    assert event.commission == 0.0
+    assert event.net_realized_pnl == pytest.approx(expected)
+    assert broker.get_account_info().balance == pytest.approx(10_000.0 + expected)
 
 
 def test_zero_spread_uses_fallback_and_base_slippage_without_stress() -> None:
@@ -361,7 +408,7 @@ def test_historical_high_low_do_not_trigger_close_without_quote_crossing() -> No
     frame = bars()
     frame.iloc[1, frame.columns.get_loc("high")] = 1.5
     frame.iloc[1, frame.columns.get_loc("low")] = 0.5
-    broker = PaperBroker(
+    broker = paper_broker(
         historical_bars={("EURUSD", "M5"): frame},
         cost_config=cost_config(),
     )
@@ -382,3 +429,104 @@ def test_non_finite_tick_rejected_without_account_mutation(bad: float) -> None:
         broker.accept_tick(tick(bid=bad, ask=bad, mid=bad))
     after = broker.get_account_info()
     assert after == before
+
+
+def test_phase18_configuration_is_explicit_and_account_currency_is_reported() -> None:
+    with pytest.raises(TypeError):
+        PaperBroker()
+    broker = paper_broker()
+    assert broker.get_account_info().currency == "USD"
+    configuration = broker.configuration_snapshot(["EURUSD"])
+    assert configuration["account_currency"] == "USD"
+    assert configuration["instrument_catalog_fingerprint"] == CATALOG.fingerprint
+    assert configuration["valuation_policy_version"] == "fx-point-in-time-v1"
+    assert configuration["margin_model_identity"] == UnmodeledPaperMargin(
+        "USD"
+    ).descriptor.fingerprint
+    assert configuration["fill_timing_policy"] == "immediate-v1"
+    assert configuration["partial_fill_policy"] == "none-v1"
+
+
+@pytest.mark.parametrize(
+    ("next_bid", "next_ask", "expected_gross"),
+    [
+        (150.1, 150.2, 10_000 / 150.2),
+        (149.8, 149.9, -20_000 / 149.8),
+    ],
+)
+def test_usdjpy_pnl_uses_signed_point_in_time_conversion(
+    next_bid: float, next_ask: float, expected_gross: float
+) -> None:
+    broker = paper_broker(cost_config=cost_config())
+    broker.connect()
+    broker.subscribe_market_data(["USDJPY"])
+    broker.accept_tick(tick("USDJPY", bid=149.98, ask=150.0))
+    broker.submit_order(
+        order(symbol="USDJPY", size=1.0, sl_price=None)
+    )
+    broker.accept_tick(
+        tick(
+            "USDJPY",
+            when=NOW + timedelta(minutes=1),
+            bid=next_bid,
+            ask=next_ask,
+        )
+    )
+    position = broker.get_account_info().open_positions[0]
+    assert position.unrealized_pnl == pytest.approx(expected_gross)
+
+
+def test_stale_conversion_fails_without_mutating_tick_position_or_account() -> None:
+    broker = paper_broker(cost_config=cost_config())
+    broker.connect()
+    broker.subscribe_market_data(["EURJPY", "USDJPY"])
+    broker.accept_tick(tick("USDJPY", bid=149.9, ask=150.0))
+    broker.accept_tick(tick("EURJPY", bid=164.9, ask=165.0))
+    broker.submit_order(order(symbol="EURJPY", size=0.1, sl_price=None))
+    before_account = broker.get_account_info()
+    before_tick = broker.get_latest_tick("EURJPY")
+
+    with pytest.raises(ValuationFailure, match="stale_conversion_quote"):
+        broker.accept_tick(
+            tick(
+                "EURJPY",
+                when=NOW + timedelta(minutes=6),
+                bid=165.1,
+                ask=165.2,
+            )
+        )
+
+    assert broker.get_account_info() == before_account
+    assert broker.get_latest_tick("EURJPY") == before_tick
+
+
+def test_fixed_margin_preflight_is_atomic_and_gross_additive() -> None:
+    margin = FixedLeveragePaperMargin("USD", {"EURUSD": 10.0})
+    broker = paper_broker(cost_config=cost_config(), margin_model=margin)
+    broker.connect()
+    broker.subscribe_market_data(["EURUSD"])
+    broker.accept_tick(tick(bid=1.1, ask=1.1))
+    broker.submit_order(order("first", size=0.5, sl_price=None))
+    first = broker.get_account_info()
+    assert first.margin_used == pytest.approx(5_500.0)
+    assert first.margin_available == pytest.approx(4_500.0)
+
+    with pytest.raises(BrokerOrderRejected, match="insufficient_margin"):
+        broker.submit_order(order("second", side=-1, size=0.5, sl_price=None))
+
+    after = broker.get_account_info()
+    assert len(after.open_positions) == 1
+    assert broker.get_correlation("second") is None
+    assert after.balance == first.balance
+    assert after.margin_used == first.margin_used
+
+    position_id = after.open_positions[0].position_id
+    broker.close_position(position_id)
+    closed = broker.get_account_info()
+    assert closed.margin_used == 0.0
+    assert closed.margin_available == closed.equity
+
+
+def test_commission_currency_must_match_account_currency() -> None:
+    with pytest.raises(ValueError, match="commission_currency"):
+        paper_broker(commission_currency="EUR")
