@@ -9,6 +9,7 @@ from math import inf, nan
 import pandas as pd
 import pytest
 
+import fxlab.execution.broker as broker_contracts
 from fxlab.execution import (
     ExecutionIntent,
     ExecutionResultKind,
@@ -16,6 +17,7 @@ from fxlab.execution import (
 )
 from fxlab.execution.broker import (
     AccountInfo,
+    BrokerOrderRejected,
     OrderRequest,
     OrderStatus,
     Tick,
@@ -25,7 +27,7 @@ from fxlab.execution.broker_capabilities import (
     BrokerDescriptor,
     BrokerEnvironment,
 )
-from fxlab.execution.event_ledger import AuditEventType, EventLedger
+from fxlab.execution.event_ledger import AuditComponent, AuditEventType, EventLedger
 from fxlab.execution.signal_engine import SignalEvent
 from fxlab.risk import (
     KillSwitchReason,
@@ -200,6 +202,18 @@ def manager(
     )  # type: ignore[arg-type]
 
 
+class DemoFakeBroker(FakeBroker):
+    @property
+    def broker_descriptor(self) -> BrokerDescriptor:
+        return BrokerDescriptor(
+            "demo-broker",
+            "1",
+            BrokerEnvironment.DEMO,
+            super().broker_descriptor.capabilities,
+            False,
+        )
+
+
 def intent(event: SignalEvent | None = None, **changes: object) -> ExecutionIntent:
     values = {"signal": event or signal(), "sl_price": 1.09, "tp_price": 1.12}
     values.update(changes)
@@ -222,6 +236,15 @@ def test_execution_intent_is_immutable_and_does_not_own_entry_price():
     assert not hasattr(execution_intent, "entry_price")
     with pytest.raises(AttributeError):
         execution_intent.sl_price = 1.08  # type: ignore[misc]
+
+
+def test_broker_order_rejected_contains_only_sanitized_primitive_evidence() -> None:
+    rejection_type = getattr(broker_contracts, "BrokerOrderRejected", None)
+    assert rejection_type is not None
+    rejection = rejection_type("insufficient_margin", rejection_transaction_id="tx-7")
+    assert rejection.reason == "insufficient_margin"
+    assert rejection.rejection_transaction_id == "tx-7"
+    assert str(rejection) == "insufficient_margin"
 
 
 def test_long_uses_ask_and_forwards_explicit_prices_and_account_unchanged():
@@ -374,7 +397,8 @@ def test_local_order_construction_failure_releases_without_broker_call(monkeypat
 
 
 def test_submission_exception_is_indeterminate_retains_reservation_and_latches_kill():
-    order_manager, broker, risk = manager()
+    ledger = EventLedger("submission-uncertainty")
+    order_manager, broker, risk = manager(ledger=ledger)
     broker.submit_error = RuntimeError("timeout")
     result = order_manager.submit(intent(), current_time=NOW)
     assert result.kind is ExecutionResultKind.INDETERMINATE
@@ -382,6 +406,61 @@ def test_submission_exception_is_indeterminate_retains_reservation_and_latches_k
     assert risk.released == []
     assert risk.kill_reasons == [KillSwitchReason.POSITION_RECONCILIATION_FAILED]
     assert order_manager.get_order("client-risk-id") is not None
+    assert len(broker.submitted) == 1
+    assert AuditEventType.ORDER_REJECTED not in {
+        event.event_type for event in ledger.events()
+    }
+
+
+def test_authoritative_broker_rejection_releases_without_reconciliation_kill() -> None:
+    ledger = EventLedger("authoritative-rejection")
+    order_manager, broker, risk = manager(ledger=ledger)
+    broker.submit_error = BrokerOrderRejected(
+        "insufficient_margin", rejection_transaction_id="reject-tx-7"
+    )
+
+    result = order_manager.submit(intent(), current_time=NOW)
+
+    assert result.kind is ExecutionResultKind.EXECUTION_REJECTED
+    assert result.reason == "broker_order_rejected"
+    assert result.record is not None
+    assert result.record.status is OrderStatus.REJECTED
+    assert result.record.reservation_released is True
+    assert risk.released == ["client-risk-id"]
+    assert risk.kill_reasons == []
+    assert [event.event_type for event in ledger.events()] == [
+        AuditEventType.RISK_APPROVED,
+        AuditEventType.ORDER_SUBMISSION_ATTEMPTED,
+        AuditEventType.ORDER_REJECTED,
+        AuditEventType.RESERVATION_RELEASED,
+    ]
+    rejected = ledger.events()[2]
+    assert rejected.component is AuditComponent.BROKER_ADAPTER
+    assert rejected.payload == {
+        "reason": "insufficient_margin",
+        "rejection_transaction_id": "reject-tx-7",
+    }
+
+
+def test_authoritative_rejection_preserves_real_risk_history_and_daily_usage() -> None:
+    broker = FakeBroker()
+    broker.submit_error = BrokerOrderRejected(
+        "insufficient_margin", rejection_transaction_id="reject-tx-8"
+    )
+    risk = RiskEngine(
+        limits=RiskLimits(max_open_positions=2, max_trades_per_day=2),
+        pip_size_resolver=Resolver(),
+    )
+    order_manager = OrderManager(broker=broker, risk_engine=risk)
+
+    result = order_manager.submit(intent(), current_time=NOW)
+
+    assert result.kind is ExecutionResultKind.EXECUTION_REJECTED
+    assert result.record is not None
+    assert risk.reserved_position_count == 0
+    assert risk.daily_trades == 1
+    assert risk.approved_order_ids == frozenset({result.record.client_order_id})
+    assert risk.kill_switch_active is False
 
 
 @pytest.mark.parametrize("broker_id", [None, "", "   ", 123])
@@ -508,6 +587,26 @@ def test_unchanged_status_is_not_audited_twice() -> None:
     order_manager.refresh_order_status(client_id, current_time=NOW)
     assert [event.event_type for event in ledger.events()] == [
         AuditEventType.ORDER_FILLED
+    ]
+
+
+def test_external_broker_lifecycle_uses_broker_adapter_audit_component() -> None:
+    ledger = EventLedger("external-component")
+    broker = DemoFakeBroker()
+    risk = RiskSpy(decision())
+    order_manager = OrderManager(broker, risk, ledger)  # type: ignore[arg-type]
+    submitted = order_manager.submit(intent(), current_time=NOW)
+    assert submitted.kind is ExecutionResultKind.SUBMITTED
+    broker.status_result = {"status": "filled"}
+    order_manager.refresh_order_status("client-risk-id", current_time=NOW)
+    lifecycle = [
+        event
+        for event in ledger.events()
+        if event.event_type in {AuditEventType.ORDER_SUBMITTED, AuditEventType.ORDER_FILLED}
+    ]
+    assert [event.component for event in lifecycle] == [
+        AuditComponent.BROKER_ADAPTER,
+        AuditComponent.BROKER_ADAPTER,
     ]
 
 

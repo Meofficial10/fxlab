@@ -10,9 +10,10 @@ from enum import StrEnum
 from threading import Lock
 
 from ..risk.engine import KillSwitchReason, RiskDecision, RiskEngine, RiskRejection
-from .broker import BrokerAdapter, OrderRequest, OrderStatus, Tick
+from .broker import BrokerAdapter, BrokerOrderRejected, OrderRequest, OrderStatus, Tick
 from .broker_capabilities import (
     CURRENT_ORDER_MANAGER_REQUIREMENTS,
+    BrokerEnvironment,
     inspect_broker_capabilities,
 )
 from .event_ledger import (
@@ -309,6 +310,40 @@ class OrderManager:
 
         try:
             broker_order_id = self.broker.submit_order(request)
+        except BrokerOrderRejected as exc:
+            rejected = replace(provisional, status=OrderStatus.REJECTED)
+            with self._lock:
+                self._records[risk_result.order_id] = rejected
+            if not self._audit(
+                AuditEventType.ORDER_REJECTED,
+                occurred_at=current_utc,
+                component=AuditComponent.BROKER_ADAPTER,
+                correlation=correlation,
+                payload={
+                    "reason": exc.reason,
+                    "rejection_transaction_id": exc.rejection_transaction_id,
+                },
+            ):
+                return ExecutionResult(
+                    kind=ExecutionResultKind.EXECUTION_REJECTED,
+                    reason="audit_failure_after_rejection",
+                    message="authoritative rejection could not be audited",
+                    record=rejected,
+                    risk_decision=risk_result,
+                )
+            released = self.risk_engine.release_approval(risk_result.order_id)
+            if released:
+                rejected = replace(rejected, reservation_released=True)
+                with self._lock:
+                    self._records[risk_result.order_id] = rejected
+                self._audit_release(risk_result.order_id, current_utc, correlation)
+            return ExecutionResult(
+                kind=ExecutionResultKind.EXECUTION_REJECTED,
+                reason="broker_order_rejected",
+                message="broker authoritatively rejected the order",
+                record=rejected,
+                risk_decision=risk_result,
+            )
         except Exception:
             self._submission_indeterminate(
                 current_utc, correlation, "broker_submission_exception"
@@ -342,7 +377,7 @@ class OrderManager:
         if not self._audit(
             AuditEventType.ORDER_SUBMITTED,
             occurred_at=current_utc,
-            component=AuditComponent.PAPER_BROKER,
+            component=self._broker_audit_component(),
             correlation=submitted_correlation,
             payload={"status": submitted.status},
         ):
@@ -441,7 +476,7 @@ class OrderManager:
             audit_ok = self._audit(
                 event_type,
                 occurred_at=occurred_at,
-                component=AuditComponent.PAPER_BROKER,
+                component=self._broker_audit_component(),
                 correlation=correlation,
                 payload={"previous_status": current.status, "status": status},
             )
@@ -475,6 +510,16 @@ class OrderManager:
             message="broker order status was updated",
             record=updated,
         )
+
+    def _broker_audit_component(self) -> AuditComponent:
+        """Keep PaperBroker identity while labeling external adapters generically."""
+        try:
+            descriptor = self.broker.broker_descriptor  # type: ignore[attr-defined]
+            if descriptor.environment is BrokerEnvironment.PAPER:
+                return AuditComponent.PAPER_BROKER
+        except Exception:
+            pass
+        return AuditComponent.BROKER_ADAPTER
 
     def confirm_position_reflected(
         self, client_order_id: str, *, current_time: datetime | None = None

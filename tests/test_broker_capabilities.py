@@ -17,6 +17,7 @@ from fxlab.execution.broker_capabilities import (
     required_capabilities_for_order,
 )
 from fxlab.execution.event_ledger import AuditEventType, EventLedger
+from fxlab.execution.oanda_demo_broker import OandaDemoBroker
 from fxlab.execution.order_manager import ExecutionIntent, ExecutionResultKind, OrderManager
 from fxlab.execution.paper_broker import PaperBroker
 from fxlab.execution.signal_engine import SignalEvent
@@ -126,6 +127,15 @@ def test_paper_broker_declares_exact_stable_capabilities() -> None:
     assert broker.broker_descriptor is initial
 
 
+def test_oanda_demo_broker_declares_exact_external_capabilities() -> None:
+    descriptor = OandaDemoBroker("practice-account", "private-token").broker_descriptor
+    assert descriptor.broker_id == "oanda-v20"
+    assert descriptor.implementation_version == "1"
+    assert descriptor.environment is BrokerEnvironment.DEMO
+    assert descriptor.capabilities == PAPER_CAPABILITIES
+    assert descriptor.deterministic is False
+
+
 class CapabilityBroker(FakeBroker):
     def __init__(self, broker_descriptor: object = None, *, raises: bool = False) -> None:
         super().__init__()
@@ -192,7 +202,9 @@ def test_order_manager_fails_before_quote_account_risk_or_submit(broker, reason)
     risk = RiskSpy(decision())
     ledger = EventLedger("capability-test")
     manager = OrderManager(broker, risk, ledger)  # type: ignore[arg-type]
-    result = manager.submit(_intent(), current_time=datetime(2026, 8, 25, 10, 5, tzinfo=UTC))
+    result = manager.submit(
+        _intent(), current_time=datetime(2026, 8, 25, 10, 5, tzinfo=UTC)
+    )
     assert result.kind is ExecutionResultKind.EXECUTION_REJECTED
     assert result.reason == reason
     assert broker.quote_calls == broker.account_calls == 0
@@ -204,9 +216,7 @@ def test_order_manager_fails_before_quote_account_risk_or_submit(broker, reason)
 def test_order_manager_rejects_missing_capability_provider_before_risk() -> None:
     risk = RiskSpy(decision())
     manager = OrderManager(object(), risk, EventLedger("missing-provider"))  # type: ignore[arg-type]
-    result = manager.submit(
-        _intent(), current_time=datetime(2026, 8, 25, 10, 5, tzinfo=UTC)
-    )
+    result = manager.submit(_intent(), current_time=datetime(2026, 8, 25, 10, 5, tzinfo=UTC))
     assert result.reason == "broker_capabilities_unavailable"
     assert not risk.calls and not risk.released
 

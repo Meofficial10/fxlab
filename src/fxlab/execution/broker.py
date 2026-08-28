@@ -8,12 +8,31 @@ future live broker implementations to be swapped seamlessly.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
 import pandas as pd
+
+_SAFE_BROKER_EVIDENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+class BrokerOrderRejected(RuntimeError):
+    """Authoritative, sanitized proof that a broker rejected an order."""
+
+    def __init__(self, reason: str, *, rejection_transaction_id: str | None = None) -> None:
+        if not isinstance(reason, str) or not _SAFE_BROKER_EVIDENCE.fullmatch(reason):
+            raise ValueError("broker rejection reason must be a safe identifier")
+        if rejection_transaction_id is not None and (
+            not isinstance(rejection_transaction_id, str)
+            or not _SAFE_BROKER_EVIDENCE.fullmatch(rejection_transaction_id)
+        ):
+            raise ValueError("rejection transaction ID must be a safe identifier")
+        self.reason = reason
+        self.rejection_transaction_id = rejection_transaction_id
+        super().__init__(reason)
 
 
 class OrderStatus(Enum):

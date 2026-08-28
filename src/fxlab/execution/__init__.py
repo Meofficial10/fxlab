@@ -18,6 +18,7 @@ if TYPE_CHECKING:
         recover_snapshot,
         run_foreground_replay,
     )
+    from .broker import BrokerOrderRejected
     from .broker_capabilities import (
         BrokerCapability,
         BrokerCapabilityProvider,
@@ -51,6 +52,13 @@ if TYPE_CHECKING:
         RuntimeMonitoringView,
         monitoring_to_dict,
         project_audit_events,
+    )
+    from .oanda_demo_broker import (
+        OANDA_PRACTICE_AUTHORITY,
+        OandaDemoBroker,
+        OandaHttpTransport,
+        OandaResponse,
+        OandaTransport,
     )
     from .order_manager import (
         ExecutionIntent,
@@ -106,6 +114,7 @@ __all__ = [
     "recover_snapshot",
     "run_foreground_replay",
     "AuditComponent",
+    "BrokerOrderRejected",
     "BrokerCapability",
     "BrokerCapabilityProvider",
     "BrokerCompatibility",
@@ -134,6 +143,11 @@ __all__ = [
     "ExecutionResultKind",
     "OrderManager",
     "OrderRecord",
+    "OANDA_PRACTICE_AUTHORITY",
+    "OandaDemoBroker",
+    "OandaHttpTransport",
+    "OandaResponse",
+    "OandaTransport",
     "AccountMonitoringView",
     "AuditEventMonitoringView",
     "BrokerMonitoringView",
@@ -172,10 +186,12 @@ def __getattr__(name: str) -> Any:
     if name in __all__:
         from . import (
             app,
+            broker,
             broker_capabilities,
             durable_event_store,
             event_ledger,
             monitoring,
+            oanda_demo_broker,
             order_manager,
             paper_broker,
             paper_session,
@@ -186,11 +202,13 @@ def __getattr__(name: str) -> Any:
 
         for module in (
             app,
+            broker,
             broker_capabilities,
             durable_event_store,
             event_ledger,
             monitoring,
             order_manager,
+            oanda_demo_broker,
             paper_broker,
             paper_session,
             reconciliation,
