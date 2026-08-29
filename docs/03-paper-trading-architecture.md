@@ -128,6 +128,12 @@ positions, orders, broker health, data freshness, reconciliation health, and lat
 
 None of Phases 8–20 is implemented by this roadmap update.
 
+> **Phase 20 audit result (2026-08-29):** The evidence-based audit is recorded in
+> `docs/05-live-readiness-audit.md`. Deterministic paper, local observation-service,
+> and constrained OANDA Practice adapter-library readiness are evaluated separately
+> from strategy-forward and live-money readiness. The calculated live-money verdict is
+> **NO-GO**; infrastructure results do not override the existing research P4 NO-GO.
+
 ### Edge / performance research track
 
 The execution roadmap and the research roadmap are separate workstreams. Current

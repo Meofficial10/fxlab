@@ -588,12 +588,14 @@ def test_shutdown_failure_result_is_failed_and_instance_lock_is_released(
         original_release(lock)
         released.set()
 
+    def fail_complete_stop(
+        session: PaperTradingSession, **kwargs: object
+    ) -> None:
+        del session, kwargs
+        raise RuntimeError("forced complete-stop failure")
+
     monkeypatch.setattr(InstanceLock, "release", tracked_release)
-    monkeypatch.setattr(
-        ObservationService,
-        "_shutdown",
-        lambda self, outcome: "session_shutdown_failed",
-    )
+    monkeypatch.setattr(PaperTradingSession, "complete_stop", fail_complete_stop)
     service = ObservationService(config, request, load_config(), StartupMode.FRESH)
 
     result = service.run()
@@ -602,3 +604,7 @@ def test_shutdown_failure_result_is_failed_and_instance_lock_is_released(
     assert result.service_state is ServiceState.FAILED
     assert result.reason == "session_shutdown_failed"
     assert released.is_set()
+    assert not any(
+        thread.name == "fxlab-control-cleanup-result" and thread.is_alive()
+        for thread in threading.enumerate()
+    )
