@@ -50,6 +50,7 @@ class AuditEventType(StrEnum):
     BROKER_CAPABILITIES_BOUND = "broker_capabilities_bound"
     BROKER_CAPABILITY_REJECTED = "broker_capability_rejected"
     RUNTIME_STATE_CHANGED = "runtime_state_changed"
+    OPERATOR_CONTROL_ACTION = "operator_control_action"
     RUNTIME_FAILURE = "runtime_failure"
 
 
@@ -64,6 +65,7 @@ class AuditComponent(StrEnum):
     RECONCILIATION_ENGINE = "reconciliation_engine"
     MARKET_DATA_PROVIDER = "market_data_provider"
     BROKER_ADAPTER = "broker_adapter"
+    CONTROL_SERVICE = "control_service"
 
 
 class AuditLedgerError(RuntimeError):

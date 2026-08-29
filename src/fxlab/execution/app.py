@@ -162,7 +162,11 @@ def _decline_only_policy(
 
 
 def assemble_observation_replay(
-    request: ReplayRequest, config: AppConfig, *, fresh: bool
+    request: ReplayRequest,
+    config: AppConfig,
+    *,
+    fresh: bool,
+    runtime_id: str = "foreground-1",
 ) -> PaperApplication:
     """Build the real paper component graph without enabling any trading policy."""
     if not isinstance(request, ReplayRequest) or not isinstance(config, AppConfig):
@@ -272,7 +276,7 @@ def assemble_observation_replay(
         risk,
         _decline_only_policy,
         ledger,
-        runtime_id="foreground-1",
+        runtime_id=runtime_id,
     )
     return PaperApplication(session, store)
 

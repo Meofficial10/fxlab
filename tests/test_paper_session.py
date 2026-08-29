@@ -284,6 +284,109 @@ def test_runtime_state_transition_audit_is_idempotent() -> None:
     ]
 
 
+def test_attributed_operator_control_audits_mutation_and_rejected_resume() -> None:
+    session, risk, _ = make_session(setup=NoSignalSetup())
+    session.start()
+    paused = session.apply_operator_control(
+        "pause",
+        actor_id="operator-one",
+        request_id="00000000-0000-4000-8000-000000000001",
+    )
+    assert paused.accepted and paused.changed
+    session.poll_once()
+    risk.trigger_kill_switch(KillSwitchReason.MANUAL)
+    rejected = session.apply_operator_control(
+        "resume",
+        actor_id="operator-one",
+        request_id="00000000-0000-4000-8000-000000000002",
+    )
+    assert not rejected.accepted
+
+    controls = [
+        event
+        for event in session.event_ledger.events()
+        if event.event_type is AuditEventType.OPERATOR_CONTROL_ACTION
+    ]
+    assert [event.payload["action"] for event in controls] == ["pause", "resume"]
+    assert controls[0].payload == {
+        "accepted": True,
+        "action": "pause",
+        "actor_id": "operator-one",
+        "changed": True,
+        "current_state": "paused",
+        "previous_state": "running",
+        "reason": "operator_paused",
+        "request_id": "00000000-0000-4000-8000-000000000001",
+    }
+    assert controls[1].payload["accepted"] is False
+    assert controls[1].payload["current_state"] == "kill_switched"
+
+
+def test_distinct_repeated_pause_is_idempotent_and_each_request_is_audited() -> None:
+    session, _, _ = make_session(setup=NoSignalSetup())
+    session.start()
+    session.apply_operator_control(
+        "pause",
+        actor_id="operator-one",
+        request_id="00000000-0000-4000-8000-000000000003",
+    )
+    repeated = session.apply_operator_control(
+        "pause",
+        actor_id="operator-one",
+        request_id="00000000-0000-4000-8000-000000000004",
+    )
+    assert repeated.accepted and not repeated.changed
+    controls = [
+        event
+        for event in session.event_ledger.events()
+        if event.event_type is AuditEventType.OPERATOR_CONTROL_ACTION
+    ]
+    assert len(controls) == 2
+    assert controls[1].payload["accepted"] is True
+    assert controls[1].payload["changed"] is False
+    assert controls[1].payload["request_id"].endswith("0004")
+
+
+def test_operator_control_rejects_arbitrary_dispatch_before_mutation() -> None:
+    session, _, _ = make_session(setup=NoSignalSetup())
+    session.start()
+    before = session.event_ledger.events()
+    with pytest.raises(ValueError, match="action"):
+        session.apply_operator_control(
+            "close_position",
+            actor_id="operator-one",
+            request_id="00000000-0000-4000-8000-000000000005",
+        )
+    assert session.event_ledger.events() == before
+
+
+def test_service_level_rejected_operator_control_is_attributed_once() -> None:
+    session, _, _ = make_session(setup=NoSignalSetup())
+    session.start()
+    session.audit_rejected_operator_control(
+        "resume",
+        actor_id="operator-one",
+        request_id="00000000-0000-4000-8000-000000000006",
+        reason="service_not_running",
+    )
+    controls = [
+        event
+        for event in session.event_ledger.events()
+        if event.event_type is AuditEventType.OPERATOR_CONTROL_ACTION
+    ]
+    assert len(controls) == 1
+    assert controls[0].payload == {
+        "accepted": False,
+        "action": "resume",
+        "actor_id": "operator-one",
+        "changed": False,
+        "current_state": "running",
+        "previous_state": "running",
+        "reason": "service_not_running",
+        "request_id": "00000000-0000-4000-8000-000000000006",
+    }
+
+
 def test_request_and_complete_stop_are_idempotent() -> None:
     session, _, broker = make_session(setup=NoSignalSetup())
     session.start()

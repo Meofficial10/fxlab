@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import fxlab.execution.app as app_module
 from fxlab.config import load_config
 from fxlab.data.store import save_bars
 from fxlab.execution.app import (
@@ -88,6 +89,8 @@ def test_observation_assembly_uses_configured_equity_and_never_signals(tmp_path)
     app = assemble_observation_replay(request, load_config(), fresh=True)
     try:
         assert app.execution_policy_id == OBSERVE_ONLY_POLICY_ID
+        assert app.session.execution_policy is app_module._decline_only_policy
+        assert app.session.execution_policy(object(), object()) is None  # type: ignore[arg-type]
         assert app.session.broker.get_account_info().balance == 10.0
         assert app.session.risk_engine.limits.starting_equity == 10.0
         assert app.session.risk_engine.pip_size_resolver.pip_size_for("EURUSD") == 0.0001
@@ -97,6 +100,17 @@ def test_observation_assembly_uses_configured_equity_and_never_signals(tmp_path)
         assert app.session.risk_engine.daily_trades == 0
         assert app.session.risk_engine.reserved_position_count == 0
         assert app.session.order_manager.snapshot_state()["records"] == []
+    finally:
+        app.close()
+
+
+def test_observation_assembly_accepts_explicit_safe_runtime_identity(tmp_path) -> None:
+    request = _request(tmp_path, session_id="service-runtime")
+    app = assemble_observation_replay(
+        request, load_config(), fresh=True, runtime_id="service-runtime-19"
+    )
+    try:
+        assert app.session.runtime_id == "service-runtime-19"
     finally:
         app.close()
 

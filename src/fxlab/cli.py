@@ -7,6 +7,7 @@ Everything runs offline with ``--synthetic``; real data uses the ``dukascopy`` s
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
@@ -41,6 +42,18 @@ from .execution.event_ledger import AuditEventType
 from .execution.recovery import RecoveryState
 from .experiment.log import hash_bars, log_experiment
 from .labeling.triple_barrier import apply_triple_barrier
+from .operations.control import (
+    ControlAction,
+    ControlRequest,
+    response_to_dict,
+    send_control_request,
+)
+from .operations.security import FileSecretResolver
+from .operations.service import (
+    ObservationService,
+    StartupMode,
+    load_operational_config,
+)
 from .setups.model_a_sweep_reversal import ModelASweepReversal
 from .setups.model_b_trend_pullback import ModelBTrendPullback
 from .setups.model_c_breakout_failure import ModelCBreakoutFailure
@@ -70,7 +83,12 @@ paper_app = typer.Typer(
     add_completion=False,
     help="Deterministic local paper-replay and durable-state inspection.",
 )
+service_app = typer.Typer(
+    add_completion=False,
+    help="Local authenticated observation-only service operations.",
+)
 app.add_typer(paper_app, name="paper")
+app.add_typer(service_app, name="service")
 console = Console()
 
 
@@ -804,6 +822,154 @@ def paper_monitor(
         raise typer.Exit(int(AppExitCode.RECONCILIATION_REQUIRED))
     if not result.available:
         raise typer.Exit(int(AppExitCode.RECOVERY_FAILURE))
+
+
+def _operational_config(path: Path):
+    try:
+        return load_operational_config(path)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--operations-config") from exc
+
+
+@service_app.command("run")
+def service_run(
+    operations_config: Annotated[Path, typer.Option("--operations-config")] = ...,
+    session_id: str = typer.Option(..., "--session-id"),
+    data_dir: Annotated[Path, typer.Option("--data-dir")] = ...,
+    symbol: str = typer.Option(..., "--symbol"),
+    timeframe: str = typer.Option(..., "--timeframe"),
+    start: str = typer.Option(..., "--start"),
+    end: str = typer.Option(..., "--end"),
+    as_of: str = typer.Option(..., "--as-of"),
+    observe_only: bool = typer.Option(False, "--observe-only"),
+    fresh: bool = typer.Option(False, "--fresh"),
+    recover_mode: bool = typer.Option(False, "--recover"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Run one foreground, local-control, observation-only PaperBroker service."""
+    if not observe_only:
+        console.print("[red]Service run requires explicit observation-only mode.[/red]")
+        raise typer.Exit(int(AppExitCode.USAGE))
+    if fresh == recover_mode:
+        console.print("[red]Select exactly one of --fresh or --recover.[/red]")
+        raise typer.Exit(int(AppExitCode.USAGE))
+    operational = _operational_config(operations_config)
+    request = _paper_request(
+        session_id=session_id,
+        store=operational.store_path,
+        data_dir=data_dir,
+        symbol=symbol,
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        as_of=as_of,
+        observe_only=True,
+    )
+    service = ObservationService(
+        operational,
+        request,
+        load_config(),
+        StartupMode.FRESH if fresh else StartupMode.RECOVER,
+    )
+    result = service.run()
+    payload = {
+        "mode": "observation-only",
+        "session_id": result.session_id,
+        "service_state": result.service_state.value,
+        "reason": result.reason,
+        "cycles": result.cycles,
+    }
+    _json_or_human(payload, json_output=json_output)
+    if result.exit_code:
+        raise typer.Exit(result.exit_code)
+
+
+def _service_control(
+    action: ControlAction,
+    *,
+    operations_config: Path,
+    json_output: bool,
+) -> None:
+    operational = _operational_config(operations_config)
+    try:
+        secret = FileSecretResolver().resolve(operational.control_secret_file)
+        response = send_control_request(
+            operational,
+            secret,
+            ControlRequest(1, str(uuid.uuid4()), action),
+        )
+    except (RuntimeError, ValueError):
+        console.print("[red]control service unavailable[/red]")
+        raise typer.Exit(int(AppExitCode.RUNTIME_FAILURE)) from None
+    payload = response_to_dict(response)
+    _json_or_human(payload, json_output=json_output)
+    if not response.accepted:
+        raise typer.Exit(int(AppExitCode.RUNTIME_FAILURE))
+
+
+@service_app.command("status")
+def service_status(
+    operations_config: Annotated[Path, typer.Option("--operations-config")] = ...,
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Read the authenticated live service snapshot."""
+    _service_control(
+        ControlAction.STATUS,
+        operations_config=operations_config,
+        json_output=json_output,
+    )
+
+
+@service_app.command("pause")
+def service_pause(
+    operations_config: Annotated[Path, typer.Option("--operations-config")] = ...,
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Pause new risk in the observation-only runtime."""
+    _service_control(
+        ControlAction.PAUSE,
+        operations_config=operations_config,
+        json_output=json_output,
+    )
+
+
+@service_app.command("resume")
+def service_resume(
+    operations_config: Annotated[Path, typer.Option("--operations-config")] = ...,
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Resume the observation-only runtime after its existing safety checks."""
+    _service_control(
+        ControlAction.RESUME,
+        operations_config=operations_config,
+        json_output=json_output,
+    )
+
+
+@service_app.command("emergency-stop")
+def service_emergency_stop(
+    operations_config: Annotated[Path, typer.Option("--operations-config")] = ...,
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Latch the existing manual kill switch without liquidation."""
+    _service_control(
+        ControlAction.EMERGENCY_STOP,
+        operations_config=operations_config,
+        json_output=json_output,
+    )
+
+
+@service_app.command("stop")
+def service_stop(
+    operations_config: Annotated[Path, typer.Option("--operations-config")] = ...,
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Request serialized graceful service shutdown."""
+    _service_control(
+        ControlAction.STOP,
+        operations_config=operations_config,
+        json_output=json_output,
+    )
 
 
 if __name__ == "__main__":

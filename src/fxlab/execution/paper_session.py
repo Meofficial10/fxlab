@@ -7,6 +7,7 @@ import json
 import math
 import re
 import struct
+import uuid
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -682,68 +683,77 @@ class PaperTradingSession:
 
     def pause(self) -> RuntimeControlResult:
         with self._cycle_lock:
-            return self._transition_paused(
-                RuntimeControlReason.OPERATOR_PAUSED,
-                self._last_market_time or self.event_ledger.now(),
-                operator_requested=True,
-            )
+            return self._pause_unlocked()
+
+    def _pause_unlocked(self) -> RuntimeControlResult:
+        return self._transition_paused(
+            RuntimeControlReason.OPERATOR_PAUSED,
+            self._last_market_time or self.event_ledger.now(),
+            operator_requested=True,
+        )
 
     def resume(self) -> RuntimeControlResult:
         with self._cycle_lock:
-            before = self.runtime_status()
-            if self._last_market_time is None or not self._resume_data_ready:
-                return RuntimeControlResult(
-                    False, False, before.state, before.state, before.reason
-                )
-            failure = None
-            if self._audit_failed or self.order_manager.audit_failed:
-                failure = RuntimeControlReason.AUDIT_INTEGRITY_FAILED
-            elif self._capability_failed:
-                failure = RuntimeControlReason.BROKER_INCOMPATIBLE
-            if (
-                before.state is not RuntimeState.PAUSED
-                or self._recovery_required
-                or failure is not None
-                or self.risk_engine.kill_switch_active
-                or self._has_unresolved_execution()
-            ):
-                return RuntimeControlResult(
-                    before.state is RuntimeState.RUNNING,
-                    False,
-                    before.state,
-                    before.state,
-                    before.reason,
-                )
-            if not self._verify_broker_descriptor():
-                self._transition_failed(RuntimeControlReason.BROKER_INCOMPATIBLE)
-                after = self.runtime_status()
-                return RuntimeControlResult(
-                    False, True, before.state, after.state, after.reason
-                )
-            self._append_runtime_transition(
-                RuntimeState.PAUSED,
-                RuntimeState.RUNNING,
-                RuntimeControlReason.OPERATOR_PAUSED,
-                operator_requested=True,
-                occurred_at=self.event_ledger.now(),
+            return self._resume_unlocked()
+
+    def _resume_unlocked(self) -> RuntimeControlResult:
+        before = self.runtime_status()
+        if self._last_market_time is None or not self._resume_data_ready:
+            return RuntimeControlResult(
+                False, False, before.state, before.state, before.reason
             )
-            return self._runtime_controller.resume(self._last_market_time)
+        failure = None
+        if self._audit_failed or self.order_manager.audit_failed:
+            failure = RuntimeControlReason.AUDIT_INTEGRITY_FAILED
+        elif self._capability_failed:
+            failure = RuntimeControlReason.BROKER_INCOMPATIBLE
+        if (
+            before.state is not RuntimeState.PAUSED
+            or self._recovery_required
+            or failure is not None
+            or self.risk_engine.kill_switch_active
+            or self._has_unresolved_execution()
+        ):
+            return RuntimeControlResult(
+                before.state is RuntimeState.RUNNING,
+                False,
+                before.state,
+                before.state,
+                before.reason,
+            )
+        if not self._verify_broker_descriptor():
+            self._transition_failed(RuntimeControlReason.BROKER_INCOMPATIBLE)
+            after = self.runtime_status()
+            return RuntimeControlResult(
+                False, True, before.state, after.state, after.reason
+            )
+        self._append_runtime_transition(
+            RuntimeState.PAUSED,
+            RuntimeState.RUNNING,
+            RuntimeControlReason.OPERATOR_PAUSED,
+            operator_requested=True,
+            occurred_at=self.event_ledger.now(),
+        )
+        return self._runtime_controller.resume(self._last_market_time)
 
     def emergency_stop(self) -> RuntimeControlResult:
         with self._cycle_lock:
-            before = self.runtime_status()
-            was_active = self.risk_engine.kill_switch_active
-            self.risk_engine.trigger_kill_switch(KillSwitchReason.MANUAL)
-            after = self.runtime_status()
-            if not was_active:
-                self._record_kill_transition(False, self.event_ledger.now())
-            return RuntimeControlResult(
-                True,
-                before.state is not after.state,
-                before.state,
-                after.state,
-                after.reason,
-            )
+            return self._emergency_stop_unlocked()
+
+    def _emergency_stop_unlocked(self) -> RuntimeControlResult:
+        before = self.runtime_status()
+        was_active = self.risk_engine.kill_switch_active
+        self.risk_engine.trigger_kill_switch(KillSwitchReason.MANUAL)
+        after = self.runtime_status()
+        if not was_active:
+            self._record_kill_transition(False, self.event_ledger.now())
+        return RuntimeControlResult(
+            True,
+            before.state is not after.state,
+            before.state,
+            after.state,
+            after.reason,
+        )
 
     def handle_provider_failure(
         self, failure: ProviderFailure, *, occurred_at: datetime | None = None
@@ -794,10 +804,110 @@ class PaperTradingSession:
 
     def request_stop(self) -> RuntimeControlResult:
         with self._cycle_lock:
-            result = self._runtime_controller.request_stop()
-            if result.changed:
-                self._audit_controller_result(result, operator_requested=True)
+            return self._request_stop_unlocked()
+
+    def _request_stop_unlocked(self) -> RuntimeControlResult:
+        result = self._runtime_controller.request_stop()
+        if result.changed:
+            self._audit_controller_result(result, operator_requested=True)
+        return result
+
+    def apply_operator_control(
+        self,
+        action: str,
+        *,
+        actor_id: str,
+        request_id: str,
+    ) -> RuntimeControlResult:
+        """Apply one allow-listed authenticated mutation at a cycle boundary."""
+        if action not in {"pause", "resume", "emergency_stop", "stop"}:
+            raise ValueError("unsupported operator control action")
+        if not isinstance(actor_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", actor_id
+        ):
+            raise ValueError("actor_id must be a safe identifier")
+        try:
+            parsed_request_id = uuid.UUID(request_id)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("request_id must be a canonical UUID4") from exc
+        if parsed_request_id.version != 4 or str(parsed_request_id) != request_id:
+            raise ValueError("request_id must be a canonical UUID4")
+        with self._cycle_lock:
+            result = {
+                "pause": self._pause_unlocked,
+                "resume": self._resume_unlocked,
+                "emergency_stop": self._emergency_stop_unlocked,
+                "stop": self._request_stop_unlocked,
+            }[action]()
+            try:
+                self._append(
+                    AuditEventType.OPERATOR_CONTROL_ACTION,
+                    occurred_at=self.event_ledger.now(),
+                    component=AuditComponent.CONTROL_SERVICE,
+                    payload={
+                        "actor_id": actor_id,
+                        "request_id": request_id,
+                        "action": action,
+                        "accepted": result.accepted,
+                        "changed": result.changed,
+                        "previous_state": result.previous_state.value,
+                        "current_state": result.current_state.value,
+                        "reason": result.reason.value if result.reason else None,
+                    },
+                )
+            except AuditLedgerError:
+                self._audit_failed = True
+                self._runtime_controller.fail(RuntimeControlReason.AUDIT_INTEGRITY_FAILED)
+                raise
             return result
+
+    def audit_rejected_operator_control(
+        self,
+        action: str,
+        *,
+        actor_id: str,
+        request_id: str,
+        reason: str,
+    ) -> None:
+        """Attribute a valid authenticated mutation rejected above runtime control."""
+        if action not in {"pause", "resume", "emergency_stop", "stop"}:
+            raise ValueError("unsupported operator control action")
+        if not isinstance(actor_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", actor_id
+        ):
+            raise ValueError("actor_id must be a safe identifier")
+        try:
+            parsed_request_id = uuid.UUID(request_id)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("request_id must be a canonical UUID4") from exc
+        if parsed_request_id.version != 4 or str(parsed_request_id) != request_id:
+            raise ValueError("request_id must be a canonical UUID4")
+        if not isinstance(reason, str) or not re.fullmatch(
+            r"[a-z][a-z0-9_]{0,127}", reason
+        ):
+            raise ValueError("reason must be a stable identifier")
+        with self._cycle_lock:
+            state = self.runtime_status().state
+            try:
+                self._append(
+                    AuditEventType.OPERATOR_CONTROL_ACTION,
+                    occurred_at=self.event_ledger.now(),
+                    component=AuditComponent.CONTROL_SERVICE,
+                    payload={
+                        "actor_id": actor_id,
+                        "request_id": request_id,
+                        "action": action,
+                        "accepted": False,
+                        "changed": False,
+                        "previous_state": state.value,
+                        "current_state": state.value,
+                        "reason": reason,
+                    },
+                )
+            except AuditLedgerError:
+                self._audit_failed = True
+                self._runtime_controller.fail(RuntimeControlReason.AUDIT_INTEGRITY_FAILED)
+                raise
 
     def complete_stop(
         self,
@@ -888,6 +998,55 @@ class PaperTradingSession:
 
         with self._cycle_lock:
             return project_live_session(self)
+
+    def create_safe_checkpoint(
+        self,
+        store: SQLiteEventStore,
+        *,
+        software_version: str,
+        execution_policy_id: str,
+    ) -> object:
+        """Create a checkpoint at the same serialized boundary as runtime controls."""
+        from .recovery import create_checkpoint
+
+        with self._cycle_lock:
+            return create_checkpoint(
+                self,
+                store,
+                software_version=software_version,
+                execution_policy_id=execution_policy_id,
+            )
+
+    def activate_recovered_maintenance(self) -> None:
+        """Reconnect a recovered blocked PaperBroker without enabling execution."""
+        with self._cycle_lock:
+            if self._started:
+                return
+            status = self.runtime_status()
+            if self._stopped or status.state in {
+                RuntimeState.RUNNING,
+                RuntimeState.RECONCILIATION_REQUIRED,
+                RuntimeState.FAILED,
+                RuntimeState.STOPPING,
+                RuntimeState.STOPPED,
+            }:
+                raise RuntimeError("recovered runtime is not maintenance-attachable")
+            if self._broker_descriptor_fingerprint is None or not self._verify_broker_descriptor():
+                raise RuntimeError("recovered broker capabilities are incompatible")
+            self.broker.connect()
+            try:
+                self.market_data.start()
+                self._append(
+                    AuditEventType.SESSION_STARTED,
+                    occurred_at=self.event_ledger.now(),
+                    component=AuditComponent.PAPER_SESSION,
+                    payload={"runtime_id": self.runtime_id, "recovered": True},
+                )
+            except Exception:
+                self.broker.disconnect()
+                raise
+            self._resume_data_ready = False
+            self._started = True
 
     @property
     def recovery_required(self) -> bool:

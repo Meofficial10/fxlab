@@ -164,6 +164,11 @@ def test_runtime_state_audit_contract_is_stable() -> None:
     assert AuditEventType.RUNTIME_STATE_CHANGED.value == "runtime_state_changed"
 
 
+def test_operator_control_audit_contract_is_stable() -> None:
+    assert AuditEventType.OPERATOR_CONTROL_ACTION.value == "operator_control_action"
+    assert AuditComponent.CONTROL_SERVICE.value == "control_service"
+
+
 def test_correlation_validation() -> None:
     with pytest.raises(ValueError, match="non-empty"):
         EventCorrelation(position_id=" ")

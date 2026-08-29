@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -16,6 +18,8 @@ from fxlab.config import load_config
 from fxlab.data import ProviderFailure, ProviderFailureCategory, ProviderGatewayError
 from fxlab.data.store import save_bars
 from fxlab.execution.app import ReplayRequest, run_foreground_replay
+from fxlab.execution.runtime_control import RuntimeState
+from fxlab.operations.control import ControlResponse, ServiceState
 
 runner = CliRunner()
 
@@ -63,6 +67,96 @@ def test_existing_commands_and_paper_commands_are_registered() -> None:
         assert command in paper.output
     for invalid in ("start", "pause", "resume", "stop", "emergency-stop", "reconcile"):
         assert f" {invalid} " not in paper.output
+
+
+def test_service_commands_are_registered_without_daemon_start() -> None:
+    root = runner.invoke(app, ["--help"])
+    service = runner.invoke(app, ["service", "--help"])
+    assert root.exit_code == 0
+    assert "service" in root.output
+    assert service.exit_code == 0
+    for command in ("run", "status", "pause", "resume", "emergency-stop", "stop"):
+        assert command in service.output
+    assert " start " not in service.output
+
+
+def _operations_file(tmp_path) -> Path:
+    state = (tmp_path / "service-state").resolve()
+    secret = (tmp_path / "service.secret").resolve()
+    secret.write_bytes(b"s" * 32)
+    path = (tmp_path / "operations.toml").resolve()
+    path.write_text(
+        "\n".join(
+            [
+                "format_version = 1",
+                f'state_directory = "{str(state).replace(chr(92), "/")}"',
+                'runtime_id = "cli-service"',
+                'operator_id = "cli-operator"',
+                f'control_secret_file = "{str(secret).replace(chr(92), "/")}"',
+                f'endpoint_id = "cli-{uuid.uuid4().hex}"',
+                'log_filename = "cli-service.jsonl"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_service_run_requires_observe_only_and_exact_startup_mode(tmp_path) -> None:
+    operations = _operations_file(tmp_path)
+    replay_args = _base(tmp_path)
+    store_index = replay_args.index("--store")
+    del replay_args[store_index : store_index + 2]
+    args = ["--operations-config", str(operations), *replay_args]
+    without_observe = runner.invoke(app, ["service", "run", *args, "--fresh"])
+    assert without_observe.exit_code == 2
+    assert "observation-only" in without_observe.output.lower()
+    no_mode = runner.invoke(app, ["service", "run", *args, "--observe-only"])
+    assert no_mode.exit_code == 2
+    both = runner.invoke(
+        app,
+        ["service", "run", *args, "--observe-only", "--fresh", "--recover"],
+    )
+    assert both.exit_code == 2
+
+
+@pytest.mark.parametrize(
+    ("command", "action"),
+    [
+        ("status", "status"),
+        ("pause", "pause"),
+        ("resume", "resume"),
+        ("emergency-stop", "emergency_stop"),
+        ("stop", "stop"),
+    ],
+)
+def test_service_client_commands_use_config_secret_and_explicit_json(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, command: str, action: str
+) -> None:
+    operations = _operations_file(tmp_path)
+    seen = []
+
+    def send(config, secret, request):
+        seen.append((config.operator_id, repr(secret), request.action.value))
+        return ControlResponse(
+            1,
+            request.request_id,
+            True,
+            False,
+            ServiceState.RUNNING,
+            RuntimeState.PAUSED,
+            "accepted",
+            (("source", "live_runtime"),),
+        )
+
+    monkeypatch.setattr(cli_module, "send_control_request", send)
+    result = runner.invoke(
+        app,
+        ["service", command, "--operations-config", str(operations), "--json"],
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["payload"]["source"] == "live_runtime"
+    assert seen == [("cli-operator", "ControlSecret(<REDACTED>)", action)]
 
 
 def test_dukascopy_ingest_failure_is_concise_and_sanitized(
