@@ -1,0 +1,1224 @@
+"""Candidate B policy-rate data qualification contracts (no market outcomes)."""
+
+from __future__ import annotations
+
+import calendar
+from dataclasses import FrozenInstanceError, asdict, fields, replace
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+
+import pytest
+from scripts.ingest_bis_policy_rates import (
+    BisTransportResponse,
+    ingest_series,
+)
+from scripts.ingest_bis_policy_rates import (
+    main as ingest_main,
+)
+from scripts.qualify_candidate_b_data import qualify_candidate_b
+
+from fxlab.data.policy_rates import (
+    APPROVED_BIS_SERIES,
+    APPROVED_PAIRS,
+    APPROVED_REQUEST_END,
+    APPROVED_REQUEST_START,
+    EXPECTED_TOTAL_COHORTS,
+    EXPECTED_TRAIN_COHORTS,
+    EXPECTED_VALIDATION_COHORTS,
+    MAX_OBSERVATION_DATE,
+    AmbiguityState,
+    CandidateBFormation,
+    CandidateBFormationManifest,
+    CandidateBQualificationResult,
+    ConcordanceStatus,
+    EvidenceClassification,
+    FormationSplit,
+    PolicyConcordanceResult,
+    PolicyEventKind,
+    PolicyEventManifest,
+    PolicyRateEvent,
+    PolicyRateMetadata,
+    PolicyRateObservation,
+    PolicyRateQualificationError,
+    PolicyRateRequest,
+    PolicyRateSeriesManifest,
+    PolicyRateSeriesSpec,
+    PolicySourceEvidence,
+    PolicyStateReference,
+    SpotObservationReference,
+    SpotPanelManifestReference,
+    TimePrecision,
+    build_series_manifest,
+    canonical_sha256,
+    event_is_eligible,
+    parse_bis_csv,
+    qualify_formation,
+    reconcile_policy_series,
+)
+
+SHA_A = "a" * 64
+SHA_B = "b" * 64
+RETRIEVED = datetime(2026, 8, 29, 10, tzinfo=UTC)
+
+
+def spec(currency: str = "AUD") -> PolicyRateSeriesSpec:
+    return PolicyRateSeriesSpec(currency, APPROVED_BIS_SERIES[currency])
+
+
+def request(currency: str = "AUD") -> PolicyRateRequest:
+    return PolicyRateRequest(spec(currency), APPROVED_REQUEST_START, APPROVED_REQUEST_END)
+
+
+def metadata(currency: str = "AUD", **changes: object) -> PolicyRateMetadata:
+    values: dict[str, object] = {
+        "agency": "BIS",
+        "dataflow": "WS_CBPOL",
+        "version": "1.0",
+        "frequency": "D",
+        "series_key": APPROVED_BIS_SERIES[currency],
+        "currency": currency,
+        "reference_area": APPROVED_BIS_SERIES[currency].split(".")[1],
+        "unit": "percent_per_annum",
+        "scale": 1,
+        "observation_status_semantics": ("A=normal",),
+        "dsd_identity": "bis_cbpol_dsd_v1",
+        "codelist_identity": "bis_cbpol_codelist_v1",
+        "instrument_metadata": "principal_policy_rate",
+        "source_identity": "bis_data_portal",
+        "endpoint_identity": "bis_sdmx_api_v2",
+        "media_type": "text/csv",
+        "revision": "revision_1",
+    }
+    values.update(changes)
+    return PolicyRateMetadata(**values)  # type: ignore[arg-type]
+
+
+def csv_bytes(*rows: tuple[str, str, str, str, str]) -> bytes:
+    content = ["FREQ,REF_AREA,TIME_PERIOD,OBS_VALUE,OBS_STATUS"]
+    content.extend(",".join(row) for row in rows)
+    return ("\n".join(content) + "\n").encode()
+
+
+def observations(currency: str = "AUD") -> tuple[PolicyRateObservation, ...]:
+    area = APPROVED_BIS_SERIES[currency].split(".")[1]
+    return parse_bis_csv(
+        csv_bytes(
+            ("D", area, "2014-01-01", "2.50", "A"),
+            ("D", area, "2014-01-02", "2.75", "A"),
+        ),
+        spec(currency),
+    )
+
+
+def source(currency: str = "AUD") -> PolicySourceEvidence:
+    domains = {
+        "AUD": "https://www.rba.gov.au/monetary-policy/decisions/2014/",
+        "CAD": "https://www.bankofcanada.ca/core-functions/monetary-policy/key-interest-rate/",
+        "CHF": "https://www.snb.ch/en/the-snb/mandates-goals/monetary-policy/decisions",
+        "EUR": "https://www.ecb.europa.eu/press/govcdec/mopo/html/index.en.html",
+        "GBP": "https://www.bankofengland.co.uk/boeapps/database/Bank-Rate.asp",
+        "JPY": "https://www.boj.or.jp/en/mopo/mpmdeci/index.htm",
+        "NZD": "https://www.rbnz.govt.nz/monetary-policy/official-cash-rate-decisions",
+        "USD": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+    }
+    return PolicySourceEvidence(
+        domains[currency], RETRIEVED, SHA_A, 100, "text/html", "official_decision"
+    )
+
+
+def event(
+    currency: str = "AUD",
+    *,
+    kind: PolicyEventKind = PolicyEventKind.RATE_CHANGE,
+    event_id: str = "aud_rate_2014_01_02",
+    announcement_lower: datetime | None = None,
+    announcement_upper: datetime | None = None,
+    effective_lower: datetime | None = None,
+    effective_upper: datetime | None = None,
+    old_rate: str | None = "2.50",
+    new_rate: str = "2.75",
+    ambiguity: AmbiguityState = AmbiguityState.CLEAR,
+) -> PolicyRateEvent:
+    announcement_lower = announcement_lower or datetime(2014, 1, 1, 4, tzinfo=UTC)
+    announcement_upper = announcement_upper or announcement_lower
+    effective_lower = effective_lower or datetime(2014, 1, 2, tzinfo=UTC)
+    effective_upper = effective_upper or effective_lower
+    return PolicyRateEvent(
+        event_id=event_id,
+        kind=kind,
+        currency=currency,
+        central_bank_id=f"{currency.lower()}_central_bank",
+        policy_instrument_id="principal_policy_rate",
+        announcement_lower=announcement_lower,
+        announcement_upper=announcement_upper,
+        announcement_precision=TimePrecision.EXACT_TIMESTAMP,
+        effective_lower=effective_lower,
+        effective_upper=effective_upper,
+        effective_precision=TimePrecision.EXACT_TIMESTAMP,
+        source_timezone="UTC",
+        old_rate=old_rate,
+        new_rate=new_rate,
+        source=source(currency),
+        evidence_classification=EvidenceClassification.OFFICIAL_ANNOUNCEMENT,
+        ambiguity=ambiguity,
+        conflict=AmbiguityState.CLEAR,
+    )
+
+
+def series_manifest(currency: str = "AUD", *, retrieved_at: datetime = RETRIEVED):
+    raw = csv_bytes(
+        ("D", APPROVED_BIS_SERIES[currency].split(".")[1], "2014-01-01", "2.50", "A"),
+        ("D", APPROVED_BIS_SERIES[currency].split(".")[1], "2014-01-02", "2.75", "A"),
+    )
+    return build_series_manifest(request(currency), metadata(currency), raw, retrieved_at)
+
+
+def spot_reference(
+    pair: str, formation_at: datetime, dataset_id: str = SHA_A
+) -> SpotObservationReference:
+    return SpotObservationReference(
+        pair=pair,
+        dataset_id=dataset_id,
+        bar_open=formation_at - timedelta(days=1),
+        bar_close=formation_at,
+        value_field="close",
+        closed=True,
+    )
+
+
+def policy_reference(
+    currency: str,
+    cutoff: datetime,
+    dataset_id: str = SHA_A,
+    *,
+    observation: PolicyRateObservation | None = None,
+    policy_event: PolicyRateEvent | None = None,
+) -> PolicyStateReference:
+    observation = observation or PolicyRateObservation(
+        APPROVED_BIS_SERIES[currency],
+        cutoff.date() - timedelta(days=1),
+        Decimal("2.50"),
+        "A",
+    )
+    event_id = policy_event.event_id if policy_event else f"{currency.lower()}_baseline"
+    instrument_id = policy_event.policy_instrument_id if policy_event else "principal_policy_rate"
+    announcement_upper = (
+        policy_event.announcement_upper if policy_event else cutoff - timedelta(days=2)
+    )
+    effective_upper = policy_event.effective_upper if policy_event else cutoff - timedelta(days=2)
+    return PolicyStateReference(
+        currency=currency,
+        series_key=APPROVED_BIS_SERIES[currency],
+        dataset_id=dataset_id,
+        observation_id=observation.identity,
+        event_id=event_id,
+        policy_instrument_id=instrument_id,
+        observation_date=observation.observation_date,
+        observation_value=observation.value,
+        observation_status=observation.status,
+        announcement_upper=announcement_upper,
+        effective_upper=effective_upper,
+        eligible=True,
+    )
+
+
+def complete_formation(
+    index: int,
+    split: FormationSplit,
+    *,
+    spot_dataset_ids: dict[str, str] | None = None,
+    policy_dataset_ids: dict[str, str] | None = None,
+    policy_observations: dict[str, PolicyRateObservation] | None = None,
+    policy_events: dict[str, PolicyRateEvent] | None = None,
+    source_manifest_fingerprints: tuple[str, ...] = (SHA_A,),
+) -> CandidateBFormation:
+    if split is FormationSplit.TRAIN:
+        base_year, base_month, offset = 2015, 1, index
+    else:
+        base_year, base_month, offset = 2022, 1, index - EXPECTED_TRAIN_COHORTS
+    month_index = base_year * 12 + base_month - 1 + offset
+    year, zero_based_month = divmod(month_index, 12)
+    month = zero_based_month + 1
+    formation_at = datetime(year, month, calendar.monthrange(year, month)[1], tzinfo=UTC)
+    next_month_index = month_index + 1
+    exit_year, exit_zero_based_month = divmod(next_month_index, 12)
+    exit_month = exit_zero_based_month + 1
+    exit_at = datetime(
+        exit_year,
+        exit_month,
+        calendar.monthrange(exit_year, exit_month)[1],
+        tzinfo=UTC,
+    )
+    cutoff = datetime.combine(formation_at.date(), datetime.min.time(), tzinfo=UTC)
+    return qualify_formation(
+        cohort_id=f"cohort_{index:03d}",
+        formation_month=f"{formation_at.year:04d}-{formation_at.month:02d}",
+        formation_at=formation_at,
+        cutoff_at=cutoff,
+        exit_at=exit_at,
+        split=split,
+        purged=False,
+        spot_observations=tuple(
+            spot_reference(pair, formation_at, (spot_dataset_ids or {}).get(pair, SHA_A))
+            for pair in APPROVED_PAIRS
+        ),
+        policy_states=tuple(
+            policy_reference(
+                currency,
+                cutoff,
+                (policy_dataset_ids or {}).get(currency, SHA_A),
+                observation=(policy_observations or {}).get(currency),
+                policy_event=(policy_events or {}).get(currency),
+            )
+            for currency in APPROVED_BIS_SERIES
+        ),
+        source_manifest_fingerprints=source_manifest_fingerprints,
+    )
+
+
+def fully_bound_qualification_inputs() -> tuple[
+    tuple[PolicyRateSeriesManifest, ...],
+    PolicyEventManifest,
+    tuple[PolicyConcordanceResult, ...],
+    SpotPanelManifestReference,
+    CandidateBFormationManifest,
+]:
+    templates = tuple(
+        [complete_formation(index, FormationSplit.TRAIN) for index in range(83)]
+        + [complete_formation(index + 83, FormationSplit.VALIDATION) for index in range(23)]
+    )
+    observation_dates = tuple(
+        sorted({template.cutoff_at.date() - timedelta(days=1) for template in templates})
+    )
+    manifests: list[PolicyRateSeriesManifest] = []
+    for currency, series_key in APPROVED_BIS_SERIES.items():
+        area = series_key.split(".", 1)[1]
+        raw = csv_bytes(*(("D", area, item.isoformat(), "2.50", "A") for item in observation_dates))
+        manifests.append(
+            build_series_manifest(request(currency), metadata(currency), raw, RETRIEVED)
+        )
+    events = tuple(
+        event(
+            currency,
+            kind=PolicyEventKind.BASELINE,
+            event_id=f"{currency.lower()}_baseline",
+            old_rate=None,
+            new_rate="2.50",
+            effective_lower=datetime(2013, 12, 31, tzinfo=UTC),
+            effective_upper=datetime(2013, 12, 31, tzinfo=UTC),
+        )
+        for currency in APPROVED_BIS_SERIES
+    )
+    event_manifest = PolicyEventManifest(events)
+    concordance = tuple(reconcile_policy_series(manifest, event_manifest) for manifest in manifests)
+    policy_ids = {manifest.request.series.currency: manifest.dataset_id for manifest in manifests}
+    events_by_currency = {item.currency: item for item in events}
+    observations_by_currency_and_date = {
+        manifest.request.series.currency: {
+            item.observation_date: item for item in manifest.observations
+        }
+        for manifest in manifests
+    }
+    source_ids = tuple(manifest.manifest_id for manifest in manifests) + (
+        event_manifest.manifest_id,
+        SHA_A,
+    )
+    formations = tuple(
+        complete_formation(
+            index,
+            FormationSplit.TRAIN if index < 83 else FormationSplit.VALIDATION,
+            policy_dataset_ids=policy_ids,
+            policy_observations={
+                currency: observations_by_currency_and_date[currency][
+                    templates[index].cutoff_at.date() - timedelta(days=1)
+                ]
+                for currency in APPROVED_BIS_SERIES
+            },
+            policy_events=events_by_currency,
+            source_manifest_fingerprints=source_ids,
+        )
+        for index in range(106)
+    )
+    spot_panel = SpotPanelManifestReference(
+        SHA_A,
+        tuple(SHA_A for _ in APPROVED_PAIRS),
+        tuple(spot for formation in formations for spot in formation.spot_observations),
+    )
+    return (
+        tuple(manifests),
+        event_manifest,
+        concordance,
+        spot_panel,
+        CandidateBFormationManifest(formations),
+    )
+
+
+def test_exact_bis_series_and_request_contract_are_frozen() -> None:
+    assert dict(APPROVED_BIS_SERIES) == {
+        "AUD": "D.AU",
+        "CAD": "D.CA",
+        "CHF": "D.CH",
+        "EUR": "D.XM",
+        "GBP": "D.GB",
+        "JPY": "D.JP",
+        "NZD": "D.NZ",
+        "USD": "D.US",
+    }
+    assert MAX_OBSERVATION_DATE == date(2023, 12, 31)
+    with pytest.raises(ValueError):
+        PolicyRateSeriesSpec("AUD", "D.US")
+    with pytest.raises(ValueError):
+        PolicyRateSeriesSpec("NOK", "D.NO")
+    with pytest.raises(ValueError):
+        PolicyRateRequest(spec(), APPROVED_REQUEST_START, date(2024, 1, 1))
+    with pytest.raises(ValueError):
+        PolicyRateRequest(spec(), date(2015, 1, 1), APPROVED_REQUEST_END)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"agency": "ECB"},
+        {"dataflow": "OTHER"},
+        {"version": "2.0"},
+        {"frequency": "M"},
+        {"series_key": "D.US"},
+        {"unit": ""},
+        {"observation_status_semantics": ()},
+        {"dsd_identity": ""},
+        {"instrument_metadata": ""},
+    ],
+)
+def test_wrong_or_missing_bis_metadata_fails_closed(changes: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        metadata(**changes)
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["UNKNOWN", "CUSTOM", ""],
+)
+def test_unknown_or_missing_observation_status_fails_closed(status: str) -> None:
+    raw = csv_bytes(("D", "AU", "2023-12-29", "4.10", status))
+    with pytest.raises(PolicyRateQualificationError, match="observation_status_invalid"):
+        build_series_manifest(request(), metadata(), raw, RETRIEVED)
+
+
+def test_conflicting_status_metadata_fails_closed() -> None:
+    with pytest.raises(ValueError, match="status semantics"):
+        metadata(observation_status_semantics=("A=provisional",))
+
+
+def test_known_normal_observation_status_is_accepted() -> None:
+    manifest = build_series_manifest(
+        request(),
+        metadata(),
+        csv_bytes(("D", "AU", "2023-12-29", "4.10", "A")),
+        RETRIEVED,
+    )
+    assert manifest.observations[0].status == "A"
+
+
+def test_response_after_sealed_window_is_rejected_without_truncation() -> None:
+    raw = csv_bytes(("D", "AU", "2024-01-01", "4.35", "A"))
+    with pytest.raises(PolicyRateQualificationError, match="sealed_window_violation"):
+        parse_bis_csv(raw, spec())
+
+
+def test_mixed_response_rejects_before_secret_sentinel_can_be_exposed() -> None:
+    raw = csv_bytes(
+        ("D", "AU", "2023-12-29", "4.10", "A"),
+        ("D", "AU", "2024-01-02", "SECRET_SENTINEL", "A"),
+    )
+    transport = FakeTransport(BisTransportResponse(raw, "text/csv", {}))
+    with pytest.raises(PolicyRateQualificationError) as captured:
+        ingest_series(request(), metadata(), transport, RETRIEVED)
+    assert captured.value.reason == "sealed_window_violation"
+    assert "SECRET_SENTINEL" not in str(captured.value)
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.parametrize("timestamp", ["", "not-a-date", "2023-13-01", "2023-01-01T00:00"])
+def test_malformed_observation_dates_fail(timestamp: str) -> None:
+    with pytest.raises(PolicyRateQualificationError):
+        parse_bis_csv(csv_bytes(("D", "AU", timestamp, "2.5", "A")), spec())
+
+
+def test_parser_rejects_wrong_series_dimensions_and_binary_float_is_not_used() -> None:
+    with pytest.raises(PolicyRateQualificationError):
+        parse_bis_csv(csv_bytes(("M", "AU", "2023-01-01", "2.5", "A")), spec())
+    with pytest.raises(PolicyRateQualificationError):
+        parse_bis_csv(csv_bytes(("D", "US", "2023-01-01", "2.5", "A")), spec())
+    parsed = parse_bis_csv(csv_bytes(("D", "AU", "2023-01-01", "2.50", "A")), spec())
+    assert parsed[0].value == Decimal("2.50")
+    assert isinstance(parsed[0].value, Decimal)
+
+
+def test_manifest_identities_are_canonical_and_retrieval_time_is_not_stable_identity() -> None:
+    first = series_manifest()
+    second = series_manifest(retrieved_at=RETRIEVED + timedelta(days=1))
+    assert first.dataset_id == second.dataset_id
+    assert first.manifest_id != second.manifest_id
+    assert first.raw_sha256 == second.raw_sha256
+    assert canonical_sha256({"b": 2, "a": 1}) == canonical_sha256({"a": 1, "b": 2})
+    persisted = asdict(first)
+    assert persisted["parsed_min_observation_date"] == date(2014, 1, 1)
+    assert persisted["parsed_max_observation_date"] == date(2014, 1, 2)
+    assert persisted["row_count"] == 2
+
+
+def test_canonicalization_rejects_arbitrary_mapping_keys() -> None:
+    with pytest.raises(ValueError, match="string keys"):
+        canonical_sha256({object(): "not-safe"})
+
+
+def test_revisions_change_dataset_identity_and_require_reconcordance() -> None:
+    first = series_manifest()
+    revised = build_series_manifest(
+        request(),
+        metadata(revision="revision_2"),
+        csv_bytes(("D", "AU", "2014-01-01", "2.50", "A"), ("D", "AU", "2014-01-02", "2.75", "A")),
+        RETRIEVED,
+    )
+    assert first.dataset_id != revised.dataset_id
+
+
+def test_contracts_are_frozen_and_mutable_inputs_do_not_escape() -> None:
+    statuses = ["A=normal"]
+    item = metadata(observation_status_semantics=statuses)
+    statuses.append("B=changed")
+    assert item.observation_status_semantics == ("A=normal",)
+    with pytest.raises(FrozenInstanceError):
+        item.unit = "other"  # type: ignore[misc]
+    supplied = list(observations())
+    raw = csv_bytes(
+        ("D", "AU", "2014-01-01", "2.50", "A"),
+        ("D", "AU", "2014-01-02", "2.75", "A"),
+    )
+    manifest = PolicyRateSeriesManifest.from_parts(request(), item, raw, RETRIEVED, supplied)
+    supplied.clear()
+    assert len(manifest.observations) == 2
+
+    headers = {"content-type": "text/csv"}
+    response = BisTransportResponse(b"x", "text/csv", headers)
+    headers["authorization"] = "secret"
+    assert dict(response.headers) == {"content-type": "text/csv"}
+    with pytest.raises(TypeError):
+        response.headers["new"] = "value"  # type: ignore[index]
+
+
+def test_manifest_from_parts_cannot_decouple_contaminated_raw_from_clean_rows() -> None:
+    clean_raw = csv_bytes(("D", "AU", "2023-12-29", "4.10", "A"))
+    contaminated_raw = clean_raw + b"D,AU,2024-01-02,SECRET_SENTINEL,A\n"
+    clean_rows = parse_bis_csv(clean_raw, spec())
+    with pytest.raises(PolicyRateQualificationError, match="sealed_window_violation"):
+        PolicyRateSeriesManifest.from_parts(
+            request(), metadata(), contaminated_raw, RETRIEVED, clean_rows
+        )
+
+
+def test_manifest_computed_bindings_cannot_be_replaced_or_forged() -> None:
+    with pytest.raises(TypeError, match="from_parts"):
+        PolicyRateSeriesManifest()
+    manifest = series_manifest()
+    for field_name, replacement in (
+        ("raw_sha256", SHA_B),
+        ("canonical_observation_hash", SHA_B),
+        ("row_count", 999),
+        ("parsed_min_observation_date", date(2015, 1, 1)),
+        ("parsed_max_observation_date", date(2015, 1, 2)),
+        ("dataset_id", SHA_B),
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            replace(manifest, **{field_name: replacement})
+
+    with pytest.raises(PolicyRateQualificationError, match="raw_parsed_mismatch"):
+        PolicyRateSeriesManifest.from_parts(
+            request(),
+            metadata(),
+            csv_bytes(("D", "AU", "2014-01-01", "9.99", "A")),
+            RETRIEVED,
+            observations(),
+        )
+    revised = build_series_manifest(
+        request(),
+        metadata(revision="revision_2"),
+        csv_bytes(
+            ("D", "AU", "2014-01-01", "2.50", "A"),
+            ("D", "AU", "2014-01-02", "2.75", "A"),
+        ),
+        RETRIEVED,
+    )
+    assert revised.dataset_id != manifest.dataset_id
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://www.rba.gov.au/decision",
+        "https://user:pass@www.rba.gov.au/decision",
+        "https://www.rba.gov.au/decision#secret",
+        "https://example.com/decision",
+        "https://rba.gov.au.evil.example/decision",
+        "https://www.rba.gov.au:444/decision",
+        "https://www.rba.gov.au/%2e%2e/private",
+        "https://www.rba.gov.au/%2E%2e/private",
+        "https://www.rba.gov.au/a/%2e./private",
+        "https://www.rba.gov.au/a%2f..%2fprivate",
+        "https://www.rba.gov.au/a%5c..%5cprivate",
+        "https://www.rba.gov.au/safe%2fpath",
+        "https://www.rba.gov.au/safe%2Fpath",
+        "https://www.rba.gov.au/safe%5cpath",
+        "https://www.rba.gov.au/safe%5Cpath",
+        "https://www.rba.gov.au/safe%252fpath",
+        "https://www.rba.gov.au/safe%255cpath",
+        "https://www.rba.gov.au/decision?token=abc",
+        "https://www.rba.gov.au/decision?api_key=abc",
+        "https://www.rba.gov.au/decision?password=abc",
+        "https://www.rba.gov.au/decision?authorization=Bearer%20abc",
+        "https://www.rba.gov.au/decision?next=https%3A%2F%2Fevil.example",
+        "https://user%3Apass@www.rba.gov.au/decision",
+        "https://www.rba.gov.au/decision%00hidden",
+    ],
+)
+def test_unsafe_policy_source_urls_are_rejected(url: str) -> None:
+    with pytest.raises(ValueError):
+        PolicySourceEvidence(url, RETRIEVED, SHA_A, 10, "text/html", "official_decision")
+
+
+def test_approved_policy_source_url_with_literal_path_separators_is_accepted() -> None:
+    evidence = PolicySourceEvidence(
+        "https://www.rba.gov.au/safe/path",
+        RETRIEVED,
+        SHA_A,
+        10,
+        "text/html",
+        "official_decision",
+    )
+    assert evidence.source_url == "https://www.rba.gov.au/safe/path"
+
+
+def test_point_in_time_excludes_same_day_future_and_ambiguous_intervals() -> None:
+    cutoff = datetime(2023, 6, 1, tzinfo=UTC)
+    same_day = event(
+        announcement_lower=cutoff,
+        announcement_upper=cutoff,
+        effective_lower=cutoff,
+        effective_upper=cutoff,
+    )
+    assert event_is_eligible(same_day, cutoff) is False
+    future_effective = event(
+        announcement_lower=cutoff - timedelta(days=1),
+        announcement_upper=cutoff - timedelta(days=1),
+        effective_lower=cutoff + timedelta(days=1),
+        effective_upper=cutoff + timedelta(days=1),
+    )
+    assert event_is_eligible(future_effective, cutoff) is False
+    ambiguous = event(ambiguity=AmbiguityState.AMBIGUOUS)
+    assert event_is_eligible(ambiguous, datetime(2014, 2, 1, tzinfo=UTC)) is False
+
+
+def test_date_only_bounds_use_conservative_upper_bound() -> None:
+    item = PolicyRateEvent(
+        event_id="aud_date_only",
+        kind=PolicyEventKind.RATE_CHANGE,
+        currency="AUD",
+        central_bank_id="aud_central_bank",
+        policy_instrument_id="principal_policy_rate",
+        announcement_lower=datetime(2023, 6, 1, tzinfo=UTC),
+        announcement_upper=datetime(2023, 6, 2, tzinfo=UTC),
+        announcement_precision=TimePrecision.DATE_ONLY,
+        effective_lower=datetime(2023, 6, 1, tzinfo=UTC),
+        effective_upper=datetime(2023, 6, 2, tzinfo=UTC),
+        effective_precision=TimePrecision.DATE_ONLY,
+        source_timezone="UTC",
+        old_rate="3.50",
+        new_rate="3.75",
+        source=source(),
+        evidence_classification=EvidenceClassification.OFFICIAL_ANNOUNCEMENT,
+        ambiguity=AmbiguityState.CLEAR,
+        conflict=AmbiguityState.CLEAR,
+    )
+    assert event_is_eligible(item, datetime(2023, 6, 1, 12, tzinfo=UTC)) is False
+    assert event_is_eligible(item, datetime(2023, 6, 2, tzinfo=UTC)) is True
+
+
+def test_concordance_passes_exact_official_transition() -> None:
+    baseline = event(
+        kind=PolicyEventKind.BASELINE,
+        event_id="aud_baseline",
+        old_rate=None,
+        new_rate="2.50",
+        effective_lower=datetime(2013, 12, 31, tzinfo=UTC),
+        effective_upper=datetime(2013, 12, 31, tzinfo=UTC),
+    )
+    result = reconcile_policy_series(series_manifest(), PolicyEventManifest((baseline, event())))
+    assert result.status is ConcordanceStatus.PASS
+    assert result.reasons == ()
+
+
+@pytest.mark.parametrize(
+    ("events", "reason"),
+    [
+        ((), "missing_baseline"),
+        ((event(new_rate="3.00"),), "missing_baseline"),
+        ((event(ambiguity=AmbiguityState.CONFLICTING),), "conflicting_official_evidence"),
+    ],
+)
+def test_missing_conflicting_or_mismatched_events_fail(
+    events: tuple[PolicyRateEvent, ...], reason: str
+) -> None:
+    result = reconcile_policy_series(series_manifest(), PolicyEventManifest(events))
+    assert result.status is ConcordanceStatus.FAIL
+    assert reason in result.reasons
+
+
+def test_duplicate_events_fail_before_concordance() -> None:
+    duplicate = event()
+    with pytest.raises(ValueError, match="duplicate"):
+        PolicyEventManifest((duplicate, duplicate))
+
+
+def test_unexplained_transition_and_official_transition_absent_from_bis_fail() -> None:
+    baseline = event(
+        kind=PolicyEventKind.BASELINE,
+        event_id="aud_baseline",
+        old_rate=None,
+        new_rate="2.50",
+        effective_lower=datetime(2013, 12, 31, tzinfo=UTC),
+        effective_upper=datetime(2013, 12, 31, tzinfo=UTC),
+    )
+    missing = reconcile_policy_series(series_manifest(), PolicyEventManifest((baseline,)))
+    assert "unexplained_bis_transition" in missing.reasons
+    extra = event(
+        event_id="aud_extra",
+        old_rate="2.75",
+        new_rate="3.00",
+        effective_lower=datetime(2014, 1, 3, tzinfo=UTC),
+        effective_upper=datetime(2014, 1, 3, tzinfo=UTC),
+    )
+    absent = reconcile_policy_series(
+        series_manifest(), PolicyEventManifest((baseline, event(), extra))
+    )
+    assert "official_transition_absent_from_bis" in absent.reasons
+
+
+def test_instrument_transition_requires_explicit_transition_evidence() -> None:
+    baseline = event(
+        kind=PolicyEventKind.BASELINE,
+        event_id="aud_baseline",
+        old_rate=None,
+        new_rate="2.50",
+        effective_lower=datetime(2013, 12, 31, tzinfo=UTC),
+        effective_upper=datetime(2013, 12, 31, tzinfo=UTC),
+    )
+    transition = event(kind=PolicyEventKind.INSTRUMENT_TRANSITION)
+    result = reconcile_policy_series(series_manifest(), PolicyEventManifest((baseline, transition)))
+    assert result.status is ConcordanceStatus.PASS
+
+
+def test_closed_d1_reference_and_complete_formation_require_exact_universe() -> None:
+    formation_at = datetime(2020, 1, 31, tzinfo=UTC)
+    with pytest.raises(ValueError, match="closed"):
+        SpotObservationReference(
+            "AUDUSD", SHA_A, formation_at - timedelta(days=1), formation_at, "close", False
+        )
+    cutoff = datetime.combine(formation_at.date(), datetime.min.time(), tzinfo=UTC)
+    missing_spot = qualify_formation(
+        cohort_id="missing_spot",
+        formation_month="2020-01",
+        formation_at=formation_at,
+        cutoff_at=cutoff,
+        exit_at=formation_at + timedelta(days=28),
+        split=FormationSplit.TRAIN,
+        purged=False,
+        spot_observations=tuple(spot_reference(pair, formation_at) for pair in APPROVED_PAIRS[:-1]),
+        policy_states=tuple(policy_reference(currency, cutoff) for currency in APPROVED_BIS_SERIES),
+        source_manifest_fingerprints=(SHA_A,),
+    )
+    assert missing_spot.complete is False
+    assert missing_spot.rejection_reason == "missing_spot_observation"
+    missing_rate = qualify_formation(
+        cohort_id="missing_rate",
+        formation_month="2020-01",
+        formation_at=formation_at,
+        cutoff_at=cutoff,
+        exit_at=formation_at + timedelta(days=28),
+        split=FormationSplit.TRAIN,
+        purged=False,
+        spot_observations=tuple(spot_reference(pair, formation_at) for pair in APPROVED_PAIRS),
+        policy_states=tuple(
+            policy_reference(currency, cutoff) for currency in tuple(APPROVED_BIS_SERIES)[:-1]
+        ),
+        source_manifest_fingerprints=(SHA_A,),
+    )
+    assert missing_rate.complete is False
+    assert missing_rate.rejection_reason == "missing_policy_state"
+
+
+def test_post_2023_spot_and_formation_references_are_rejected() -> None:
+    future_close = datetime(2024, 1, 1, tzinfo=UTC)
+    with pytest.raises(PolicyRateQualificationError, match="sealed_window_violation"):
+        spot_reference("AUDUSD", future_close)
+
+    safe_close = datetime(2023, 12, 31, tzinfo=UTC)
+    with pytest.raises(PolicyRateQualificationError, match="sealed_window_violation"):
+        qualify_formation(
+            cohort_id="future_exit",
+            formation_month="2023-12",
+            formation_at=safe_close,
+            cutoff_at=datetime(2023, 12, 31, tzinfo=UTC),
+            exit_at=datetime(2024, 1, 31, tzinfo=UTC),
+            split=FormationSplit.VALIDATION,
+            purged=False,
+            spot_observations=tuple(spot_reference(pair, safe_close) for pair in APPROVED_PAIRS),
+            policy_states=tuple(
+                policy_reference(currency, safe_close) for currency in APPROVED_BIS_SERIES
+            ),
+            source_manifest_fingerprints=(SHA_A,),
+        )
+
+
+def test_boundary_crossing_formation_is_purged() -> None:
+    formation_at = datetime(2021, 12, 31, tzinfo=UTC)
+    cutoff = datetime(2021, 12, 31, tzinfo=UTC)
+    purged = qualify_formation(
+        cohort_id="boundary",
+        formation_month="2021-12",
+        formation_at=formation_at,
+        cutoff_at=cutoff,
+        exit_at=datetime(2022, 1, 31, tzinfo=UTC),
+        split=FormationSplit.PURGED,
+        purged=True,
+        spot_observations=tuple(spot_reference(pair, formation_at) for pair in APPROVED_PAIRS),
+        policy_states=tuple(policy_reference(currency, cutoff) for currency in APPROVED_BIS_SERIES),
+        source_manifest_fingerprints=(SHA_A,),
+    )
+    assert purged.complete is False
+    assert purged.rejection_reason == "split_boundary_purge"
+
+
+def test_formation_month_and_split_labels_cannot_override_calendar_derivation() -> None:
+    item = complete_formation(0, FormationSplit.TRAIN)
+    with pytest.raises(ValueError, match="formation month"):
+        replace(item, formation_month="1999-01")
+    with pytest.raises(ValueError, match="split"):
+        replace(item, split=FormationSplit.VALIDATION)
+
+
+def test_train_validation_crossing_cohort_must_be_purged() -> None:
+    formation_at = datetime(2021, 12, 31, tzinfo=UTC)
+    cutoff = datetime(2021, 12, 31, tzinfo=UTC)
+    with pytest.raises(ValueError, match="split|purge"):
+        qualify_formation(
+            cohort_id="boundary_mismatch",
+            formation_month="2021-12",
+            formation_at=formation_at,
+            cutoff_at=cutoff,
+            exit_at=datetime(2022, 1, 31, tzinfo=UTC),
+            split=FormationSplit.TRAIN,
+            purged=False,
+            spot_observations=tuple(spot_reference(pair, formation_at) for pair in APPROVED_PAIRS),
+            policy_states=tuple(
+                policy_reference(currency, cutoff) for currency in APPROVED_BIS_SERIES
+            ),
+            source_manifest_fingerprints=(SHA_A,),
+        )
+
+
+def test_policy_and_spot_references_expose_resolvable_immutable_identities() -> None:
+    observation = PolicyRateObservation("D.AU", date(2020, 1, 30), Decimal("0.75"), "A")
+    reference = PolicyStateReference(
+        currency="AUD",
+        series_key="D.AU",
+        dataset_id=SHA_A,
+        observation_id=observation.identity,
+        observation_date=observation.observation_date,
+        observation_value=observation.value,
+        observation_status=observation.status,
+        event_id="aud_baseline",
+        policy_instrument_id="principal_policy_rate",
+        announcement_upper=datetime(2019, 1, 1, tzinfo=UTC),
+        effective_upper=datetime(2019, 1, 1, tzinfo=UTC),
+        eligible=True,
+    )
+    assert reference.observation_id == observation.identity
+    spot = spot_reference("AUDUSD", datetime(2020, 1, 31, tzinfo=UTC))
+    panel = SpotPanelManifestReference(SHA_A, (SHA_A,) * 7, observations=(spot,))
+    assert panel.observations == (spot,)
+
+
+def test_direct_formation_construction_cannot_claim_false_completeness() -> None:
+    formation_at = datetime(2020, 1, 31, tzinfo=UTC)
+    with pytest.raises(ValueError, match="complete formation"):
+        CandidateBFormation(
+            cohort_id="forged_complete",
+            formation_month="2020-01",
+            formation_at=formation_at,
+            cutoff_at=datetime(2020, 1, 31, tzinfo=UTC),
+            exit_at=datetime(2020, 2, 28, tzinfo=UTC),
+            split=FormationSplit.TRAIN,
+            purged=False,
+            spot_observations=(),
+            policy_states=(),
+            pit_eligible=True,
+            complete=True,
+            rejection_reason=None,
+            source_manifest_fingerprints=(SHA_A,),
+        )
+
+
+def test_exact_83_23_106_cohort_gate() -> None:
+    formations = tuple(
+        [complete_formation(index, FormationSplit.TRAIN) for index in range(83)]
+        + [complete_formation(index + 83, FormationSplit.VALIDATION) for index in range(23)]
+    )
+    manifest = CandidateBFormationManifest(formations)
+    assert manifest.train_count == EXPECTED_TRAIN_COHORTS == 83
+    assert manifest.validation_count == EXPECTED_VALIDATION_COHORTS == 23
+    assert manifest.total_count == EXPECTED_TOTAL_COHORTS == 106
+    assert manifest.qualified is True
+    assert CandidateBFormationManifest(formations[:-1]).qualified is False
+
+
+@pytest.mark.parametrize(
+    ("train_count", "validation_count"),
+    [(82, 23), (83, 22), (84, 23), (83, 24)],
+)
+def test_exact_count_gate_rejects_every_off_by_one_shape(
+    train_count: int, validation_count: int
+) -> None:
+    train = [complete_formation(index, FormationSplit.TRAIN) for index in range(83)]
+    validation = [complete_formation(index + 83, FormationSplit.VALIDATION) for index in range(23)]
+    if train_count < 83:
+        train = train[:train_count]
+    elif train_count > 83:
+        train.append(replace(train[-1], cohort_id="extra_train"))
+    if validation_count < 23:
+        validation = validation[:validation_count]
+    elif validation_count > 23:
+        validation.append(replace(validation[-1], cohort_id="extra_validation"))
+    formations = tuple(train + validation)
+    assert CandidateBFormationManifest(formations).qualified is False
+
+
+def test_qualification_contract_has_no_performance_fields() -> None:
+    forbidden = {
+        "policy_differential",
+        "rank",
+        "weight",
+        "return",
+        "pnl",
+        "sharpe",
+        "drawdown",
+        "performance",
+    }
+    for dto in (CandidateBFormation, CandidateBFormationManifest, CandidateBQualificationResult):
+        names = {field.name.lower() for field in fields(dto)}
+        assert not any(any(term in name for term in forbidden) for name in names)
+
+
+class FakeTransport:
+    def __init__(self, response: BisTransportResponse):
+        self.response = response
+        self.calls: list[PolicyRateRequest] = []
+
+    def fetch(self, item: PolicyRateRequest) -> BisTransportResponse:
+        self.calls.append(item)
+        return self.response
+
+
+def test_ingestion_uses_one_attempt_no_retry_or_fallback() -> None:
+    raw = csv_bytes(("D", "AU", "2014-01-01", "2.50", "A"))
+    transport = FakeTransport(BisTransportResponse(raw, "text/csv", {}))
+    result = ingest_series(request(), metadata(), transport, RETRIEVED)
+    assert len(transport.calls) == 1
+    assert result.series_manifest.dataset_id
+    assert result.raw_bytes == raw
+
+
+def test_default_ingestion_main_refuses_network_acquisition() -> None:
+    with pytest.raises(SystemExit, match="network_acquisition_not_authorized"):
+        ingest_main()
+
+
+def test_unexpected_future_response_never_produces_manifest_and_transport_is_not_retried() -> None:
+    raw = csv_bytes(("D", "AU", "2024-01-01", "4.35", "A"))
+    transport = FakeTransport(BisTransportResponse(raw, "text/csv", {}))
+    with pytest.raises(PolicyRateQualificationError, match="sealed_window_violation"):
+        ingest_series(request(), metadata(), transport, RETRIEVED)
+    assert len(transport.calls) == 1
+
+
+def test_future_source_rows_do_not_change_a_bounded_transport_result() -> None:
+    allowed = csv_bytes(("D", "AU", "2014-01-01", "2.50", "A"))
+    first = FakeTransport(BisTransportResponse(allowed, "text/csv", {}))
+    second = FakeTransport(BisTransportResponse(allowed, "text/csv", {"source_has_later": "yes"}))
+    assert ingest_series(request(), metadata(), first, RETRIEVED).series_manifest.dataset_id == (
+        ingest_series(request(), metadata(), second, RETRIEVED).series_manifest.dataset_id
+    )
+
+
+def test_offline_qualification_requires_every_manifest_and_passing_concordance() -> None:
+    formation_manifest = CandidateBFormationManifest(())
+    spot = SpotPanelManifestReference(SHA_A, tuple(SHA_A for _ in APPROVED_PAIRS))
+    failed = qualify_candidate_b(
+        series_manifests=(),
+        event_manifest=PolicyEventManifest(()),
+        concordance_results=(),
+        spot_panel=spot,
+        formation_manifest=formation_manifest,
+    )
+    assert failed.qualified is False
+    assert "missing_series_manifest" in failed.reasons
+
+
+def test_offline_qualification_cross_binds_concordance_to_series_and_event_inventory() -> None:
+    manifests = tuple(series_manifest(currency) for currency in APPROVED_BIS_SERIES)
+    event_manifest = PolicyEventManifest(())
+    mismatched = tuple(
+        PolicyConcordanceResult(
+            currency,
+            SHA_B,
+            event_manifest.manifest_id,
+            ConcordanceStatus.PASS,
+            (),
+        )
+        for currency in APPROVED_BIS_SERIES
+    )
+    result = qualify_candidate_b(
+        series_manifests=manifests,
+        event_manifest=event_manifest,
+        concordance_results=mismatched,
+        spot_panel=SpotPanelManifestReference(SHA_A, tuple(SHA_A for _ in APPROVED_PAIRS)),
+        formation_manifest=CandidateBFormationManifest(()),
+    )
+    assert result.qualified is False
+    assert "concordance_provenance_mismatch" in result.reasons
+
+
+def test_offline_qualification_recomputes_concordance_instead_of_trusting_pass_flag() -> None:
+    manifests = tuple(series_manifest(currency) for currency in APPROVED_BIS_SERIES)
+    event_manifest = PolicyEventManifest(())
+    forged_passes = tuple(
+        PolicyConcordanceResult(
+            currency,
+            manifest.dataset_id,
+            event_manifest.manifest_id,
+            ConcordanceStatus.PASS,
+            (),
+        )
+        for currency, manifest in zip(APPROVED_BIS_SERIES, manifests, strict=True)
+    )
+    result = qualify_candidate_b(
+        series_manifests=manifests,
+        event_manifest=event_manifest,
+        concordance_results=forged_passes,
+        spot_panel=SpotPanelManifestReference(SHA_A, tuple(SHA_A for _ in APPROVED_PAIRS)),
+        formation_manifest=CandidateBFormationManifest(()),
+    )
+    assert result.qualified is False
+    assert "concordance_result_mismatch" in result.reasons
+
+
+def test_offline_qualification_requires_formation_provenance_binding() -> None:
+    manifests = tuple(series_manifest(currency) for currency in APPROVED_BIS_SERIES)
+    events: list[PolicyRateEvent] = []
+    for currency in APPROVED_BIS_SERIES:
+        events.extend(
+            (
+                event(
+                    currency,
+                    kind=PolicyEventKind.BASELINE,
+                    event_id=f"{currency.lower()}_baseline",
+                    old_rate=None,
+                    new_rate="2.50",
+                    effective_lower=datetime(2013, 12, 31, tzinfo=UTC),
+                    effective_upper=datetime(2013, 12, 31, tzinfo=UTC),
+                ),
+                event(currency, event_id=f"{currency.lower()}_rate_2014_01_02"),
+            )
+        )
+    event_manifest = PolicyEventManifest(tuple(events))
+    concordance = tuple(reconcile_policy_series(manifest, event_manifest) for manifest in manifests)
+    formations = tuple(
+        [complete_formation(index, FormationSplit.TRAIN) for index in range(83)]
+        + [complete_formation(index + 83, FormationSplit.VALIDATION) for index in range(23)]
+    )
+    spot_panel = SpotPanelManifestReference(SHA_A, tuple(SHA_A for _ in APPROVED_PAIRS))
+    result = qualify_candidate_b(
+        series_manifests=manifests,
+        event_manifest=event_manifest,
+        concordance_results=concordance,
+        spot_panel=spot_panel,
+        formation_manifest=CandidateBFormationManifest(formations),
+    )
+    assert result.qualified is False
+    assert "formation_provenance_mismatch" in result.reasons
+
+    policy_ids = {manifest.request.series.currency: manifest.dataset_id for manifest in manifests}
+    source_ids = tuple(manifest.manifest_id for manifest in manifests) + (
+        event_manifest.manifest_id,
+        spot_panel.manifest_id,
+    )
+    bound_formations = tuple(
+        [
+            complete_formation(
+                index,
+                FormationSplit.TRAIN,
+                policy_dataset_ids=policy_ids,
+                source_manifest_fingerprints=source_ids,
+            )
+            for index in range(83)
+        ]
+        + [
+            complete_formation(
+                index + 83,
+                FormationSplit.VALIDATION,
+                policy_dataset_ids=policy_ids,
+                source_manifest_fingerprints=source_ids,
+            )
+            for index in range(23)
+        ]
+    )
+    qualified = qualify_candidate_b(
+        series_manifests=manifests,
+        event_manifest=event_manifest,
+        concordance_results=concordance,
+        spot_panel=spot_panel,
+        formation_manifest=CandidateBFormationManifest(bound_formations),
+    )
+    assert qualified.qualified is False
+    assert "formation_reference_unresolved" in qualified.reasons
+
+
+def test_fully_bound_synthetic_qualification_can_pass_without_outcomes() -> None:
+    manifests, events, concordance, spots, formations = fully_bound_qualification_inputs()
+    result = qualify_candidate_b(
+        series_manifests=manifests,
+        event_manifest=events,
+        concordance_results=concordance,
+        spot_panel=spots,
+        formation_manifest=formations,
+    )
+    assert result.qualified is True
+    assert result.reasons == ()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "nonexistent_event",
+        "nonexistent_observation",
+        "event_currency_mismatch",
+        "observation_value_mismatch",
+        "instrument_mismatch",
+    ],
+)
+def test_dangling_or_mismatched_policy_reference_invalidates_qualification(
+    mutation: str,
+) -> None:
+    manifests, events, concordance, spots, formations = fully_bound_qualification_inputs()
+    first = formations.formations[0]
+    state = first.policy_states[0]
+    changes: dict[str, object] = {}
+    if mutation == "nonexistent_event":
+        changes["event_id"] = "aud_nonexistent"
+    elif mutation == "nonexistent_observation":
+        changes["observation_id"] = SHA_B
+    elif mutation == "event_currency_mismatch":
+        changes["event_id"] = "cad_baseline"
+    elif mutation == "observation_value_mismatch":
+        changes["observation_value"] = Decimal("9.99")
+    else:
+        changes["policy_instrument_id"] = "wrong_instrument"
+    forged_state = replace(state, **changes)
+    forged_formation = replace(first, policy_states=(forged_state, *first.policy_states[1:]))
+    forged_manifest = CandidateBFormationManifest((forged_formation, *formations.formations[1:]))
+    result = qualify_candidate_b(
+        series_manifests=manifests,
+        event_manifest=events,
+        concordance_results=concordance,
+        spot_panel=spots,
+        formation_manifest=forged_manifest,
+    )
+    assert result.qualified is False
+    assert "formation_reference_unresolved" in result.reasons
+
+
+def test_policy_series_mismatch_and_forged_future_pit_are_rejected() -> None:
+    _, _, _, _, formations = fully_bound_qualification_inputs()
+    first = formations.formations[0]
+    state = first.policy_states[0]
+    with pytest.raises(ValueError, match="series mismatch"):
+        replace(state, series_key="D.US")
+    with pytest.raises(ValueError, match="point-in-time"):
+        replace(
+            first,
+            policy_states=(
+                replace(
+                    state,
+                    announcement_upper=first.cutoff_at + timedelta(days=1),
+                    eligible=True,
+                ),
+                *first.policy_states[1:],
+            ),
+        )
+
+
+def test_missing_spot_index_entry_and_dataset_mismatch_invalidate_qualification() -> None:
+    manifests, events, concordance, spots, formations = fully_bound_qualification_inputs()
+    missing_spot_panel = SpotPanelManifestReference(
+        spots.manifest_id,
+        spots.dataset_ids,
+        spots.observations[1:],
+    )
+    missing = qualify_candidate_b(
+        series_manifests=manifests,
+        event_manifest=events,
+        concordance_results=concordance,
+        spot_panel=missing_spot_panel,
+        formation_manifest=formations,
+    )
+    assert missing.qualified is False
+    assert "formation_reference_unresolved" in missing.reasons
+
+    first = formations.formations[0]
+    forged_spot = replace(first.spot_observations[0], dataset_id=SHA_B)
+    forged_formation = replace(first, spot_observations=(forged_spot, *first.spot_observations[1:]))
+    forged_manifest = CandidateBFormationManifest((forged_formation, *formations.formations[1:]))
+    mismatched = qualify_candidate_b(
+        series_manifests=manifests,
+        event_manifest=events,
+        concordance_results=concordance,
+        spot_panel=spots,
+        formation_manifest=forged_manifest,
+    )
+    assert mismatched.qualified is False
+    assert "formation_provenance_mismatch" in mismatched.reasons
+
+
+def test_wrong_d1_close_and_missing_pair_or_policy_state_fail_before_qualification() -> None:
+    formation_at = datetime(2020, 1, 31, tzinfo=UTC)
+    with pytest.raises(ValueError, match="closed D1"):
+        SpotObservationReference(
+            "AUDUSD",
+            SHA_A,
+            formation_at - timedelta(hours=23),
+            formation_at,
+            "close",
+            True,
+        )
+
+
+def test_qualification_result_cannot_claim_success_with_incomplete_evidence() -> None:
+    with pytest.raises(ValueError, match="qualified result"):
+        CandidateBQualificationResult(
+            qualified=True,
+            reasons=(),
+            series_manifest_ids=(SHA_A,),
+            event_manifest_id=SHA_A,
+            concordance_result_ids=(SHA_A,),
+            spot_manifest_id=SHA_A,
+            formation_manifest_id=SHA_A,
+        )
