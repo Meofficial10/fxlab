@@ -191,11 +191,44 @@ sum(one_way_cost_in_return_units * abs(new_weight - old_weight))
 where one basis point is `0.0001` return units. Initial entry from zero is charged. Terminal
 liquidation of each split to zero is charged to that split. Validation starts from zero.
 
+Terminal liquidation does not create another monthly cohort or return observation. Its turnover
+cost is charged to the final measured cohort of that split. Train and validation therefore remain
+exactly `83` and `23` measured cohorts, respectively, and validation still starts independently
+from zero.
+
 - Headline cost multiplier: `1.0`.
 - Mandatory stress multiplier: `1.5`.
 
 No financing accrual, forward spread, cross-currency basis, broker swap, or fabricated carry income
 is permitted. These costs are frozen research assumptions, not historical executability proof.
+
+## Frozen accounting and summary-statistic conventions
+
+Each split starts with normalized equity `equity_0 = 1.0`. For its ordered net monthly cohort
+returns `r_1, ..., r_n`, equity compounds as:
+
+```text
+equity_t = equity_(t-1) * (1 + r_t)
+```
+
+Drawdown at `t` is:
+
+```text
+drawdown_t = equity_t / max(equity_0, ..., equity_t) - 1
+```
+
+Maximum drawdown is the magnitude of the minimum `drawdown_t`. Initial equity `1.0` participates as
+the initial peak, and train and validation drawdowns are calculated independently.
+
+Annualized Sharpe uses only net monthly cohort returns, an arithmetic mean, risk-free rate `0`,
+sample standard deviation with `ddof=1`, and annualization by `sqrt(12)`:
+
+```text
+Sharpe = sqrt(12) * mean(r) / sample_std(r, ddof=1)
+```
+
+Nonfinite input, fewer than two observations, or zero sample standard deviation cannot produce a
+passing Sharpe result. No alternative annualization or downside-ratio substitution is permitted.
 
 ## Frozen research windows and sealed boundary
 
@@ -265,12 +298,47 @@ Primary inference:
 - fixed lag: `3`;
 - Student-t reference with `n - 1` degrees of freedom.
 
+For the intercept-only mean inference, let `e_t = r_t - mean(r)`. With `n` net monthly returns and
+fixed `L = 3`, define:
+
+```text
+gamma_j = (1 / n) * sum from t=j to n-1 of (e_t * e_(t-j))
+w_j = 1 - j / (L + 1)
+LRV = gamma_0 + 2 * sum from j=1 to L of (w_j * gamma_j)
+Var(mean) = LRV / n
+SE(mean) = sqrt(Var(mean))
+```
+
+No additional finite-sample covariance multiplier is applied. The one-sided 95% lower confidence
+bound is:
+
+```text
+LCB_95 = mean(r) - t_(0.95, n-1) * SE(mean)
+```
+
+HAC passes only when `LCB_95 > 0`. The later implementation must use one reviewed deterministic
+Student-t quantile implementation already available in the locked dependency set if possible. If
+none is suitable, G2 implementation must stop and report that blocker rather than silently invent
+a quantile implementation.
+
 Confirmation:
 
 - circular moving-block bootstrap;
 - fixed block length: `3`;
 - replications: `10,000`;
 - seed: `20260829`.
+
+The bootstrap statistic is the arithmetic mean monthly net return. It uses NumPy `Generator` with
+`PCG64`. Each replication draws `ceil(n / 3)` independent block-start indices uniformly from the
+integer range `[0, n)`. A block beginning at `start` contains `start`, `start+1`, and `start+2`,
+each modulo `n`. Blocks are concatenated in draw order and truncated to exactly `n` observations;
+the mean of that resampled vector is recorded.
+
+The bootstrap one-sided 95% lower bound is the 5th percentile of the `10,000` bootstrap means using
+NumPy quantile method `linear`. Bootstrap passes only when this lower bound is strictly greater
+than zero. No alternate seed, block length, replication count, interval type, or quantile method is
+permitted. The NumPy version and RNG implementation identity must be included in G1's late-bound
+environment identity.
 
 Validation requires a strictly positive one-sided 95% lower confidence bound under both methods.
 No lag, block length, seed, inference method, or confidence level may be selected after outcomes are
@@ -319,6 +387,34 @@ All of the following are mandatory:
 - `+50%` cost stress passes;
 - no quotation-direction dependence;
 - no leakage or future-data dependence.
+
+For the frozen currency-concentration gate, define each currency's gross monthly contribution as:
+
+```text
+gross_contribution_c,m = weight_c,m * normalized_return_c,m
+currency_cost_c,m = one_way_cost_c * abs(weight_c,m - weight_c,m-1)
+net_contribution_c,m = gross_contribution_c,m - currency_cost_c,m
+```
+
+The initial prior weight is zero. The currency's terminal-liquidation cost is allocated to the
+final measured cohort of the split. The corresponding headline multiplier `1.0` or stress
+multiplier `1.5` is applied to `currency_cost_c,m` for the portfolio being evaluated. Within each
+split:
+
+```text
+C_c = sum over m of net_contribution_c,m
+share_c = abs(C_c) / sum over j of abs(C_j)
+```
+
+The concentration gate fails when any `share_c > 0.50`. If the denominator is zero, concentration
+is undefined and cannot pass. Profitable-only contributions and sums of absolute monthly returns
+must not replace this definition.
+
+The frozen no-quotation-direction-dependence requirement is an implementation and data-
+normalization invariant. Economically identical direct foreign/USD values `V` and inverse
+USD/foreign prices `1/V` must produce the same normalized foreign-currency return after the ADR's
+reciprocal rule. This is verified mechanically with synthetic golden cases; it does not authorize
+alternate real datasets, pair orientations, or a second decision-making specification.
 
 The 106 ordered complete cohorts are partitioned deterministically into six consecutive blocks: the
 first four blocks contain 18 cohorts each and the final two contain 17 cohorts each. The partition
