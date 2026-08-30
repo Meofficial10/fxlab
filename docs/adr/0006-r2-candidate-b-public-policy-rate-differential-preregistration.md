@@ -229,6 +229,21 @@ diagnostics only; none may define a replacement specification or rescue a reject
 
 ## Preregistered cohort expectation
 
+The BIS acquisition start of `2014-01-01` supplies initialization history only, so the
+already-announced and already-effective policy state can be established before the first
+formation. Calendar year 2014 is not part of the Candidate B portfolio-formation window. The
+first formation is January 2015, with its first measured outcome exiting in February 2015.
+
+Train formation months are January 2015 through November 2021 (`83`). The December 2021
+formation, which exits in January 2022, is **PURGED** because it crosses the train/validation
+boundary. Validation formation months are January 2022 through November 2023 (`23`). A December
+2023 formation is excluded because its next formation exit would require sealed 2024 data. The
+required measured total therefore remains exactly `106` complete cohorts.
+
+Missing required observations or evidence do not permit shifting the January 2015 formation
+start, shrinking the seven-currency universe, imputing observations, or replacing the exact
+`83`/`23`/`106` requirement.
+
 Calendar arithmetic produces these expectations:
 
 - train: `83` complete monthly cohorts;
@@ -438,4 +453,3 @@ limitation and cannot be addressed by weakening this preregistration.
 - **R7/R8 NOT AUTHORIZED**
 - **LIVE TRADING NOT AUTHORIZED**
 - **2024+ REMAINS SEALED**
-
