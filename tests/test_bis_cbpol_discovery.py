@@ -525,6 +525,103 @@ def test_generalized_schema_probe_construction_failure_is_network_free(monkeypat
         )
 
 
+def test_sparse_d_au_schema_probe_dates_are_valid_discovery_evidence() -> None:
+    request = discovery.build_schema_probe_request(
+        DiscoveryTarget.D_AU_SCHEMA_PROBE, metadata_insufficient=True
+    )
+    sparse_dates = (
+        "2023-01-03",
+        "2023-01-04",
+        "2023-01-05",
+        "2023-01-06",
+        "2023-01-09",
+        "2023-01-10",
+        "2023-01-11",
+        "2023-01-12",
+        "2023-01-13",
+        "2023-01-16",
+        "2023-01-17",
+        "2023-01-18",
+        "2023-01-19",
+        "2023-01-20",
+        "2023-01-23",
+        "2023-01-24",
+        "2023-01-25",
+        "2023-01-27",
+        "2023-01-30",
+        "2023-01-31",
+    )
+
+    artifact = execute_discovery(
+        request,
+        FakeTransport(
+            response(
+                request.url,
+                probe_xml(reference_area="AU", dates=sparse_dates),
+                "application/xml",
+            )
+        ),
+        RETRIEVED,
+    ).artifact
+
+    assert artifact.observation_count == 20
+    assert artifact.parsed_min_observation_date == date(2023, 1, 3)
+    assert artifact.parsed_max_observation_date == date(2023, 1, 31)
+    assert artifact.classification == DISCOVERY_CLASSIFICATION
+    assert artifact.authoritative_qualification_eligible is False
+    assert artifact.final_run_identity_eligible is False
+    assert artifact.r4_evidence_eligible is False
+
+
+@pytest.mark.parametrize(
+    ("dates", "reason"),
+    (
+        (("2023-01-03", "2023-01-03"), "duplicate_observation"),
+        (("2022-12-31", "2023-01-03"), "observation_outside_request"),
+        (("2023-01-03", "2023-02-01"), "observation_outside_request"),
+        (("2023-01-04", "2023-01-03"), "observation_order_invalid"),
+    ),
+)
+def test_sparse_schema_probe_rejects_duplicate_outside_or_unordered_dates(
+    dates: tuple[str, ...], reason: str
+) -> None:
+    request = discovery.build_schema_probe_request(
+        DiscoveryTarget.D_AU_SCHEMA_PROBE, metadata_insufficient=True
+    )
+
+    with pytest.raises(DiscoveryFailure, match=reason):
+        execute_discovery(
+            request,
+            FakeTransport(
+                response(
+                    request.url,
+                    probe_xml(reference_area="AU", dates=dates),
+                    "application/xml",
+                )
+            ),
+            RETRIEVED,
+        )
+
+
+def test_sparse_schema_probe_rejects_empty_observation_set() -> None:
+    request = discovery.build_schema_probe_request(
+        DiscoveryTarget.D_AU_SCHEMA_PROBE, metadata_insufficient=True
+    )
+
+    with pytest.raises(DiscoveryFailure, match="probe_date_set_mismatch"):
+        execute_discovery(
+            request,
+            FakeTransport(
+                response(
+                    request.url,
+                    probe_xml(reference_area="AU", dates=()),
+                    "application/xml",
+                )
+            ),
+            RETRIEVED,
+        )
+
+
 def test_structure_discovery_captures_bounded_metadata_and_allowlisted_headers() -> None:
     request = build_structure_request()
     transport = FakeTransport(response(request.url))
@@ -805,14 +902,15 @@ def test_probe_rejects_missing_or_inconsistent_required_structure(payload: bytes
 @pytest.mark.parametrize(
     "dates",
     (
-        tuple(f"2023-01-{day:02d}" for day in range(1, 31)),
         tuple(f"2023-01-{day:02d}" for day in range(1, 31)) + ("2023-01-30",),
         ("not-a-date",) + tuple(f"2023-01-{day:02d}" for day in range(2, 32)),
         ("2022-12-31",) + tuple(f"2023-01-{day:02d}" for day in range(2, 32)),
         tuple(f"2023-01-{day:02d}" for day in range(1, 31)) + ("2023-02-01",),
     ),
 )
-def test_probe_requires_exact_complete_january_2023_date_set(dates: tuple[str, ...]) -> None:
+def test_probe_rejects_duplicate_malformed_or_out_of_window_dates(
+    dates: tuple[str, ...],
+) -> None:
     request = build_d_us_schema_probe_request(metadata_insufficient=True)
     with pytest.raises(DiscoveryFailure):
         execute_discovery(

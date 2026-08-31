@@ -710,10 +710,7 @@ def _parse_probe_structure_specific_xml(
     all_observations = [
         item for item in root.iter() if _local_name(item.tag) == "Obs"
     ]
-    if (
-        len(observations) != len(_PROBE_DATE_SET)
-        or all_observations != list(observations)
-    ):
+    if not observations or all_observations != list(observations):
         raise DiscoveryFailure("probe_date_set_mismatch")
 
     observed_dates: list[date] = []
@@ -735,8 +732,8 @@ def _parse_probe_structure_specific_xml(
         raise DiscoveryFailure("observation_outside_request")
     if len(set(observed_dates)) != len(observed_dates):
         raise DiscoveryFailure("duplicate_observation")
-    if set(observed_dates) != set(_PROBE_DATE_SET):
-        raise DiscoveryFailure("probe_date_set_mismatch")
+    if observed_dates != sorted(observed_dates):
+        raise DiscoveryFailure("observation_order_invalid")
 
     statuses, has_observation_confidence = _validate_probe_observation_values(
         observations
