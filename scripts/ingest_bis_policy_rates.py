@@ -27,6 +27,7 @@ from fxlab.data.policy_rates import (
     APPROVED_BIS_SERIES,
     APPROVED_REQUEST_END,
     APPROVED_REQUEST_START,
+    AUTHORITATIVE_BIS_RAW_STATUS_SEMANTICS,
     AUTHORITATIVE_D_AU_ACCEPT,
     AUTHORITATIVE_D_AU_URL,
     AUTHORITATIVE_D_CA_ACCEPT,
@@ -349,7 +350,8 @@ class AuthoritativeDUsManifest:
     status_semantics: tuple[str, ...]
     raw_sha256: str
     canonical_observation_hash: str
-    row_count: int
+    raw_row_count: int
+    numeric_observation_count: int
     min_observation_date: date
     max_observation_date: date
     retrieved_at: datetime
@@ -380,7 +382,8 @@ class AuthoritativeDAuManifest:
     status_semantics: tuple[str, ...]
     raw_sha256: str
     canonical_observation_hash: str
-    row_count: int
+    raw_row_count: int
+    numeric_observation_count: int
     min_observation_date: date
     max_observation_date: date
     retrieved_at: datetime
@@ -411,7 +414,8 @@ class AuthoritativeDCaManifest:
     status_semantics: tuple[str, ...]
     raw_sha256: str
     canonical_observation_hash: str
-    row_count: int
+    raw_row_count: int
+    numeric_observation_count: int
     min_observation_date: date
     max_observation_date: date
     retrieved_at: datetime
@@ -442,7 +446,8 @@ class AuthoritativeDChManifest:
     status_semantics: tuple[str, ...]
     raw_sha256: str
     canonical_observation_hash: str
-    row_count: int
+    raw_row_count: int
+    numeric_observation_count: int
     min_observation_date: date
     max_observation_date: date
     retrieved_at: datetime
@@ -473,7 +478,8 @@ class AuthoritativeDXmManifest:
     status_semantics: tuple[str, ...]
     raw_sha256: str
     canonical_observation_hash: str
-    row_count: int
+    raw_row_count: int
+    numeric_observation_count: int
     min_observation_date: date
     max_observation_date: date
     retrieved_at: datetime
@@ -504,7 +510,8 @@ class AuthoritativeDJpManifest:
     status_semantics: tuple[str, ...]
     raw_sha256: str
     canonical_observation_hash: str
-    row_count: int
+    raw_row_count: int
+    numeric_observation_count: int
     min_observation_date: date
     max_observation_date: date
     retrieved_at: datetime
@@ -543,10 +550,11 @@ def _authoritative_d_us_manifest(
         "reference_area": "US",
         "unit_measure": "368",
         "unit_mult": "0",
-        "status_semantics": ("A=normal",),
+        "status_semantics": AUTHORITATIVE_BIS_RAW_STATUS_SEMANTICS,
         "raw_sha256": raw_sha256,
         "canonical_observation_hash": observation_hash,
-        "row_count": len(observations),
+        "raw_row_count": len(observations),
+        "numeric_observation_count": len(observations),
         "min_observation_date": observations[0].observation_date,
         "max_observation_date": observations[-1].observation_date,
     }
@@ -592,7 +600,8 @@ def _authoritative_sparse_manifest_values(
     if retrieved_at.tzinfo is None or retrieved_at.utcoffset() is None:
         raise ValueError("retrieval timestamp must be timezone-aware")
     retrieved = retrieved_at.astimezone(UTC)
-    observations = parse_authoritative_bis_sdmx(response.raw_bytes, request)
+    parsed = parse_authoritative_bis_sdmx(response.raw_bytes, request)
+    observations = parsed.observations
     raw_sha256 = hashlib.sha256(response.raw_bytes).hexdigest()
     observation_hash = canonical_sha256(observations)
     semantic = {
@@ -605,10 +614,11 @@ def _authoritative_sparse_manifest_values(
         "reference_area": reference_area,
         "unit_measure": "368",
         "unit_mult": "0",
-        "status_semantics": ("A=normal",),
+        "status_semantics": AUTHORITATIVE_BIS_RAW_STATUS_SEMANTICS,
         "raw_sha256": raw_sha256,
         "canonical_observation_hash": observation_hash,
-        "row_count": len(observations),
+        "raw_row_count": parsed.raw_row_count,
+        "numeric_observation_count": parsed.numeric_observation_count,
         "min_observation_date": observations[0].observation_date,
         "max_observation_date": observations[-1].observation_date,
     }

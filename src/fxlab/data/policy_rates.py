@@ -111,6 +111,10 @@ APPROVED_PAIRS = (
 )
 APPROVED_BIS_OBSERVATION_STATUS_SEMANTICS = ("A=normal",)
 APPROVED_BIS_OBSERVATION_STATUS_CODES = frozenset({"A"})
+AUTHORITATIVE_BIS_RAW_STATUS_SEMANTICS = (
+    "A=normal",
+    "M=missing_value_data_cannot_exist",
+)
 OFFICIAL_DOMAINS: Mapping[str, str] = MappingProxyType(
     {
         "AUD": "rba.gov.au",
@@ -383,6 +387,36 @@ class PolicyRateObservation:
 
 
 @dataclass(frozen=True)
+class AuthoritativePolicyRateParseResult(Sequence[PolicyRateObservation]):
+    """Typed separation between returned BIS rows and accepted numeric observations."""
+
+    raw_row_count: int
+    observations: tuple[PolicyRateObservation, ...]
+    numeric_observation_count: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.raw_row_count, bool)
+            or not isinstance(self.raw_row_count, int)
+            or self.raw_row_count < 1
+        ):
+            raise ValueError("raw_row_count must be a positive integer")
+        observations = tuple(self.observations)
+        if not observations or len(observations) > self.raw_row_count:
+            raise ValueError("numeric observations must be a non-empty raw-row subset")
+        object.__setattr__(self, "observations", observations)
+        object.__setattr__(self, "numeric_observation_count", len(observations))
+
+    def __len__(self) -> int:
+        return self.numeric_observation_count
+
+    def __getitem__(
+        self, index: int | slice
+    ) -> PolicyRateObservation | tuple[PolicyRateObservation, ...]:
+        return self.observations[index]
+
+
+@dataclass(frozen=True)
 class PolicyRateMetadata:
     agency: str
     dataflow: str
@@ -645,15 +679,16 @@ def parse_authoritative_bis_d_us_sdmx(
 def parse_authoritative_bis_sdmx(
     raw_bytes: object,
     request: PolicyRateRequest,
-) -> tuple[PolicyRateObservation, ...]:
-    """Parse one approved authoritative series without normalizing missing values."""
+) -> AuthoritativePolicyRateParseResult:
+    """Parse raw rows while emitting numeric observations only for A + finite."""
 
     if not isinstance(raw_bytes, bytes):
         raise PolicyRateQualificationError("authoritative_raw_bytes_required")
     if not isinstance(request, PolicyRateRequest):
         raise PolicyRateQualificationError("request_not_approved")
     if request == authoritative_d_us_request():
-        return parse_authoritative_bis_d_us_sdmx(raw_bytes, request)
+        observations = parse_authoritative_bis_d_us_sdmx(raw_bytes, request)
+        return AuthoritativePolicyRateParseResult(len(observations), observations)
 
     root, namespaces = _authoritative_sdmx_root_and_namespaces(raw_bytes)
     if root.tag != _D_US_ROOT_QNAME or _D_US_STRUCTURE_NAMESPACE not in namespaces.values():
@@ -749,11 +784,9 @@ def parse_authoritative_bis_sdmx(
         status = observation.attrib.get("OBS_STATUS")
         value = observation.attrib.get("OBS_VALUE")
         if status == "M" and value == "NaN":
-            raise PolicyRateQualificationError(
-                "missing_observation_normalization_unresolved"
-            )
+            continue
         if status != "A":
-            raise PolicyRateQualificationError("observation_status_invalid")
+            raise PolicyRateQualificationError("observation_status_value_invalid")
         if value is None:
             raise PolicyRateQualificationError("observation_value_invalid")
         try:
@@ -765,7 +798,12 @@ def parse_authoritative_bis_sdmx(
         observations.append(
             PolicyRateObservation(request.series.series_key, observed, parsed_value, "A")
         )
-    return tuple(observations)
+    if not observations:
+        raise PolicyRateQualificationError("numeric_observations_missing")
+    return AuthoritativePolicyRateParseResult(
+        raw_row_count=len(observation_elements),
+        observations=tuple(observations),
+    )
 
 
 @dataclass(frozen=True, init=False)
@@ -781,7 +819,8 @@ class PolicyRateSeriesManifest:
     manifest_id: str
     parsed_min_observation_date: date = field(init=False)
     parsed_max_observation_date: date = field(init=False)
-    row_count: int = field(init=False)
+    raw_row_count: int = field(init=False)
+    numeric_observation_count: int = field(init=False)
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         del args, kwargs
@@ -820,6 +859,8 @@ class PolicyRateSeriesManifest:
                 "metadata_identity": metadata.stable_identity,
                 "raw_sha256": raw_hash,
                 "canonical_observation_hash": observation_hash,
+                "raw_row_count": len(rows),
+                "numeric_observation_count": len(rows),
                 "revision": metadata.revision,
             }
         )
@@ -845,7 +886,8 @@ class PolicyRateSeriesManifest:
             ("manifest_id", manifest),
             ("parsed_min_observation_date", rows[0].observation_date),
             ("parsed_max_observation_date", rows[-1].observation_date),
-            ("row_count", len(rows)),
+            ("raw_row_count", len(rows)),
+            ("numeric_observation_count", len(rows)),
         ):
             object.__setattr__(instance, name, value)
         return instance

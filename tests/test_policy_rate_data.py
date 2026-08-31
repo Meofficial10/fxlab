@@ -288,10 +288,10 @@ def authoritative_sparse_xml(
     ).encode()
 
 
-def _parse_authoritative_sparse(raw: object):
+def _parse_authoritative_sparse(raw: object, currency: str = "AUD"):
     from fxlab.data.policy_rates import parse_authoritative_bis_sdmx
 
-    return parse_authoritative_bis_sdmx(raw, request("AUD"))
+    return parse_authoritative_bis_sdmx(raw, request(currency))
 
 
 def test_authoritative_sparse_a_only_series_preserves_exact_observations() -> None:
@@ -352,9 +352,15 @@ def test_authoritative_sparse_a_status_rejects_nonfinite_or_malformed_values(
         )
 
 
-def test_authoritative_sparse_m_nan_fails_closed_pending_normalization_contract() -> None:
+@pytest.mark.parametrize(
+    ("currency", "reference_area"),
+    (("AUD", "AU"), ("CAD", "CA"), ("GBP", "GB"), ("NZD", "NZ")),
+)
+def test_authoritative_sparse_m_nan_is_raw_only_uniformly(
+    currency: str, reference_area: str
+) -> None:
     raw = authoritative_sparse_xml(
-        reference_area="AU",
+        reference_area=reference_area,
         observations=(
             ("2014-01-03", "2.50", "A"),
             ("2014-01-07", "NaN", "M"),
@@ -362,9 +368,50 @@ def test_authoritative_sparse_m_nan_fails_closed_pending_normalization_contract(
         ),
     )
 
+    parsed = _parse_authoritative_sparse(raw, currency)
+
+    assert parsed.raw_row_count == 3
+    assert parsed.numeric_observation_count == 2
+    assert tuple(item.observation_date for item in parsed.observations) == (
+        date(2014, 1, 3),
+        date(2014, 1, 31),
+    )
+    assert tuple(item.value for item in parsed.observations) == (
+        Decimal("2.50"),
+        Decimal("2.75"),
+    )
+    assert all(item.status == "A" for item in parsed.observations)
+
+
+@pytest.mark.parametrize(
+    ("status", "value", "reason"),
+    (
+        ("A", "NaN", "observation_value_invalid"),
+        ("M", "2.50", "observation_status_value_invalid"),
+        ("X", "2.50", "observation_status_value_invalid"),
+        ("X", "NaN", "observation_status_value_invalid"),
+    ),
+)
+def test_authoritative_sparse_rejects_unsupported_status_value_combinations(
+    status: str, value: str, reason: str
+) -> None:
+    raw = authoritative_sparse_xml(
+        reference_area="AU",
+        observations=(("2014-01-03", value, status),),
+    )
+
+    with pytest.raises(PolicyRateQualificationError, match=reason):
+        _parse_authoritative_sparse(raw)
+
+
+def test_authoritative_sparse_m_without_literal_nan_fails_closed() -> None:
+    raw = authoritative_sparse_xml(
+        reference_area="AU",
+        observations=(("2014-01-03", "NaN", "M"),),
+    ).replace(b' OBS_VALUE="NaN"', b"")
+
     with pytest.raises(
-        PolicyRateQualificationError,
-        match="missing_observation_normalization_unresolved",
+        PolicyRateQualificationError, match="observation_status_value_invalid"
     ):
         _parse_authoritative_sparse(raw)
 
@@ -858,10 +905,14 @@ def test_authoritative_d_us_offline_end_to_end_integration(
             "reference_area": "US",
             "unit_measure": "368",
             "unit_mult": "0",
-            "status_semantics": ("A=normal",),
+            "status_semantics": (
+                "A=normal",
+                "M=missing_value_data_cannot_exist",
+            ),
             "raw_sha256": hashlib.sha256(raw).hexdigest(),
             "canonical_observation_hash": manifest.canonical_observation_hash,
-            "row_count": 3652,
+            "raw_row_count": 3652,
+            "numeric_observation_count": 3652,
             "min_observation_date": date(2014, 1, 1),
             "max_observation_date": date(2023, 12, 31),
         }
@@ -1133,12 +1184,16 @@ def test_authoritative_d_us_manifest_binds_frozen_semantic_evidence(
         "US",
     )
     assert (manifest.unit_measure, manifest.unit_mult) == ("368", "0")
-    assert manifest.status_semantics == ("A=normal",)
+    assert manifest.status_semantics == (
+        "A=normal",
+        "M=missing_value_data_cannot_exist",
+    )
     assert manifest.raw_sha256 == hashlib.sha256(raw).hexdigest()
     assert manifest.canonical_observation_hash == canonical_sha256(
         parse_authoritative_bis_d_us_sdmx(raw, item)
     )
-    assert manifest.row_count == 3652
+    assert manifest.raw_row_count == 3652
+    assert manifest.numeric_observation_count == 3652
     assert manifest.min_observation_date == date(2014, 1, 1)
     assert manifest.max_observation_date == date(2023, 12, 31)
 
@@ -1344,15 +1399,21 @@ def test_authoritative_d_au_publication_is_atomic_and_binds_sparse_manifest(
         "AU",
     )
     assert (manifest.unit_measure, manifest.unit_mult) == ("368", "0")
-    assert manifest.status_semantics == ("A=normal",)
+    assert manifest.status_semantics == (
+        "A=normal",
+        "M=missing_value_data_cannot_exist",
+    )
     assert manifest.raw_sha256 == hashlib.sha256(raw).hexdigest()
-    assert manifest.canonical_observation_hash == canonical_sha256(observations)
-    assert manifest.row_count == len(observations) == 3
+    assert manifest.canonical_observation_hash == canonical_sha256(
+        observations.observations
+    )
+    assert manifest.raw_row_count == 3
+    assert manifest.numeric_observation_count == len(observations) == 3
     assert manifest.min_observation_date == date(2014, 1, 3)
     assert manifest.max_observation_date == date(2023, 12, 29)
 
 
-def test_authoritative_d_au_m_nan_never_publishes(
+def test_authoritative_d_au_m_nan_publishes_raw_without_numeric_missing_row(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import scripts.ingest_bis_policy_rates as ingestion
@@ -1370,14 +1431,13 @@ def test_authoritative_d_au_m_nan_never_publishes(
         ),
     )
 
-    with pytest.raises(
-        PolicyRateQualificationError,
-        match="missing_observation_normalization_unresolved",
-    ):
-        ingestion.acquire_and_publish_authoritative_d_au(
-            item, _authoritative_d_au_transport(raw), RETRIEVED
-        )
-    assert not root.exists()
+    published = ingestion.acquire_and_publish_authoritative_d_au(
+        item, _authoritative_d_au_transport(raw), RETRIEVED
+    )
+
+    assert published.raw_path.read_bytes() == raw
+    assert published.manifest.raw_row_count == 2
+    assert published.manifest.numeric_observation_count == 1
 
 
 def test_authoritative_d_au_existing_destination_precedes_transport(
@@ -1552,20 +1612,33 @@ def test_authoritative_d_ca_publication_binds_exact_sparse_observations(
         "CA",
     )
     assert (manifest.unit_measure, manifest.unit_mult) == ("368", "0")
-    assert manifest.status_semantics == ("A=normal",)
+    assert manifest.status_semantics == (
+        "A=normal",
+        "M=missing_value_data_cannot_exist",
+    )
     assert manifest.raw_sha256 == hashlib.sha256(raw).hexdigest()
-    assert manifest.canonical_observation_hash == canonical_sha256(observations)
-    assert manifest.row_count == len(observations) == 3
+    assert manifest.canonical_observation_hash == canonical_sha256(
+        observations.observations
+    )
+    assert manifest.raw_row_count == 3
+    assert manifest.numeric_observation_count == len(observations) == 3
     assert manifest.min_observation_date == date(2014, 1, 3)
     assert manifest.max_observation_date == date(2023, 12, 29)
 
 
-def test_authoritative_d_ca_m_nan_remains_fail_closed_without_publication(
+def test_authoritative_d_ca_m_nan_is_preserved_raw_and_excluded_from_numeric_rows(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import hashlib
+    import json
+
     import scripts.ingest_bis_policy_rates as ingestion
 
-    from fxlab.data.policy_rates import authoritative_d_ca_request
+    from fxlab.data.policy_rates import (
+        authoritative_d_ca_request,
+        canonical_sha256,
+        parse_authoritative_bis_sdmx,
+    )
 
     root = tmp_path / "authoritative"
     monkeypatch.setattr(ingestion, "AUTHORITATIVE_BIS_ROOT", root)
@@ -1575,17 +1648,75 @@ def test_authoritative_d_ca_m_nan_remains_fail_closed_without_publication(
         observations=(
             ("2014-01-03", "1.00", "A"),
             ("2014-01-04", "NaN", "M"),
+            ("2023-12-29", "5.00", "A"),
         ),
     )
 
-    with pytest.raises(
-        PolicyRateQualificationError,
-        match="missing_observation_normalization_unresolved",
-    ):
-        ingestion.acquire_and_publish_authoritative_d_ca(
-            item, _authoritative_d_ca_transport(raw), RETRIEVED
+    published = ingestion.acquire_and_publish_authoritative_d_ca(
+        item, _authoritative_d_ca_transport(raw), RETRIEVED
+    )
+    parsed = parse_authoritative_bis_sdmx(raw, item)
+
+    assert published.raw_path.read_bytes() == raw
+    assert published.manifest.raw_sha256 == hashlib.sha256(raw).hexdigest()
+    assert published.manifest.raw_row_count == 3
+    assert published.manifest.numeric_observation_count == 2
+    persisted = json.loads(published.manifest_path.read_text(encoding="utf-8"))
+    assert persisted["raw_row_count"] == 3
+    assert persisted["numeric_observation_count"] == 2
+    assert "row_count" not in persisted
+    assert published.manifest.canonical_observation_hash == canonical_sha256(
+        parsed.observations
+    )
+    assert tuple(item.observation_date for item in parsed.observations) == (
+        date(2014, 1, 3),
+        date(2023, 12, 29),
+    )
+
+
+def test_authoritative_m_nan_raw_provenance_changes_semantic_identity(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    from fxlab.data.policy_rates import authoritative_d_ca_request
+
+    item = authoritative_d_ca_request()
+    without_missing = authoritative_sparse_xml(
+        reference_area="CA",
+        observations=(
+            ("2014-01-03", "1.00", "A"),
+            ("2023-12-29", "5.00", "A"),
+        ),
+    )
+    with_missing = authoritative_sparse_xml(
+        reference_area="CA",
+        observations=(
+            ("2014-01-03", "1.00", "A"),
+            ("2019-10-30", "NaN", "M"),
+            ("2023-12-29", "5.00", "A"),
+        ),
+    )
+    manifests = []
+    for index, raw in enumerate((without_missing, with_missing)):
+        monkeypatch.setattr(
+            ingestion, "AUTHORITATIVE_BIS_ROOT", tmp_path / f"authoritative-{index}"
         )
-    assert not root.exists()
+        manifests.append(
+            ingestion.acquire_and_publish_authoritative_d_ca(
+                item, _authoritative_d_ca_transport(raw), RETRIEVED
+            ).manifest
+        )
+
+    assert manifests[0].canonical_observation_hash == (
+        manifests[1].canonical_observation_hash
+    )
+    assert manifests[0].numeric_observation_count == (
+        manifests[1].numeric_observation_count
+    ) == 2
+    assert (manifests[0].raw_row_count, manifests[1].raw_row_count) == (2, 3)
+    assert manifests[0].raw_sha256 != manifests[1].raw_sha256
+    assert manifests[0].dataset_id != manifests[1].dataset_id
 
 
 def test_authoritative_d_ca_existing_destination_precedes_transport(
@@ -1757,10 +1888,16 @@ def test_authoritative_d_ch_publication_binds_exact_sparse_observations(
         "CH",
     )
     assert (manifest.unit_measure, manifest.unit_mult) == ("368", "0")
-    assert manifest.status_semantics == ("A=normal",)
+    assert manifest.status_semantics == (
+        "A=normal",
+        "M=missing_value_data_cannot_exist",
+    )
     assert manifest.raw_sha256 == hashlib.sha256(raw).hexdigest()
-    assert manifest.canonical_observation_hash == canonical_sha256(observations)
-    assert manifest.row_count == len(observations) == 3
+    assert manifest.canonical_observation_hash == canonical_sha256(
+        observations.observations
+    )
+    assert manifest.raw_row_count == 3
+    assert manifest.numeric_observation_count == len(observations) == 3
     assert manifest.min_observation_date == date(2014, 1, 3)
     assert manifest.max_observation_date == date(2023, 12, 29)
 
@@ -1934,10 +2071,16 @@ def test_authoritative_d_xm_publication_binds_exact_sparse_observations(
         "XM",
     )
     assert (manifest.unit_measure, manifest.unit_mult) == ("368", "0")
-    assert manifest.status_semantics == ("A=normal",)
+    assert manifest.status_semantics == (
+        "A=normal",
+        "M=missing_value_data_cannot_exist",
+    )
     assert manifest.raw_sha256 == hashlib.sha256(raw).hexdigest()
-    assert manifest.canonical_observation_hash == canonical_sha256(observations)
-    assert manifest.row_count == len(observations) == 3
+    assert manifest.canonical_observation_hash == canonical_sha256(
+        observations.observations
+    )
+    assert manifest.raw_row_count == 3
+    assert manifest.numeric_observation_count == len(observations) == 3
     assert manifest.min_observation_date == date(2014, 1, 2)
     assert manifest.max_observation_date == date(2023, 12, 29)
 
@@ -2112,10 +2255,16 @@ def test_authoritative_d_jp_publication_binds_exact_sparse_observations(
         "JP",
     )
     assert (manifest.unit_measure, manifest.unit_mult) == ("368", "0")
-    assert manifest.status_semantics == ("A=normal",)
+    assert manifest.status_semantics == (
+        "A=normal",
+        "M=missing_value_data_cannot_exist",
+    )
     assert manifest.raw_sha256 == hashlib.sha256(raw).hexdigest()
-    assert manifest.canonical_observation_hash == canonical_sha256(observations)
-    assert manifest.row_count == len(observations) == 3
+    assert manifest.canonical_observation_hash == canonical_sha256(
+        observations.observations
+    )
+    assert manifest.raw_row_count == 3
+    assert manifest.numeric_observation_count == len(observations) == 3
     assert manifest.min_observation_date == date(2014, 1, 6)
     assert manifest.max_observation_date == date(2023, 12, 29)
 
@@ -2584,7 +2733,9 @@ def test_manifest_identities_are_canonical_and_retrieval_time_is_not_stable_iden
     persisted = asdict(first)
     assert persisted["parsed_min_observation_date"] == date(2014, 1, 1)
     assert persisted["parsed_max_observation_date"] == date(2014, 1, 2)
-    assert persisted["row_count"] == 2
+    assert persisted["raw_row_count"] == 2
+    assert persisted["numeric_observation_count"] == 2
+    assert "row_count" not in persisted
 
 
 def test_canonicalization_rejects_arbitrary_mapping_keys() -> None:
@@ -2644,7 +2795,8 @@ def test_manifest_computed_bindings_cannot_be_replaced_or_forged() -> None:
     for field_name, replacement in (
         ("raw_sha256", SHA_B),
         ("canonical_observation_hash", SHA_B),
-        ("row_count", 999),
+        ("raw_row_count", 999),
+        ("numeric_observation_count", 999),
         ("parsed_min_observation_date", date(2015, 1, 1)),
         ("parsed_max_observation_date", date(2015, 1, 2)),
         ("dataset_id", SHA_B),
