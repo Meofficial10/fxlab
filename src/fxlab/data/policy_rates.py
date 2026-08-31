@@ -577,6 +577,132 @@ def parse_authoritative_bis_d_us_sdmx(
     return tuple(observations)
 
 
+def parse_authoritative_bis_sdmx(
+    raw_bytes: object,
+    request: PolicyRateRequest,
+) -> tuple[PolicyRateObservation, ...]:
+    """Parse one approved authoritative series without normalizing missing values."""
+
+    if not isinstance(raw_bytes, bytes):
+        raise PolicyRateQualificationError("authoritative_raw_bytes_required")
+    if not isinstance(request, PolicyRateRequest):
+        raise PolicyRateQualificationError("request_not_approved")
+    if request == authoritative_d_us_request():
+        return parse_authoritative_bis_d_us_sdmx(raw_bytes, request)
+
+    root, namespaces = _authoritative_sdmx_root_and_namespaces(raw_bytes)
+    if root.tag != _D_US_ROOT_QNAME or _D_US_STRUCTURE_NAMESPACE not in namespaces.values():
+        raise PolicyRateQualificationError("response_schema_invalid")
+
+    header_qname = f"{{{_SDMX_21_MESSAGE_NAMESPACE}}}Header"
+    structure_qname = f"{{{_SDMX_21_MESSAGE_NAMESPACE}}}Structure"
+    usage_qname = f"{{{_SDMX_21_COMMON_NAMESPACE}}}StructureUsage"
+    headers = root.findall(header_qname)
+    if len(headers) != 1:
+        raise PolicyRateQualificationError("response_series_mismatch")
+    structures = headers[0].findall(structure_qname)
+    if len(structures) != 1:
+        raise PolicyRateQualificationError("response_series_mismatch")
+    structure = structures[0]
+    if (
+        structure.attrib.get("structureID") != _D_US_STRUCTURE_REFERENCE
+        or structure.attrib.get("namespace") != _D_US_STRUCTURE_NAMESPACE
+        or structure.attrib.get("dimensionAtObservation") != "TIME_PERIOD"
+    ):
+        raise PolicyRateQualificationError("response_series_mismatch")
+    usages = structure.findall(usage_qname)
+    references = list(usages[0]) if len(usages) == 1 else []
+    if len(references) != 1 or references[0].tag != "Ref" or (
+        references[0].attrib.get("agencyID"),
+        references[0].attrib.get("id"),
+        references[0].attrib.get("version"),
+    ) != ("BIS", "WS_CBPOL", "1.0"):
+        raise PolicyRateQualificationError("response_series_mismatch")
+
+    dataset_qname = f"{{{_SDMX_21_MESSAGE_NAMESPACE}}}DataSet"
+    datasets = root.findall(dataset_qname)
+    all_datasets = [item for item in root.iter() if item.tag.rsplit("}", 1)[-1] == "DataSet"]
+    if len(datasets) != 1 or all_datasets != datasets:
+        raise PolicyRateQualificationError("response_schema_invalid")
+    dataset = datasets[0]
+    if (
+        dataset.attrib.get(_D_US_DATA_SCOPE_QNAME) != "DataStructure"
+        or dataset.attrib.get(_D_US_STRUCTURE_REF_QNAME) != _D_US_STRUCTURE_REFERENCE
+        or _expanded_sdmx_qname(
+            dataset.attrib.get(f"{{{_XSI_NAMESPACE}}}type"), namespaces
+        )
+        != f"{{{_D_US_STRUCTURE_NAMESPACE}}}DataSetType"
+    ):
+        raise PolicyRateQualificationError("response_series_mismatch")
+    if (
+        dataset.attrib.get("UNIT_MEASURE") != "368"
+        or dataset.attrib.get("UNIT_MULT") != "0"
+    ):
+        raise PolicyRateQualificationError("response_unit_mismatch")
+
+    series = [item for item in dataset if item.tag == "Series"]
+    all_series = [item for item in root.iter() if item.tag.rsplit("}", 1)[-1] == "Series"]
+    if len(series) != 1 or all_series != series:
+        raise PolicyRateQualificationError("response_schema_invalid")
+    series_element = series[0]
+    expected_area = request.series.series_key.split(".", 1)[1]
+    if (
+        series_element.attrib.get("FREQ") != "D"
+        or series_element.attrib.get("REF_AREA") != expected_area
+    ):
+        raise PolicyRateQualificationError("response_series_mismatch")
+
+    observation_elements = tuple(item for item in series_element if item.tag == "Obs")
+    all_observations = [
+        item for item in root.iter() if item.tag.rsplit("}", 1)[-1] == "Obs"
+    ]
+    if not observation_elements or all_observations != list(observation_elements):
+        raise PolicyRateQualificationError("response_schema_invalid")
+
+    observed_dates: list[date] = []
+    for observation in observation_elements:
+        timestamp = observation.attrib.get("TIME_PERIOD")
+        try:
+            if timestamp is None or len(timestamp) != 10:
+                raise ValueError
+            observed = date.fromisoformat(timestamp)
+        except (TypeError, ValueError) as exc:
+            raise PolicyRateQualificationError("observation_timestamp_invalid") from exc
+        if observed > MAX_OBSERVATION_DATE:
+            raise PolicyRateQualificationError("sealed_window_violation")
+        if observed < request.start or observed > request.end:
+            raise PolicyRateQualificationError("observation_outside_request")
+        observed_dates.append(observed)
+
+    if len(set(observed_dates)) != len(observed_dates):
+        raise PolicyRateQualificationError("duplicate_observation")
+    if observed_dates != sorted(observed_dates):
+        raise PolicyRateQualificationError("observation_order_invalid")
+
+    observations: list[PolicyRateObservation] = []
+    for observed, observation in zip(observed_dates, observation_elements, strict=True):
+        status = observation.attrib.get("OBS_STATUS")
+        value = observation.attrib.get("OBS_VALUE")
+        if status == "M" and value == "NaN":
+            raise PolicyRateQualificationError(
+                "missing_observation_normalization_unresolved"
+            )
+        if status != "A":
+            raise PolicyRateQualificationError("observation_status_invalid")
+        if value is None:
+            raise PolicyRateQualificationError("observation_value_invalid")
+        try:
+            parsed_value = Decimal(value)
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise PolicyRateQualificationError("observation_value_invalid") from exc
+        if not parsed_value.is_finite():
+            raise PolicyRateQualificationError("observation_value_invalid")
+        observations.append(
+            PolicyRateObservation(request.series.series_key, observed, parsed_value, "A")
+        )
+    return tuple(observations)
+
+
 @dataclass(frozen=True, init=False)
 class PolicyRateSeriesManifest:
     request: PolicyRateRequest

@@ -257,6 +257,176 @@ def test_authoritative_d_us_adversarial_dtd_or_entity_fails(
         parse_authoritative_bis_d_us_sdmx(raw, authoritative_d_us_request())
 
 
+def authoritative_sparse_xml(
+    *,
+    reference_area: str,
+    observations: tuple[tuple[str, str, str], ...],
+) -> bytes:
+    observation_xml = "".join(
+        f'<Obs TIME_PERIOD="{observed}" OBS_VALUE="{value}" OBS_STATUS="{status}" />'
+        for observed, value, status in observations
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<mes:StructureSpecificData '
+        'xmlns:mes="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message" '
+        'xmlns:com="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common" '
+        'xmlns:ss="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/data/structurespecific" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        'xmlns:cbpol="urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow='
+        'BIS:WS_CBPOL(1.0):ObsLevelDim:TIME_PERIOD">'
+        '<mes:Header><mes:Structure structureID="BIS_WS_CBPOL_1_0" '
+        'namespace="urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow='
+        'BIS:WS_CBPOL(1.0):ObsLevelDim:TIME_PERIOD" '
+        'dimensionAtObservation="TIME_PERIOD"><com:StructureUsage><Ref '
+        'agencyID="BIS" id="WS_CBPOL" version="1.0" /></com:StructureUsage>'
+        '</mes:Structure></mes:Header>'
+        '<mes:DataSet UNIT_MEASURE="368" UNIT_MULT="0" '
+        'ss:dataScope="DataStructure" ss:structureRef="BIS_WS_CBPOL_1_0" '
+        f'xsi:type="cbpol:DataSetType"><Series FREQ="D" REF_AREA="{reference_area}">'
+        f"{observation_xml}</Series></mes:DataSet></mes:StructureSpecificData>"
+    ).encode()
+
+
+def _parse_authoritative_sparse(raw: object):
+    from fxlab.data.policy_rates import parse_authoritative_bis_sdmx
+
+    return parse_authoritative_bis_sdmx(raw, request("AUD"))
+
+
+def test_authoritative_sparse_a_only_series_preserves_exact_observations() -> None:
+    supplied = (
+        ("2014-01-03", "2.50", "A"),
+        ("2014-01-07", "2.50", "A"),
+        ("2014-01-31", "2.75", "A"),
+    )
+
+    parsed = _parse_authoritative_sparse(
+        authoritative_sparse_xml(reference_area="AU", observations=supplied)
+    )
+
+    assert tuple(item.observation_date.isoformat() for item in parsed) == tuple(
+        item[0] for item in supplied
+    )
+    assert tuple(item.value for item in parsed) == tuple(
+        Decimal(item[1]) for item in supplied
+    )
+    assert tuple(item.status for item in parsed) == ("A", "A", "A")
+    assert len(parsed) == len(supplied)
+
+
+@pytest.mark.parametrize(
+    ("observations", "reason"),
+    (
+        (
+            (("2014-01-03", "2.50", "A"), ("2014-01-03", "2.75", "A")),
+            "duplicate_observation",
+        ),
+        (
+            (("2014-01-07", "2.50", "A"), ("2014-01-03", "2.75", "A")),
+            "observation_order_invalid",
+        ),
+        ((("2013-12-31", "2.50", "A"),), "observation_outside_request"),
+        ((("2024-01-01", "2.50", "A"),), "sealed_window_violation"),
+    ),
+)
+def test_authoritative_sparse_series_rejects_invalid_date_sequences(
+    observations: tuple[tuple[str, str, str], ...], reason: str
+) -> None:
+    with pytest.raises(PolicyRateQualificationError, match=reason):
+        _parse_authoritative_sparse(
+            authoritative_sparse_xml(reference_area="AU", observations=observations)
+        )
+
+
+@pytest.mark.parametrize("value", ("NaN", "Infinity", "not-a-number"))
+def test_authoritative_sparse_a_status_rejects_nonfinite_or_malformed_values(
+    value: str,
+) -> None:
+    with pytest.raises(PolicyRateQualificationError, match="observation_value_invalid"):
+        _parse_authoritative_sparse(
+            authoritative_sparse_xml(
+                reference_area="AU",
+                observations=(("2014-01-03", value, "A"),),
+            )
+        )
+
+
+def test_authoritative_sparse_m_nan_fails_closed_pending_normalization_contract() -> None:
+    raw = authoritative_sparse_xml(
+        reference_area="AU",
+        observations=(
+            ("2014-01-03", "2.50", "A"),
+            ("2014-01-07", "NaN", "M"),
+            ("2014-01-31", "2.75", "A"),
+        ),
+    )
+
+    with pytest.raises(
+        PolicyRateQualificationError,
+        match="missing_observation_normalization_unresolved",
+    ):
+        _parse_authoritative_sparse(raw)
+
+
+def test_authoritative_sparse_canonical_identity_binds_only_exact_observations() -> None:
+    original = _parse_authoritative_sparse(
+        authoritative_sparse_xml(
+            reference_area="AU",
+            observations=(
+                ("2014-01-03", "2.50", "A"),
+                ("2014-01-31", "2.75", "A"),
+            ),
+        )
+    )
+    changed_date = _parse_authoritative_sparse(
+        authoritative_sparse_xml(
+            reference_area="AU",
+            observations=(
+                ("2014-01-04", "2.50", "A"),
+                ("2014-01-31", "2.75", "A"),
+            ),
+        )
+    )
+    changed_value = _parse_authoritative_sparse(
+        authoritative_sparse_xml(
+            reference_area="AU",
+            observations=(
+                ("2014-01-03", "2.51", "A"),
+                ("2014-01-31", "2.75", "A"),
+            ),
+        )
+    )
+
+    assert len(original) == len(changed_date) == len(changed_value) == 2
+    assert (
+    len(
+        {
+            canonical_sha256(original),
+            canonical_sha256(changed_date),
+            canonical_sha256(changed_value),
+        }
+    )
+    == 3
+)
+
+
+def test_authoritative_sparse_parser_rejects_discovery_artifact_input() -> None:
+    discovery_artifact = {
+        "classification": "NON_AUTHORITATIVE_DISCOVERY",
+        "raw_bytes": authoritative_sparse_xml(
+            reference_area="AU",
+            observations=(("2014-01-03", "2.50", "A"),),
+        ),
+    }
+
+    with pytest.raises(
+        PolicyRateQualificationError,
+        match="authoritative_raw_bytes_required",
+    ):
+        _parse_authoritative_sparse(discovery_artifact)
+
+
 class FakeAuthoritativeTransport:
     def __init__(self, response: object = None, error: Exception | None = None):
         self.response = response
