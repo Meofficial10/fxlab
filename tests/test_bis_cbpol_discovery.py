@@ -394,6 +394,137 @@ def test_probe_is_fixed_to_d_us_and_predeclared_pre_2024_dates() -> None:
         replace(request, end=date(2024, 1, 1))
 
 
+@pytest.mark.parametrize(
+    ("target_value", "series_key"),
+    (
+        ("d_au_schema_probe", "D.AU"),
+        ("d_ca_schema_probe", "D.CA"),
+        ("d_ch_schema_probe", "D.CH"),
+        ("d_xm_schema_probe", "D.XM"),
+        ("d_gb_schema_probe", "D.GB"),
+        ("d_jp_schema_probe", "D.JP"),
+        ("d_nz_schema_probe", "D.NZ"),
+        ("d_us_schema_probe", "D.US"),
+    ),
+)
+def test_generalized_schema_probe_targets_are_exactly_allowlisted(
+    target_value: str, series_key: str
+) -> None:
+    target = DiscoveryTarget(target_value)
+    request = discovery.build_schema_probe_request(target, metadata_insufficient=True)
+
+    assert request.target is target
+    assert request.series_key == series_key
+    assert request.start == date(2023, 1, 1)
+    assert request.end == date(2023, 1, 31)
+    assert request.url == (
+        f"https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/{series_key}"
+        "?startPeriod=2023-01-01&endPeriod=2023-01-31"
+    )
+    assert request.accept == STRUCTURE_SPECIFIC_MEDIA_TYPE
+    with pytest.raises(DiscoveryFailure, match="request_not_approved"):
+        replace(request, series_key="D.US" if series_key != "D.US" else "D.AU")
+
+
+@pytest.mark.parametrize(
+    ("target_value", "reference_area"),
+    (
+        ("d_au_schema_probe", "AU"),
+        ("d_ca_schema_probe", "CA"),
+        ("d_ch_schema_probe", "CH"),
+        ("d_xm_schema_probe", "XM"),
+        ("d_gb_schema_probe", "GB"),
+        ("d_jp_schema_probe", "JP"),
+        ("d_nz_schema_probe", "NZ"),
+        ("d_us_schema_probe", "US"),
+    ),
+)
+def test_generalized_schema_probe_validates_series_and_stays_non_authoritative(
+    target_value: str, reference_area: str
+) -> None:
+    request = discovery.build_schema_probe_request(
+        DiscoveryTarget(target_value), metadata_insufficient=True
+    )
+    transport = FakeTransport(
+        response(request.url, probe_xml(reference_area=reference_area), "application/xml")
+    )
+
+    artifact = execute_discovery(request, transport, RETRIEVED).artifact
+
+    assert len(transport.calls) == 1
+    assert artifact.classification == DISCOVERY_CLASSIFICATION
+    assert artifact.authoritative_qualification_eligible is False
+    assert artifact.final_run_identity_eligible is False
+    assert artifact.r4_evidence_eligible is False
+
+
+@pytest.mark.parametrize(
+    "target_value",
+    (
+        "d_au_schema_probe",
+        "d_ca_schema_probe",
+        "d_ch_schema_probe",
+        "d_xm_schema_probe",
+        "d_gb_schema_probe",
+        "d_jp_schema_probe",
+        "d_nz_schema_probe",
+    ),
+)
+def test_generalized_schema_probe_cli_executes_one_explicit_action(
+    monkeypatch, target_value: str
+) -> None:
+    built_transports: list[object] = []
+    executed: list[tuple[object, object, datetime]] = []
+
+    def build_transport() -> object:
+        transport = object()
+        built_transports.append(transport)
+        return transport
+
+    def execute(request, transport, retrieved_at):
+        executed.append((request, transport, retrieved_at))
+        return object(), (Path("response.bin"), Path("discovery.json"))
+
+    monkeypatch.setattr(discovery, "_build_network_transport", build_transport)
+    monkeypatch.setattr(discovery, "execute_and_persist_discovery", execute)
+
+    assert (
+        discovery.main(
+            [
+                "--authorize-network-discovery",
+                "--metadata-insufficient",
+                "--target",
+                target_value,
+            ]
+        )
+        == 0
+    )
+    assert len(built_transports) == len(executed) == 1
+    request, transport, retrieved_at = executed[0]
+    assert request.target.value == target_value
+    assert transport is built_transports[0]
+    assert retrieved_at.tzinfo is UTC
+
+
+def test_generalized_schema_probe_construction_failure_is_network_free(monkeypatch) -> None:
+    monkeypatch.setattr(
+        discovery,
+        "_build_network_transport",
+        lambda: pytest.fail("network transport must not be constructed"),
+    )
+
+    with pytest.raises(SystemExit, match="network_acquisition_not_authorized"):
+        discovery.main(["--target", "d_au_schema_probe", "--metadata-insufficient"])
+    with pytest.raises(DiscoveryFailure, match="metadata_discovery_required_first"):
+        discovery.main(
+            [
+                "--authorize-network-discovery",
+                "--target",
+                "d_au_schema_probe",
+            ]
+        )
+
+
 def test_structure_discovery_captures_bounded_metadata_and_allowlisted_headers() -> None:
     request = build_structure_request()
     transport = FakeTransport(response(request.url))

@@ -26,7 +26,12 @@ from types import MappingProxyType
 from typing import Protocol
 from urllib.parse import parse_qsl, urlsplit
 
-from fxlab.data.policy_rates import MAX_OBSERVATION_DATE, canonical_json, canonical_sha256
+from fxlab.data.policy_rates import (
+    APPROVED_BIS_SERIES,
+    MAX_OBSERVATION_DATE,
+    canonical_json,
+    canonical_sha256,
+)
 
 DISCOVERY_CLASSIFICATION = "NON_AUTHORITATIVE_DISCOVERY"
 FAILED_DISCOVERY_CLASSIFICATION = "NON_AUTHORITATIVE_DISCOVERY_FAILED"
@@ -43,10 +48,8 @@ _STRUCTURE_URL = (
     "https://stats.bis.org/api/v2/structure/dataflow/BIS/WS_CBPOL/1.0"
     "?detail=referencepartial&references=descendants"
 )
-_PROBE_URL = (
-    "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.US"
-    "?startPeriod=2023-01-01&endPeriod=2023-01-31"
-)
+_PROBE_URL_PREFIX = "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/"
+_PROBE_QUERY = "?startPeriod=2023-01-01&endPeriod=2023-01-31"
 _STRUCTURE_ACCEPT = "application/vnd.sdmx.structure+xml;version=2.1"
 _PROBE_ACCEPT = "application/vnd.sdmx.structurespecificdata+xml;version=2.1"
 _RETAINED_HEADERS = frozenset(
@@ -105,7 +108,32 @@ class DiscoveryFailure(ValueError):
 
 class DiscoveryTarget(StrEnum):
     STRUCTURE = "structure"
+    D_AU_SCHEMA_PROBE = "d_au_schema_probe"
+    D_CA_SCHEMA_PROBE = "d_ca_schema_probe"
+    D_CH_SCHEMA_PROBE = "d_ch_schema_probe"
+    D_XM_SCHEMA_PROBE = "d_xm_schema_probe"
+    D_GB_SCHEMA_PROBE = "d_gb_schema_probe"
+    D_JP_SCHEMA_PROBE = "d_jp_schema_probe"
+    D_NZ_SCHEMA_PROBE = "d_nz_schema_probe"
     D_US_SCHEMA_PROBE = "d_us_schema_probe"
+
+
+_PROBE_SERIES_BY_TARGET: Mapping[DiscoveryTarget, str] = MappingProxyType(
+    {
+        DiscoveryTarget.D_AU_SCHEMA_PROBE: APPROVED_BIS_SERIES["AUD"],
+        DiscoveryTarget.D_CA_SCHEMA_PROBE: APPROVED_BIS_SERIES["CAD"],
+        DiscoveryTarget.D_CH_SCHEMA_PROBE: APPROVED_BIS_SERIES["CHF"],
+        DiscoveryTarget.D_XM_SCHEMA_PROBE: APPROVED_BIS_SERIES["EUR"],
+        DiscoveryTarget.D_GB_SCHEMA_PROBE: APPROVED_BIS_SERIES["GBP"],
+        DiscoveryTarget.D_JP_SCHEMA_PROBE: APPROVED_BIS_SERIES["JPY"],
+        DiscoveryTarget.D_NZ_SCHEMA_PROBE: APPROVED_BIS_SERIES["NZD"],
+        DiscoveryTarget.D_US_SCHEMA_PROBE: APPROVED_BIS_SERIES["USD"],
+    }
+)
+
+
+def _probe_url(series_key: str) -> str:
+    return f"{_PROBE_URL_PREFIX}{series_key}{_PROBE_QUERY}"
 
 
 @dataclass(frozen=True)
@@ -139,13 +167,14 @@ class DiscoveryRequest:
 def _validate_request_values(request: DiscoveryRequest) -> None:
     if request.target == DiscoveryTarget.STRUCTURE:
         expected = (_STRUCTURE_URL, _STRUCTURE_ACCEPT, None, None, None)
-    elif request.target == DiscoveryTarget.D_US_SCHEMA_PROBE:
+    elif request.target in _PROBE_SERIES_BY_TARGET:
         if isinstance(request.end, date) and request.end > MAX_OBSERVATION_DATE:
             raise DiscoveryFailure("sealed_window_violation")
+        series_key = _PROBE_SERIES_BY_TARGET[request.target]
         expected = (
-            _PROBE_URL,
+            _probe_url(series_key),
             _PROBE_ACCEPT,
-            "D.US",
+            series_key,
             DISCOVERY_SAMPLE_START,
             DISCOVERY_SAMPLE_END,
         )
@@ -189,16 +218,28 @@ def build_structure_request() -> DiscoveryRequest:
     return DiscoveryRequest(DiscoveryTarget.STRUCTURE, _STRUCTURE_URL, _STRUCTURE_ACCEPT)
 
 
-def build_d_us_schema_probe_request(*, metadata_insufficient: bool) -> DiscoveryRequest:
+def build_schema_probe_request(
+    target: DiscoveryTarget, *, metadata_insufficient: bool
+) -> DiscoveryRequest:
     if metadata_insufficient is not True:
         raise DiscoveryFailure("metadata_discovery_required_first")
+    if not isinstance(target, DiscoveryTarget) or target not in _PROBE_SERIES_BY_TARGET:
+        raise DiscoveryFailure("request_not_approved")
+    series_key = _PROBE_SERIES_BY_TARGET[target]
     return DiscoveryRequest(
-        DiscoveryTarget.D_US_SCHEMA_PROBE,
-        _PROBE_URL,
+        target,
+        _probe_url(series_key),
         _PROBE_ACCEPT,
-        "D.US",
+        series_key,
         DISCOVERY_SAMPLE_START,
         DISCOVERY_SAMPLE_END,
+    )
+
+
+def build_d_us_schema_probe_request(*, metadata_insufficient: bool) -> DiscoveryRequest:
+    return build_schema_probe_request(
+        DiscoveryTarget.D_US_SCHEMA_PROBE,
+        metadata_insufficient=metadata_insufficient,
     )
 
 
@@ -660,7 +701,8 @@ def _parse_probe_structure_specific_xml(
     series_element = series[0]
     if (
         series_element.attrib.get("FREQ") != "D"
-        or series_element.attrib.get("REF_AREA") != "US"
+        or request.series_key is None
+        or series_element.attrib.get("REF_AREA") != request.series_key.removeprefix("D.")
     ):
         raise DiscoveryFailure("response_series_mismatch")
 
@@ -806,7 +848,7 @@ def _build_discovery_result(
 
     media_type = (
         _validated_probe_media_type(response.media_type)
-        if request.target == DiscoveryTarget.D_US_SCHEMA_PROBE
+        if request.target in _PROBE_SERIES_BY_TARGET
         else _normalized_media_type(response.media_type)
     )
     allowed = (
@@ -1110,7 +1152,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.target == DiscoveryTarget.STRUCTURE.value:
         request = build_structure_request()
     else:
-        request = build_d_us_schema_probe_request(
+        request = build_schema_probe_request(
+            DiscoveryTarget(args.target),
             metadata_insufficient=args.metadata_insufficient
         )
     _, (raw_path, manifest_path) = execute_and_persist_discovery(
