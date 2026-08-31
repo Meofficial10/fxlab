@@ -49,6 +49,11 @@ AUTHORITATIVE_D_CH_URL = (
     "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.CH"
     "?startPeriod=2014-01-01&endPeriod=2023-12-31"
 )
+AUTHORITATIVE_D_XM_ACCEPT = AUTHORITATIVE_D_US_ACCEPT
+AUTHORITATIVE_D_XM_URL = (
+    "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.XM"
+    "?startPeriod=2014-01-01&endPeriod=2023-12-31"
+)
 AUTHORITATIVE_D_US_URL = (
     "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.US"
     "?startPeriod=2014-01-01&endPeriod=2023-12-31"
@@ -323,6 +328,14 @@ def authoritative_d_ca_request() -> PolicyRateRequest:
 def authoritative_d_ch_request() -> PolicyRateRequest:
     return PolicyRateRequest(
         PolicyRateSeriesSpec("CHF", "D.CH"),
+        APPROVED_REQUEST_START,
+        APPROVED_REQUEST_END,
+    )
+
+
+def authoritative_d_xm_request() -> PolicyRateRequest:
+    return PolicyRateRequest(
+        PolicyRateSeriesSpec("EUR", "D.XM"),
         APPROVED_REQUEST_START,
         APPROVED_REQUEST_END,
     )
