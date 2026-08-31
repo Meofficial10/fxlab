@@ -7,10 +7,12 @@ retry, cache, or fallback behavior.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import os
 import shutil
 import socket
+import sys
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -367,12 +369,36 @@ def ingest_series(
     return BisIngestionResult(response.raw_bytes, manifest)
 
 
-def main() -> None:
-    raise SystemExit(
-        "network_acquisition_not_authorized: inject an explicitly approved one-attempt BIS "
-        "transport"
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--authorize-network-acquisition",
+        action="store_true",
     )
+    parser.add_argument(
+        "--target",
+        choices=("d_us",),
+    )
+    args = parser.parse_args([] if argv is None else argv)
+
+    if not args.authorize_network_acquisition:
+        raise SystemExit("network_acquisition_not_authorized")
+
+    if args.target != "d_us":
+        parser.error("--target d_us is required")
+
+    publication = acquire_and_publish_authoritative_d_us(
+        authoritative_d_us_request(),
+        UrllibAuthoritativeBisTransport(),
+        datetime.now(UTC),
+    )
+
+    print(f"destination={publication.destination}")
+    print(f"raw_path={publication.raw_path}")
+    print(f"manifest_path={publication.manifest_path}")
+    print(f"dataset_id={publication.manifest.dataset_id}")
+    print(f"manifest_id={publication.manifest.manifest_id}")
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

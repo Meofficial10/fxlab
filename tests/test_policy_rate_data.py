@@ -701,6 +701,108 @@ def test_authoritative_d_us_offline_end_to_end_integration(
     assert [call[0].full_url for call in opener.calls] == [AUTHORITATIVE_D_US_URL]
 
 
+def test_authoritative_d_us_cli_help_is_network_free(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    def forbidden_transport():
+        raise AssertionError("transport constructed while rendering help")
+
+    monkeypatch.setattr(ingestion, "UrllibAuthoritativeBisTransport", forbidden_transport)
+    with pytest.raises(SystemExit) as exc_info:
+        ingestion.main(["--help"])
+    assert exc_info.value.code == 0
+    assert "--authorize-network-acquisition" in capsys.readouterr().out
+
+
+def test_authoritative_d_us_cli_missing_authorization_is_network_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    calls: list[object] = []
+    monkeypatch.setattr(
+        ingestion,
+        "acquire_and_publish_authoritative_d_us",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    with pytest.raises(SystemExit, match="network_acquisition_not_authorized"):
+        ingestion.main(["--target", "d_us"])
+    assert calls == []
+
+
+def test_authoritative_d_us_cli_wrong_target_is_rejected_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    calls: list[object] = []
+    monkeypatch.setattr(
+        ingestion,
+        "acquire_and_publish_authoritative_d_us",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        ingestion.main(
+            ["--authorize-network-acquisition", "--target", "not_d_us"]
+        )
+    assert exc_info.value.code == 2
+    assert calls == []
+
+
+def test_authoritative_d_us_cli_exact_authorized_path_invokes_once(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from types import SimpleNamespace
+
+    import scripts.ingest_bis_policy_rates as ingestion
+    from fxlab.data.policy_rates import authoritative_d_us_request
+
+    transport = object()
+    calls: list[tuple[object, object, datetime]] = []
+    destination = tmp_path / "d_us-fixed"
+    publication = SimpleNamespace(
+        destination=destination,
+        raw_path=destination / "response.xml",
+        manifest_path=destination / "manifest.json",
+        manifest=SimpleNamespace(dataset_id="d" * 64, manifest_id="m" * 64),
+    )
+
+    monkeypatch.setattr(
+        ingestion,
+        "UrllibAuthoritativeBisTransport",
+        lambda: transport,
+    )
+
+    def fake_acquire(request, supplied_transport, retrieved_at):
+        calls.append((request, supplied_transport, retrieved_at))
+        return publication
+
+    monkeypatch.setattr(
+        ingestion,
+        "acquire_and_publish_authoritative_d_us",
+        fake_acquire,
+    )
+    ingestion.main(["--authorize-network-acquisition", "--target", "d_us"])
+
+    assert len(calls) == 1
+    request, supplied_transport, retrieved_at = calls[0]
+    assert request == authoritative_d_us_request()
+    assert supplied_transport is transport
+    assert retrieved_at.tzinfo is UTC
+    assert capsys.readouterr().out.splitlines() == [
+        f"destination={publication.destination}",
+        f"raw_path={publication.raw_path}",
+        f"manifest_path={publication.manifest_path}",
+        f"dataset_id={publication.manifest.dataset_id}",
+        f"manifest_id={publication.manifest.manifest_id}",
+    ]
+
+
 def _authoritative_transport_with_raw(raw_bytes: bytes) -> FakeAuthoritativeTransport:
     from scripts.ingest_bis_policy_rates import AuthoritativeBisHttpResponse
 
