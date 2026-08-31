@@ -930,6 +930,7 @@ def test_authoritative_d_us_cli_exact_authorized_path_invokes_once(
     from types import SimpleNamespace
 
     import scripts.ingest_bis_policy_rates as ingestion
+
     from fxlab.data.policy_rates import authoritative_d_us_request
 
     transport = object()
@@ -1195,6 +1196,252 @@ def test_authoritative_d_us_manifest_discovery_classification_cannot_be_promoted
             classification=classification,
         )
     assert transport.calls == []
+
+
+def _authoritative_d_au_raw() -> bytes:
+    return authoritative_sparse_xml(
+        reference_area="AU",
+        observations=(
+            ("2014-01-03", "2.50", "A"),
+            ("2018-06-15", "1.50", "A"),
+            ("2023-12-29", "4.35", "A"),
+        ),
+    )
+
+
+def _authoritative_d_au_transport(raw_bytes: bytes) -> FakeAuthoritativeTransport:
+    from scripts.ingest_bis_policy_rates import AuthoritativeBisHttpResponse
+
+    from fxlab.data.policy_rates import AUTHORITATIVE_D_AU_URL
+
+    return FakeAuthoritativeTransport(
+        AuthoritativeBisHttpResponse(
+            status_code=200,
+            final_url=AUTHORITATIVE_D_AU_URL,
+            media_type="application/xml",
+            headers={"Content-Type": "application/xml", "ETag": "synthetic-au"},
+            raw_bytes=raw_bytes,
+        )
+    )
+
+
+def test_authoritative_d_au_request_and_transport_are_exact_and_one_attempt() -> None:
+    from scripts.ingest_bis_policy_rates import (
+        AUTHORITATIVE_MAX_RESPONSE_BYTES,
+        AUTHORITATIVE_TIMEOUT_SECONDS,
+        fetch_authoritative_d_au_response,
+    )
+
+    from fxlab.data.policy_rates import (
+        AUTHORITATIVE_D_AU_ACCEPT,
+        AUTHORITATIVE_D_AU_URL,
+        authoritative_d_au_request,
+    )
+
+    item = authoritative_d_au_request()
+    transport = _authoritative_d_au_transport(_authoritative_d_au_raw())
+
+    assert item == request("AUD")
+    assert AUTHORITATIVE_D_AU_URL == (
+        "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.AU"
+        "?startPeriod=2014-01-01&endPeriod=2023-12-31"
+    )
+    assert AUTHORITATIVE_D_AU_ACCEPT == (
+        "application/vnd.sdmx.structurespecificdata+xml;version=2.1"
+    )
+    assert fetch_authoritative_d_au_response(item, transport).raw_bytes == (
+        _authoritative_d_au_raw()
+    )
+    assert transport.calls == [
+        (
+            item,
+            AUTHORITATIVE_D_AU_URL,
+            AUTHORITATIVE_D_AU_ACCEPT,
+            AUTHORITATIVE_TIMEOUT_SECONDS,
+            AUTHORITATIVE_MAX_RESPONSE_BYTES,
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "final_url", "reason"),
+    (
+        (302, None, "redirect_rejected"),
+        (200, "https://stats.bis.org/api/v2/other", "redirect_rejected"),
+        (503, None, "http_status_not_success"),
+    ),
+)
+def test_authoritative_d_au_transport_fails_once_without_retry_or_fallback(
+    status_code: int, final_url: str | None, reason: str
+) -> None:
+    from scripts.ingest_bis_policy_rates import (
+        AuthoritativeBisHttpResponse,
+        fetch_authoritative_d_au_response,
+    )
+
+    from fxlab.data.policy_rates import (
+        AUTHORITATIVE_D_AU_URL,
+        authoritative_d_au_request,
+    )
+
+    item = authoritative_d_au_request()
+    transport = FakeAuthoritativeTransport(
+        AuthoritativeBisHttpResponse(
+            status_code=status_code,
+            final_url=final_url or AUTHORITATIVE_D_AU_URL,
+            media_type="application/xml",
+            headers={},
+            raw_bytes=_authoritative_d_au_raw(),
+        )
+    )
+    with pytest.raises(PolicyRateQualificationError, match=reason):
+        fetch_authoritative_d_au_response(item, transport)
+    assert len(transport.calls) == 1
+
+
+def test_authoritative_d_au_publication_is_atomic_and_binds_sparse_manifest(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+    import json
+
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    from fxlab.data.policy_rates import (
+        AUTHORITATIVE_D_AU_URL,
+        authoritative_d_au_request,
+        canonical_sha256,
+        parse_authoritative_bis_sdmx,
+    )
+
+    root = tmp_path / "authoritative"
+    monkeypatch.setattr(ingestion, "AUTHORITATIVE_BIS_ROOT", root)
+    item = authoritative_d_au_request()
+    raw = _authoritative_d_au_raw()
+    transport = _authoritative_d_au_transport(raw)
+
+    published = ingestion.acquire_and_publish_authoritative_d_au(
+        item, transport, RETRIEVED
+    )
+
+    destination = root / f"d_au-{item.fingerprint}"
+    observations = parse_authoritative_bis_sdmx(raw, item)
+    manifest = published.manifest
+    assert len(transport.calls) == 1
+    assert published.destination == destination
+    assert published.raw_path == destination / "response.xml"
+    assert published.manifest_path == destination / "manifest.json"
+    assert published.raw_path.read_bytes() == raw
+    persisted = json.loads(published.manifest_path.read_text(encoding="utf-8"))
+    assert persisted["dataset_id"] == manifest.dataset_id
+    assert persisted["manifest_id"] == manifest.manifest_id
+    assert manifest.request_fingerprint == item.fingerprint
+    assert manifest.exact_url == AUTHORITATIVE_D_AU_URL
+    assert manifest.representation_identity == "SDMX_ML_2_1_STRUCTURE_SPECIFIC_DATA"
+    assert (manifest.series_key, manifest.frequency, manifest.reference_area) == (
+        "D.AU",
+        "D",
+        "AU",
+    )
+    assert (manifest.unit_measure, manifest.unit_mult) == ("368", "0")
+    assert manifest.status_semantics == ("A=normal",)
+    assert manifest.raw_sha256 == hashlib.sha256(raw).hexdigest()
+    assert manifest.canonical_observation_hash == canonical_sha256(observations)
+    assert manifest.row_count == len(observations) == 3
+    assert manifest.min_observation_date == date(2014, 1, 3)
+    assert manifest.max_observation_date == date(2023, 12, 29)
+
+
+def test_authoritative_d_au_m_nan_never_publishes(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    from fxlab.data.policy_rates import authoritative_d_au_request
+
+    root = tmp_path / "authoritative"
+    monkeypatch.setattr(ingestion, "AUTHORITATIVE_BIS_ROOT", root)
+    item = authoritative_d_au_request()
+    raw = authoritative_sparse_xml(
+        reference_area="AU",
+        observations=(
+            ("2014-01-03", "2.50", "A"),
+            ("2014-01-07", "NaN", "M"),
+        ),
+    )
+
+    with pytest.raises(
+        PolicyRateQualificationError,
+        match="missing_observation_normalization_unresolved",
+    ):
+        ingestion.acquire_and_publish_authoritative_d_au(
+            item, _authoritative_d_au_transport(raw), RETRIEVED
+        )
+    assert not root.exists()
+
+
+def test_authoritative_d_au_existing_destination_precedes_transport(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    from fxlab.data.policy_rates import authoritative_d_au_request
+
+    root = tmp_path / "authoritative"
+    monkeypatch.setattr(ingestion, "AUTHORITATIVE_BIS_ROOT", root)
+    item = authoritative_d_au_request()
+    (root / f"d_au-{item.fingerprint}").mkdir(parents=True)
+    transport = _authoritative_d_au_transport(_authoritative_d_au_raw())
+
+    with pytest.raises(PolicyRateQualificationError, match="destination_exists"):
+        ingestion.acquire_and_publish_authoritative_d_au(item, transport, RETRIEVED)
+    assert transport.calls == []
+
+
+def test_authoritative_d_au_cli_exact_authorized_target_invokes_once(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from types import SimpleNamespace
+
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    from fxlab.data.policy_rates import authoritative_d_au_request
+
+    transport = object()
+    calls: list[tuple[object, object, datetime]] = []
+    destination = tmp_path / "d_au-fixed"
+    publication = SimpleNamespace(
+        destination=destination,
+        raw_path=destination / "response.xml",
+        manifest_path=destination / "manifest.json",
+        manifest=SimpleNamespace(dataset_id="a" * 64, manifest_id="b" * 64),
+    )
+    monkeypatch.setattr(ingestion, "UrllibAuthoritativeBisTransport", lambda: transport)
+
+    def fake_acquire(request, supplied_transport, retrieved_at):
+        calls.append((request, supplied_transport, retrieved_at))
+        return publication
+
+    monkeypatch.setattr(
+        ingestion, "acquire_and_publish_authoritative_d_au", fake_acquire
+    )
+
+    ingestion.main(["--authorize-network-acquisition", "--target", "d_au"])
+
+    assert len(calls) == 1
+    item, supplied_transport, retrieved_at = calls[0]
+    assert item == authoritative_d_au_request()
+    assert supplied_transport is transport
+    assert retrieved_at.tzinfo is UTC
+    assert capsys.readouterr().out.splitlines() == [
+        f"destination={publication.destination}",
+        f"raw_path={publication.raw_path}",
+        f"manifest_path={publication.manifest_path}",
+        f"dataset_id={publication.manifest.dataset_id}",
+        f"manifest_id={publication.manifest.manifest_id}",
+    ]
 
 
 def spec(currency: str = "AUD") -> PolicyRateSeriesSpec:

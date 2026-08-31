@@ -27,6 +27,8 @@ from fxlab.data.policy_rates import (
     APPROVED_BIS_SERIES,
     APPROVED_REQUEST_END,
     APPROVED_REQUEST_START,
+    AUTHORITATIVE_D_AU_ACCEPT,
+    AUTHORITATIVE_D_AU_URL,
     AUTHORITATIVE_D_US_ACCEPT,
     AUTHORITATIVE_D_US_URL,
     PolicyRateMetadata,
@@ -34,17 +36,20 @@ from fxlab.data.policy_rates import (
     PolicyRateRequest,
     PolicyRateSeriesManifest,
     PolicyRateSeriesSpec,
+    authoritative_d_au_request,
     authoritative_d_us_request,
     build_series_manifest,
     canonical_json,
     canonical_sha256,
     parse_authoritative_bis_d_us_sdmx,
+    parse_authoritative_bis_sdmx,
 )
 
 AUTHORITATIVE_TIMEOUT_SECONDS = 15
 AUTHORITATIVE_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 AUTHORITATIVE_BIS_ROOT = Path("data/raw/candidate_b/bis/authoritative")
 AUTHORITATIVE_D_US_REPRESENTATION = "SDMX_ML_2_1_STRUCTURE_SPECIFIC_DATA"
+AUTHORITATIVE_D_AU_REPRESENTATION = AUTHORITATIVE_D_US_REPRESENTATION
 
 
 @dataclass(frozen=True)
@@ -211,6 +216,41 @@ def fetch_authoritative_d_us_response(
     return response
 
 
+def fetch_authoritative_d_au_response(
+    request: PolicyRateRequest,
+    transport: AuthoritativeBisTransport,
+) -> AuthoritativeBisHttpResponse:
+    if request != authoritative_d_au_request():
+        raise PolicyRateQualificationError("request_not_approved")
+    try:
+        response = transport.fetch(
+            request,
+            exact_url=AUTHORITATIVE_D_AU_URL,
+            accept=AUTHORITATIVE_D_AU_ACCEPT,
+            timeout_seconds=AUTHORITATIVE_TIMEOUT_SECONDS,
+            max_response_bytes=AUTHORITATIVE_MAX_RESPONSE_BYTES,
+        )
+    except TimeoutError as exc:
+        raise PolicyRateQualificationError("acquisition_timeout") from exc
+    except PolicyRateQualificationError:
+        raise
+    except Exception as exc:
+        raise PolicyRateQualificationError("transport_failure") from exc
+    if not isinstance(response, AuthoritativeBisHttpResponse):
+        raise PolicyRateQualificationError("transport_response_invalid")
+    if 300 <= response.status_code <= 399:
+        raise PolicyRateQualificationError("redirect_rejected")
+    if response.status_code != 200:
+        raise PolicyRateQualificationError("http_status_not_success")
+    if response.final_url != AUTHORITATIVE_D_AU_URL:
+        raise PolicyRateQualificationError("redirect_rejected")
+    if response.media_type != "application/xml":
+        raise PolicyRateQualificationError("media_type_not_approved")
+    if len(response.raw_bytes) > AUTHORITATIVE_MAX_RESPONSE_BYTES:
+        raise PolicyRateQualificationError("response_too_large")
+    return response
+
+
 @dataclass(frozen=True)
 class AuthoritativeDUsManifest:
     request_fingerprint: str
@@ -240,6 +280,37 @@ class AuthoritativeDUsPublication:
     raw_path: Path
     manifest_path: Path
     manifest: AuthoritativeDUsManifest
+
+
+@dataclass(frozen=True)
+class AuthoritativeDAuManifest:
+    request_fingerprint: str
+    exact_url: str
+    representation_identity: str
+    series_key: str
+    frequency: str
+    reference_area: str
+    unit_measure: str
+    unit_mult: str
+    status_semantics: tuple[str, ...]
+    raw_sha256: str
+    canonical_observation_hash: str
+    row_count: int
+    min_observation_date: date
+    max_observation_date: date
+    retrieved_at: datetime
+    response_media_type: str
+    byte_count: int
+    dataset_id: str
+    manifest_id: str
+
+
+@dataclass(frozen=True)
+class AuthoritativeDAuPublication:
+    destination: Path
+    raw_path: Path
+    manifest_path: Path
+    manifest: AuthoritativeDAuManifest
 
 
 def _authoritative_d_us_manifest(
@@ -299,6 +370,56 @@ def _write_fully(path: Path, payload: bytes) -> None:
         os.fsync(stream.fileno())
 
 
+def _authoritative_d_au_manifest(
+    request: PolicyRateRequest,
+    response: AuthoritativeBisHttpResponse,
+    retrieved_at: datetime,
+) -> AuthoritativeDAuManifest:
+    if retrieved_at.tzinfo is None or retrieved_at.utcoffset() is None:
+        raise ValueError("retrieval timestamp must be timezone-aware")
+    retrieved = retrieved_at.astimezone(UTC)
+    observations = parse_authoritative_bis_sdmx(response.raw_bytes, request)
+    raw_sha256 = hashlib.sha256(response.raw_bytes).hexdigest()
+    observation_hash = canonical_sha256(observations)
+    semantic = {
+        "format": 1,
+        "request_fingerprint": request.fingerprint,
+        "exact_url": AUTHORITATIVE_D_AU_URL,
+        "representation_identity": AUTHORITATIVE_D_AU_REPRESENTATION,
+        "series_key": "D.AU",
+        "frequency": "D",
+        "reference_area": "AU",
+        "unit_measure": "368",
+        "unit_mult": "0",
+        "status_semantics": ("A=normal",),
+        "raw_sha256": raw_sha256,
+        "canonical_observation_hash": observation_hash,
+        "row_count": len(observations),
+        "min_observation_date": observations[0].observation_date,
+        "max_observation_date": observations[-1].observation_date,
+    }
+    dataset_id = canonical_sha256(semantic)
+    audit = {
+        "format": 1,
+        "dataset_id": dataset_id,
+        "retrieved_at": retrieved,
+        "returned_url": response.final_url,
+        "response_media_type": response.media_type,
+        "byte_count": len(response.raw_bytes),
+        "headers": response.headers,
+    }
+    manifest_values = dict(semantic)
+    del manifest_values["format"]
+    return AuthoritativeDAuManifest(
+        **manifest_values,
+        retrieved_at=retrieved,
+        response_media_type=response.media_type,
+        byte_count=len(response.raw_bytes),
+        dataset_id=dataset_id,
+        manifest_id=canonical_sha256(audit),
+    )
+
+
 def acquire_and_publish_authoritative_d_us(
     request: PolicyRateRequest,
     transport: AuthoritativeBisTransport,
@@ -330,6 +451,42 @@ def acquire_and_publish_authoritative_d_us(
         raise
 
     return AuthoritativeDUsPublication(
+        destination=destination,
+        raw_path=destination / "response.xml",
+        manifest_path=destination / "manifest.json",
+        manifest=manifest,
+    )
+
+
+def acquire_and_publish_authoritative_d_au(
+    request: PolicyRateRequest,
+    transport: AuthoritativeBisTransport,
+    retrieved_at: datetime,
+) -> AuthoritativeDAuPublication:
+    if request != authoritative_d_au_request():
+        raise PolicyRateQualificationError("request_not_approved")
+    destination = AUTHORITATIVE_BIS_ROOT / f"d_au-{request.fingerprint}"
+    if destination.exists():
+        raise PolicyRateQualificationError("destination_exists")
+
+    response = fetch_authoritative_d_au_response(request, transport)
+    manifest = _authoritative_d_au_manifest(request, response, retrieved_at)
+
+    AUTHORITATIVE_BIS_ROOT.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=".tmp-", dir=AUTHORITATIVE_BIS_ROOT))
+    try:
+        raw_path = temporary / "response.xml"
+        manifest_path = temporary / "manifest.json"
+        _write_fully(raw_path, response.raw_bytes)
+        _write_fully(manifest_path, canonical_json(manifest).encode("utf-8"))
+        if destination.exists():
+            raise PolicyRateQualificationError("destination_exists")
+        temporary.replace(destination)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+    return AuthoritativeDAuPublication(
         destination=destination,
         raw_path=destination / "response.xml",
         manifest_path=destination / "manifest.json",
@@ -377,21 +534,28 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--target",
-        choices=("d_us",),
+        choices=("d_us", "d_au"),
     )
     args = parser.parse_args([] if argv is None else argv)
 
     if not args.authorize_network_acquisition:
         raise SystemExit("network_acquisition_not_authorized")
 
-    if args.target != "d_us":
-        parser.error("--target d_us is required")
+    if args.target is None:
+        parser.error("--target is required")
 
-    publication = acquire_and_publish_authoritative_d_us(
-        authoritative_d_us_request(),
-        UrllibAuthoritativeBisTransport(),
-        datetime.now(UTC),
-    )
+    if args.target == "d_us":
+        publication = acquire_and_publish_authoritative_d_us(
+            authoritative_d_us_request(),
+            UrllibAuthoritativeBisTransport(),
+            datetime.now(UTC),
+        )
+    else:
+        publication = acquire_and_publish_authoritative_d_au(
+            authoritative_d_au_request(),
+            UrllibAuthoritativeBisTransport(),
+            datetime.now(UTC),
+        )
 
     print(f"destination={publication.destination}")
     print(f"raw_path={publication.raw_path}")
