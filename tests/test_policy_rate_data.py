@@ -1649,6 +1649,183 @@ def test_authoritative_d_ca_cli_exact_authorized_target_invokes_once(
     ]
 
 
+def _authoritative_d_ch_raw() -> bytes:
+    return authoritative_sparse_xml(
+        reference_area="CH",
+        observations=(
+            ("2014-01-03", "0.00", "A"),
+            ("2019-06-14", "-0.75", "A"),
+            ("2023-12-29", "1.75", "A"),
+        ),
+    )
+
+
+def _authoritative_d_ch_transport(raw_bytes: bytes) -> FakeAuthoritativeTransport:
+    from scripts.ingest_bis_policy_rates import AuthoritativeBisHttpResponse
+
+    from fxlab.data.policy_rates import AUTHORITATIVE_D_CH_URL
+
+    return FakeAuthoritativeTransport(
+        AuthoritativeBisHttpResponse(
+            status_code=200,
+            final_url=AUTHORITATIVE_D_CH_URL,
+            media_type="application/xml",
+            headers={"Content-Type": "application/xml", "ETag": "synthetic-ch"},
+            raw_bytes=raw_bytes,
+        )
+    )
+
+
+def test_authoritative_d_ch_request_and_transport_are_exact_and_one_attempt() -> None:
+    from scripts.ingest_bis_policy_rates import (
+        AUTHORITATIVE_MAX_RESPONSE_BYTES,
+        AUTHORITATIVE_TIMEOUT_SECONDS,
+        fetch_authoritative_d_ch_response,
+    )
+
+    from fxlab.data.policy_rates import (
+        AUTHORITATIVE_D_CH_ACCEPT,
+        AUTHORITATIVE_D_CH_URL,
+        authoritative_d_ch_request,
+    )
+
+    item = authoritative_d_ch_request()
+    transport = _authoritative_d_ch_transport(_authoritative_d_ch_raw())
+
+    assert item == request("CHF")
+    assert AUTHORITATIVE_D_CH_URL == (
+        "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.CH"
+        "?startPeriod=2014-01-01&endPeriod=2023-12-31"
+    )
+    assert AUTHORITATIVE_D_CH_ACCEPT == (
+        "application/vnd.sdmx.structurespecificdata+xml;version=2.1"
+    )
+    assert fetch_authoritative_d_ch_response(item, transport).raw_bytes == (
+        _authoritative_d_ch_raw()
+    )
+    assert transport.calls == [
+        (
+            item,
+            AUTHORITATIVE_D_CH_URL,
+            AUTHORITATIVE_D_CH_ACCEPT,
+            AUTHORITATIVE_TIMEOUT_SECONDS,
+            AUTHORITATIVE_MAX_RESPONSE_BYTES,
+        )
+    ]
+
+
+def test_authoritative_d_ch_publication_binds_exact_sparse_observations(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+    import json
+
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    from fxlab.data.policy_rates import (
+        AUTHORITATIVE_D_CH_URL,
+        authoritative_d_ch_request,
+        canonical_sha256,
+        parse_authoritative_bis_sdmx,
+    )
+
+    root = tmp_path / "authoritative"
+    monkeypatch.setattr(ingestion, "AUTHORITATIVE_BIS_ROOT", root)
+    item = authoritative_d_ch_request()
+    raw = _authoritative_d_ch_raw()
+    transport = _authoritative_d_ch_transport(raw)
+
+    published = ingestion.acquire_and_publish_authoritative_d_ch(
+        item, transport, RETRIEVED
+    )
+
+    destination = root / f"d_ch-{item.fingerprint}"
+    observations = parse_authoritative_bis_sdmx(raw, item)
+    manifest = published.manifest
+    assert len(transport.calls) == 1
+    assert published.destination == destination
+    assert published.raw_path.read_bytes() == raw
+    persisted = json.loads(published.manifest_path.read_text(encoding="utf-8"))
+    assert persisted["dataset_id"] == manifest.dataset_id
+    assert persisted["manifest_id"] == manifest.manifest_id
+    assert manifest.request_fingerprint == item.fingerprint
+    assert manifest.exact_url == AUTHORITATIVE_D_CH_URL
+    assert manifest.representation_identity == "SDMX_ML_2_1_STRUCTURE_SPECIFIC_DATA"
+    assert (manifest.series_key, manifest.frequency, manifest.reference_area) == (
+        "D.CH",
+        "D",
+        "CH",
+    )
+    assert (manifest.unit_measure, manifest.unit_mult) == ("368", "0")
+    assert manifest.status_semantics == ("A=normal",)
+    assert manifest.raw_sha256 == hashlib.sha256(raw).hexdigest()
+    assert manifest.canonical_observation_hash == canonical_sha256(observations)
+    assert manifest.row_count == len(observations) == 3
+    assert manifest.min_observation_date == date(2014, 1, 3)
+    assert manifest.max_observation_date == date(2023, 12, 29)
+
+
+def test_authoritative_d_ch_existing_destination_precedes_transport(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    from fxlab.data.policy_rates import authoritative_d_ch_request
+
+    root = tmp_path / "authoritative"
+    monkeypatch.setattr(ingestion, "AUTHORITATIVE_BIS_ROOT", root)
+    item = authoritative_d_ch_request()
+    (root / f"d_ch-{item.fingerprint}").mkdir(parents=True)
+    transport = _authoritative_d_ch_transport(_authoritative_d_ch_raw())
+
+    with pytest.raises(PolicyRateQualificationError, match="destination_exists"):
+        ingestion.acquire_and_publish_authoritative_d_ch(item, transport, RETRIEVED)
+    assert transport.calls == []
+
+
+def test_authoritative_d_ch_cli_exact_authorized_target_invokes_once(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from types import SimpleNamespace
+
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    from fxlab.data.policy_rates import authoritative_d_ch_request
+
+    transport = object()
+    calls: list[tuple[object, object, datetime]] = []
+    destination = tmp_path / "d_ch-fixed"
+    publication = SimpleNamespace(
+        destination=destination,
+        raw_path=destination / "response.xml",
+        manifest_path=destination / "manifest.json",
+        manifest=SimpleNamespace(dataset_id="e" * 64, manifest_id="f" * 64),
+    )
+    monkeypatch.setattr(ingestion, "UrllibAuthoritativeBisTransport", lambda: transport)
+
+    def fake_acquire(request, supplied_transport, retrieved_at):
+        calls.append((request, supplied_transport, retrieved_at))
+        return publication
+
+    monkeypatch.setattr(
+        ingestion, "acquire_and_publish_authoritative_d_ch", fake_acquire
+    )
+
+    ingestion.main(["--authorize-network-acquisition", "--target", "d_ch"])
+
+    assert calls == [(authoritative_d_ch_request(), transport, calls[0][2])]
+    assert calls[0][2].tzinfo is UTC
+    assert capsys.readouterr().out.splitlines() == [
+        f"destination={publication.destination}",
+        f"raw_path={publication.raw_path}",
+        f"manifest_path={publication.manifest_path}",
+        f"dataset_id={publication.manifest.dataset_id}",
+        f"manifest_id={publication.manifest.manifest_id}",
+    ]
+
+
 def spec(currency: str = "AUD") -> PolicyRateSeriesSpec:
     return PolicyRateSeriesSpec(currency, APPROVED_BIS_SERIES[currency])
 

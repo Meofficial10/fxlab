@@ -31,6 +31,8 @@ from fxlab.data.policy_rates import (
     AUTHORITATIVE_D_AU_URL,
     AUTHORITATIVE_D_CA_ACCEPT,
     AUTHORITATIVE_D_CA_URL,
+    AUTHORITATIVE_D_CH_ACCEPT,
+    AUTHORITATIVE_D_CH_URL,
     AUTHORITATIVE_D_US_ACCEPT,
     AUTHORITATIVE_D_US_URL,
     PolicyRateMetadata,
@@ -40,6 +42,7 @@ from fxlab.data.policy_rates import (
     PolicyRateSeriesSpec,
     authoritative_d_au_request,
     authoritative_d_ca_request,
+    authoritative_d_ch_request,
     authoritative_d_us_request,
     build_series_manifest,
     canonical_json,
@@ -54,6 +57,7 @@ AUTHORITATIVE_BIS_ROOT = Path("data/raw/candidate_b/bis/authoritative")
 AUTHORITATIVE_D_US_REPRESENTATION = "SDMX_ML_2_1_STRUCTURE_SPECIFIC_DATA"
 AUTHORITATIVE_D_AU_REPRESENTATION = AUTHORITATIVE_D_US_REPRESENTATION
 AUTHORITATIVE_D_CA_REPRESENTATION = AUTHORITATIVE_D_US_REPRESENTATION
+AUTHORITATIVE_D_CH_REPRESENTATION = AUTHORITATIVE_D_US_REPRESENTATION
 
 
 @dataclass(frozen=True)
@@ -285,6 +289,19 @@ def fetch_authoritative_d_ca_response(
     )
 
 
+def fetch_authoritative_d_ch_response(
+    request: PolicyRateRequest,
+    transport: AuthoritativeBisTransport,
+) -> AuthoritativeBisHttpResponse:
+    return _fetch_authoritative_sparse_response(
+        request,
+        transport,
+        approved_request=authoritative_d_ch_request(),
+        exact_url=AUTHORITATIVE_D_CH_URL,
+        accept=AUTHORITATIVE_D_CH_ACCEPT,
+    )
+
+
 @dataclass(frozen=True)
 class AuthoritativeDUsManifest:
     request_fingerprint: str
@@ -376,6 +393,37 @@ class AuthoritativeDCaPublication:
     raw_path: Path
     manifest_path: Path
     manifest: AuthoritativeDCaManifest
+
+
+@dataclass(frozen=True)
+class AuthoritativeDChManifest:
+    request_fingerprint: str
+    exact_url: str
+    representation_identity: str
+    series_key: str
+    frequency: str
+    reference_area: str
+    unit_measure: str
+    unit_mult: str
+    status_semantics: tuple[str, ...]
+    raw_sha256: str
+    canonical_observation_hash: str
+    row_count: int
+    min_observation_date: date
+    max_observation_date: date
+    retrieved_at: datetime
+    response_media_type: str
+    byte_count: int
+    dataset_id: str
+    manifest_id: str
+
+
+@dataclass(frozen=True)
+class AuthoritativeDChPublication:
+    destination: Path
+    raw_path: Path
+    manifest_path: Path
+    manifest: AuthoritativeDChManifest
 
 
 def _authoritative_d_us_manifest(
@@ -526,6 +574,24 @@ def _authoritative_d_ca_manifest(
     )
 
 
+def _authoritative_d_ch_manifest(
+    request: PolicyRateRequest,
+    response: AuthoritativeBisHttpResponse,
+    retrieved_at: datetime,
+) -> AuthoritativeDChManifest:
+    return AuthoritativeDChManifest(
+        **_authoritative_sparse_manifest_values(
+            request,
+            response,
+            retrieved_at,
+            exact_url=AUTHORITATIVE_D_CH_URL,
+            representation_identity=AUTHORITATIVE_D_CH_REPRESENTATION,
+            series_key="D.CH",
+            reference_area="CH",
+        )
+    )
+
+
 def acquire_and_publish_authoritative_d_us(
     request: PolicyRateRequest,
     transport: AuthoritativeBisTransport,
@@ -576,13 +642,13 @@ def _publish_authoritative_sparse_series(
     ],
     build_manifest: Callable[
         [PolicyRateRequest, AuthoritativeBisHttpResponse, datetime],
-        AuthoritativeDAuManifest | AuthoritativeDCaManifest,
+        AuthoritativeDAuManifest | AuthoritativeDCaManifest | AuthoritativeDChManifest,
     ],
 ) -> tuple[
     Path,
     Path,
     Path,
-    AuthoritativeDAuManifest | AuthoritativeDCaManifest,
+    AuthoritativeDAuManifest | AuthoritativeDCaManifest | AuthoritativeDChManifest,
 ]:
     if request != approved_request:
         raise PolicyRateQualificationError("request_not_approved")
@@ -663,6 +729,30 @@ def acquire_and_publish_authoritative_d_ca(
     )
 
 
+def acquire_and_publish_authoritative_d_ch(
+    request: PolicyRateRequest,
+    transport: AuthoritativeBisTransport,
+    retrieved_at: datetime,
+) -> AuthoritativeDChPublication:
+    destination, raw_path, manifest_path, manifest = _publish_authoritative_sparse_series(
+        request,
+        transport,
+        retrieved_at,
+        approved_request=authoritative_d_ch_request(),
+        destination_slug="d_ch",
+        fetch_response=fetch_authoritative_d_ch_response,
+        build_manifest=_authoritative_d_ch_manifest,
+    )
+    if not isinstance(manifest, AuthoritativeDChManifest):
+        raise TypeError("D.CH manifest type mismatch")
+    return AuthoritativeDChPublication(
+        destination=destination,
+        raw_path=raw_path,
+        manifest_path=manifest_path,
+        manifest=manifest,
+    )
+
+
 @dataclass(frozen=True)
 class BisIngestionResult:
     raw_bytes: bytes
@@ -703,7 +793,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--target",
-        choices=("d_us", "d_au", "d_ca"),
+        choices=("d_us", "d_au", "d_ca", "d_ch"),
     )
     args = parser.parse_args([] if argv is None else argv)
 
@@ -725,9 +815,15 @@ def main(argv: list[str] | None = None) -> None:
             UrllibAuthoritativeBisTransport(),
             datetime.now(UTC),
         )
-    else:
+    elif args.target == "d_ca":
         publication = acquire_and_publish_authoritative_d_ca(
             authoritative_d_ca_request(),
+            UrllibAuthoritativeBisTransport(),
+            datetime.now(UTC),
+        )
+    else:
+        publication = acquire_and_publish_authoritative_d_ch(
+            authoritative_d_ch_request(),
             UrllibAuthoritativeBisTransport(),
             datetime.now(UTC),
         )
