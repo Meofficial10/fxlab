@@ -107,6 +107,56 @@ Before R4, every relevant rate change must be reconciled to an immutable invento
 central-bank announcement and effective-date evidence. An unresolved BIS-to-official discrepancy
 invalidates the affected cohort.
 
+## Frozen BIS missing-observation representation clarification
+
+This is a blind pre-measurement data-representation clarification. The preserved BIS observation-
+status codelist defines `A` as a normal value and `M` as a missing value for which data cannot
+exist. The following representation rule applies uniformly to every approved Candidate B BIS
+series; it may not be applied selectively to rescue `D.CA`, `D.GB`, `D.NZ`, or any other currency.
+
+Raw and audit evidence remain complete:
+
+- Every row returned by BIS is preserved in immutable raw bytes and bound by raw-content identity
+  and provenance.
+- A row with exact `OBS_STATUS=M` and `OBS_VALUE=NaN` remains represented in raw and audit
+  evidence. It may not silently disappear from the raw returned-row count or provenance.
+- The raw returned-row count and the accepted numeric-observation count are distinct provenance
+  fields. A difference caused solely by explicitly preserved `M + NaN` rows is not itself
+  imputation or silent omission.
+
+The numeric observation contract is narrower than the raw evidence contract:
+
+- Only `OBS_STATUS=A` with a finite numeric `OBS_VALUE` may create a numeric
+  `PolicyRateObservation`.
+- Exact `OBS_STATUS=M` with `OBS_VALUE=NaN` is a recognized nonnumeric BIS missing marker and must
+  not create a `PolicyRateObservation`.
+- An `M + NaN` row must not be converted to zero or any other numeric value. It must not be
+  forward-filled, backward-filled, interpolated, copied, inferred, synthesized, or otherwise
+  imputed.
+- Every unsupported status/value combination fails closed.
+
+Point-in-time policy state remains governed only by the existing announcement/effective-time
+contract. At formation, policy state comes from the latest eligible authoritative official event
+that satisfies those frozen rules. Existing ADR-authorized state persistence of a previously known
+and effective policy state remains valid. An `M + NaN` BIS row never establishes, modifies,
+infers, or numerically supplies policy state.
+
+BIS numeric `A` observations must still reconcile with authoritative official-event evidence under
+the existing concordance rules. An `M + NaN` row does not authorize ignoring an unexplained
+policy-rate change, a missing official event, timestamp ambiguity, or any BIS/official discrepancy;
+each continues to fail closed.
+
+This clarification changes no hypothesis, currency universe, policy-rate family, formation date,
+signal, ranking, portfolio weight, FX return construction, transaction cost, statistical method,
+threshold, robustness gate, `83`/`23`/`106` cohort requirement, or sealed 2024+ boundary. It is not
+an outcome-dependent choice and may not be changed selectively after evidence is observed.
+
+This clarification does not establish that Candidate B data are feasible. It authorizes neither
+R4 nor measurement, and it does not authorize access to 2024+ observations. Candidate B remains
+**BLOCKED** until every existing data, provenance, concordance, and completeness gate passes. If
+exactly `106` complete cohorts cannot subsequently be established without imputation, Candidate B
+is **REJECTED AS INFEASIBLE** under the existing preregistration.
+
 ## Frozen formation and holding rule
 
 - Form once per calendar month at `F_m`.
