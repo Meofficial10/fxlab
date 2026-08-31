@@ -39,6 +39,11 @@ AUTHORITATIVE_D_AU_URL = (
     "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.AU"
     "?startPeriod=2014-01-01&endPeriod=2023-12-31"
 )
+AUTHORITATIVE_D_CA_ACCEPT = AUTHORITATIVE_D_US_ACCEPT
+AUTHORITATIVE_D_CA_URL = (
+    "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.CA"
+    "?startPeriod=2014-01-01&endPeriod=2023-12-31"
+)
 AUTHORITATIVE_D_US_URL = (
     "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.US"
     "?startPeriod=2014-01-01&endPeriod=2023-12-31"
@@ -297,6 +302,14 @@ def authoritative_d_us_request() -> PolicyRateRequest:
 def authoritative_d_au_request() -> PolicyRateRequest:
     return PolicyRateRequest(
         PolicyRateSeriesSpec("AUD", "D.AU"),
+        APPROVED_REQUEST_START,
+        APPROVED_REQUEST_END,
+    )
+
+
+def authoritative_d_ca_request() -> PolicyRateRequest:
+    return PolicyRateRequest(
+        PolicyRateSeriesSpec("CAD", "D.CA"),
         APPROVED_REQUEST_START,
         APPROVED_REQUEST_END,
     )
