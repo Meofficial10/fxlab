@@ -73,6 +73,9 @@ _SDMX_21_MESSAGE_NAMESPACE = (
     "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message"
 )
 _SDMX_21_COMMON_NAMESPACE = "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common"
+_SDMX_21_STRUCTURE_SPECIFIC_DATA_NAMESPACE = (
+    "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/data/structurespecific"
+)
 _XSI_NAMESPACE = "http://www.w3.org/2001/XMLSchema-instance"
 _STRUCTURE_SPECIFIC_NAMESPACE = (
     "urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow="
@@ -84,6 +87,12 @@ _STRUCTURE_SPECIFIC_ROOT_QNAME = (
 _PROBE_REPRESENTATION_IDENTITY = "SDMX_ML_2_1_STRUCTURE_SPECIFIC_DATA"
 _PROBE_STRUCTURE_ID = "BIS_WS_CBPOL_1_0"
 _PROBE_DATE_SET = tuple(date(2023, 1, day) for day in range(1, 32))
+_DATA_SCOPE_QNAME = (
+    f"{{{_SDMX_21_STRUCTURE_SPECIFIC_DATA_NAMESPACE}}}dataScope"
+)
+_STRUCTURE_REF_QNAME = (
+    f"{{{_SDMX_21_STRUCTURE_SPECIFIC_DATA_NAMESPACE}}}structureRef"
+)
 
 
 class DiscoveryFailure(ValueError):
@@ -635,8 +644,8 @@ def _parse_probe_structure_specific_xml(
     if not unit_measure or not unit_mult:
         raise DiscoveryFailure("schema_response_malformed")
     if (
-        dataset.attrib.get("dataScope") != "DataStructure"
-        or dataset.attrib.get("structureRef") != _PROBE_STRUCTURE_ID
+        dataset.attrib.get(_DATA_SCOPE_QNAME) != "DataStructure"
+        or dataset.attrib.get(_STRUCTURE_REF_QNAME) != _PROBE_STRUCTURE_ID
         or _expanded_lexical_qname(
             dataset.attrib.get(f"{{{_XSI_NAMESPACE}}}type"), namespaces
         )

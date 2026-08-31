@@ -102,6 +102,9 @@ PROBE_CSV = (
 
 SDMX_21_MESSAGE = "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message"
 SDMX_21_COMMON = "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common"
+SDMX_21_STRUCTURE_SPECIFIC_DATA = (
+    "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/data/structurespecific"
+)
 STRUCTURE_SPECIFIC_NAMESPACE = (
     "urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow="
     "BIS:WS_CBPOL(1.0):ObsLevelDim:TIME_PERIOD"
@@ -125,10 +128,13 @@ def probe_xml(
     reference_area: str = "US",
     unit_measure: str | None = "368",
     unit_mult: str | None = "0",
+    dataset_data_scope: str | None = "DataStructure",
     dates: tuple[str, ...] | None = None,
     missing_observation_field: str | None = None,
     structure_ref: str = "BIS_WS_CBPOL_1_0",
-    dataset_structure_ref: str = "BIS_WS_CBPOL_1_0",
+    dataset_structure_ref: str | None = "BIS_WS_CBPOL_1_0",
+    data_scope_attribute: str = "ssdata:dataScope",
+    structure_ref_attribute: str = "ssdata:structureRef",
     dataset_type_namespace: str | None = None,
 ) -> bytes:
     if dates is None:
@@ -161,9 +167,10 @@ def probe_xml(
         "<message:DataSet"
         + optional_attribute("UNIT_MEASURE", unit_measure)
         + optional_attribute("UNIT_MULT", unit_mult)
-        + ' dataScope="DataStructure"'
+        + optional_attribute(data_scope_attribute, dataset_data_scope)
         + ' xsi:type="ss:DataSetType"'
-        + f' structureRef="{dataset_structure_ref}">{series}</message:DataSet>'
+        + optional_attribute(structure_ref_attribute, dataset_structure_ref)
+        + f">{series}</message:DataSet>"
         for _ in range(dataset_count)
     )
     return (
@@ -171,6 +178,8 @@ def probe_xml(
         f'<message:{root_name} xmlns:message="{message_namespace}" '
         f'xmlns:common="{SDMX_21_COMMON}" '
         f'xmlns:ss="{semantic_namespace}" '
+        f'xmlns:ssdata="{SDMX_21_STRUCTURE_SPECIFIC_DATA}" '
+        'xmlns:wrong="urn:example:wrong-structure-specific-data" '
         'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
         "<message:Header>"
         f'<message:Structure structureID="{structure_ref}" namespace="{semantic_namespace}" '
@@ -510,6 +519,42 @@ def test_probe_discovers_strict_structure_specific_schema_without_exposing_value
     assert not hasattr(artifact, "observations")
     assert b"OBS_VALUE" in discovery.discovery_artifact_json(artifact)
     assert b'"0.01"' not in discovery.discovery_artifact_json(artifact)
+
+
+def test_probe_accepts_real_response_shaped_namespaced_dataset_attributes() -> None:
+    request = build_d_us_schema_probe_request(metadata_insufficient=True)
+    artifact = execute_discovery(
+        request,
+        FakeTransport(response(request.url, probe_xml(), "application/xml")),
+        RETRIEVED,
+    ).artifact
+    assert artifact.series_count == 1
+    assert artifact.observation_count == 31
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        probe_xml(dataset_data_scope=None),
+        probe_xml(dataset_structure_ref=None),
+        probe_xml(data_scope_attribute="dataScope"),
+        probe_xml(structure_ref_attribute="structureRef"),
+        probe_xml(data_scope_attribute="wrong:dataScope"),
+        probe_xml(structure_ref_attribute="wrong:structureRef"),
+        probe_xml(dataset_data_scope="AllDimensions"),
+        probe_xml(dataset_structure_ref="OTHER_STRUCTURE"),
+    ),
+)
+def test_probe_rejects_missing_unqualified_wrong_namespace_or_value_dataset_binding(
+    payload: bytes,
+) -> None:
+    request = build_d_us_schema_probe_request(metadata_insufficient=True)
+    with pytest.raises(DiscoveryFailure, match="response_series_mismatch"):
+        execute_discovery(
+            request,
+            FakeTransport(response(request.url, payload, "application/xml")),
+            RETRIEVED,
+        )
 
 
 @pytest.mark.parametrize(
