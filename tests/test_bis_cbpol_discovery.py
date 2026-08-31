@@ -100,6 +100,92 @@ PROBE_CSV = (
     b"D,US,2023-01-03,4.50,A,PCT,0\n"
 )
 
+SDMX_21_MESSAGE = "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message"
+SDMX_21_COMMON = "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common"
+STRUCTURE_SPECIFIC_NAMESPACE = (
+    "urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow="
+    "BIS:WS_CBPOL(1.0):ObsLevelDim:TIME_PERIOD"
+)
+STRUCTURE_SPECIFIC_MEDIA_TYPE = (
+    "application/vnd.sdmx.structurespecificdata+xml;version=2.1"
+)
+
+
+def probe_xml(
+    *,
+    agency: str = "BIS",
+    flow: str = "WS_CBPOL",
+    version: str = "1.0",
+    observation_dimension: str = "TIME_PERIOD",
+    message_namespace: str = SDMX_21_MESSAGE,
+    root_name: str = "StructureSpecificData",
+    dataset_count: int = 1,
+    series_count: int = 1,
+    frequency: str = "D",
+    reference_area: str = "US",
+    unit_measure: str | None = "368",
+    unit_mult: str | None = "0",
+    dates: tuple[str, ...] | None = None,
+    missing_observation_field: str | None = None,
+    structure_ref: str = "BIS_WS_CBPOL_1_0",
+    dataset_structure_ref: str = "BIS_WS_CBPOL_1_0",
+    dataset_type_namespace: str | None = None,
+) -> bytes:
+    if dates is None:
+        dates = tuple(f"2023-01-{day:02d}" for day in range(1, 32))
+    semantic_namespace = dataset_type_namespace or (
+        "urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow="
+        f"{agency}:{flow}({version}):ObsLevelDim:{observation_dimension}"
+    )
+
+    def optional_attribute(name: str, value: str | None) -> str:
+        return "" if value is None else f' {name}="{value}"'
+
+    observations = "".join(
+        "<Obs"
+        + ("" if missing_observation_field == "TIME_PERIOD" else f' TIME_PERIOD="{day}"')
+        + (
+            ""
+            if missing_observation_field == "OBS_VALUE"
+            else f' OBS_VALUE="{index / 100:.2f}"'
+        )
+        + ("" if missing_observation_field == "OBS_STATUS" else ' OBS_STATUS="A"')
+        + ' OBS_CONF="F" />'
+        for index, day in enumerate(dates, start=1)
+    )
+    series = "".join(
+        f'<Series FREQ="{frequency}" REF_AREA="{reference_area}">{observations}</Series>'
+        for _ in range(series_count)
+    )
+    datasets = "".join(
+        "<message:DataSet"
+        + optional_attribute("UNIT_MEASURE", unit_measure)
+        + optional_attribute("UNIT_MULT", unit_mult)
+        + ' dataScope="DataStructure"'
+        + ' xsi:type="ss:DataSetType"'
+        + f' structureRef="{dataset_structure_ref}">{series}</message:DataSet>'
+        for _ in range(dataset_count)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f'<message:{root_name} xmlns:message="{message_namespace}" '
+        f'xmlns:common="{SDMX_21_COMMON}" '
+        f'xmlns:ss="{semantic_namespace}" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+        "<message:Header>"
+        f'<message:Structure structureID="{structure_ref}" namespace="{semantic_namespace}" '
+        f'dimensionAtObservation="{observation_dimension}">'
+        "<common:StructureUsage>"
+        f'<Ref agencyID="{agency}" id="{flow}" version="{version}" />'
+        "</common:StructureUsage></message:Structure>"
+        "</message:Header>"
+        f"{datasets}"
+        f"</message:{root_name}>"
+    ).encode()
+
+
+PROBE_XML = probe_xml()
+
 
 def realistic_sdmx21_xml(*, include_flow: bool = True, include_dsd: bool = True) -> bytes:
     flow = (
@@ -290,6 +376,7 @@ def test_probe_is_fixed_to_d_us_and_predeclared_pre_2024_dates() -> None:
     assert "startPeriod=2023-01-01" in request.url
     assert "endPeriod=2023-01-31" in request.url
     assert "latest" not in request.url.lower()
+    assert request.accept == STRUCTURE_SPECIFIC_MEDIA_TYPE
     with pytest.raises(DiscoveryFailure, match="metadata_discovery_required_first"):
         build_d_us_schema_probe_request(metadata_insufficient=False)
     with pytest.raises(DiscoveryFailure, match="request_not_approved"):
@@ -390,24 +477,199 @@ def test_status_vocabulary_requires_dsd_component_codelist_provenance() -> None:
         execute_discovery(request, FakeTransport(response(request.url, unbound_status)), RETRIEVED)
 
 
-def test_probe_discovers_actual_columns_status_unit_and_scale_without_values() -> None:
+@pytest.mark.parametrize(
+    "media_type",
+    (STRUCTURE_SPECIFIC_MEDIA_TYPE, "application/xml"),
+)
+def test_probe_discovers_strict_structure_specific_schema_without_exposing_values(
+    media_type: str,
+) -> None:
     request = build_d_us_schema_probe_request(metadata_insufficient=True)
-    transport = FakeTransport(response(request.url, PROBE_CSV, "text/csv"))
+    transport = FakeTransport(response(request.url, PROBE_XML, media_type))
     artifact = execute_discovery(request, transport, RETRIEVED).artifact
     assert artifact.returned_columns == (
         "FREQ",
         "REF_AREA",
+        "UNIT_MEASURE",
+        "UNIT_MULT",
         "TIME_PERIOD",
         "OBS_VALUE",
         "OBS_STATUS",
-        "UNIT_MEASURE",
-        "UNIT_MULT",
+        "OBS_CONF",
     )
     assert artifact.status_vocabulary == ("A",)
-    assert artifact.units == ("PCT",)
+    assert artifact.units == ("368",)
     assert artifact.scales == ("0",)
+    assert artifact.representation_identity == "SDMX_ML_2_1_STRUCTURE_SPECIFIC_DATA"
+    assert artifact.root_qname == f"{{{SDMX_21_MESSAGE}}}StructureSpecificData"
+    assert artifact.structure_specific_namespace == STRUCTURE_SPECIFIC_NAMESPACE
+    assert artifact.series_count == 1
+    assert artifact.observation_count == 31
+    assert artifact.parsed_min_observation_date == date(2023, 1, 1)
+    assert artifact.parsed_max_observation_date == date(2023, 1, 31)
     assert not hasattr(artifact, "observations")
-    assert b"4.50" not in discovery.discovery_artifact_json(artifact)
+    assert b"OBS_VALUE" in discovery.discovery_artifact_json(artifact)
+    assert b'"0.01"' not in discovery.discovery_artifact_json(artifact)
+
+
+@pytest.mark.parametrize(
+    ("media_type", "payload", "reason"),
+    (
+        ("application/xml", b"<unrelated />", "schema_representation_mismatch"),
+        (
+            "application/xml",
+            probe_xml(root_name="GenericData"),
+            "schema_representation_mismatch",
+        ),
+        ("text/csv", PROBE_XML, "media_type_not_approved"),
+        ("application/xml", PROBE_CSV, "schema_response_malformed"),
+        (
+            "application/vnd.sdmx.structurespecificdata+xml;version=2.0",
+            PROBE_XML,
+            "media_type_not_approved",
+        ),
+        ("application/json", PROBE_XML, "media_type_not_approved"),
+    ),
+)
+def test_probe_media_and_body_dispatch_fail_closed(
+    media_type: str, payload: bytes, reason: str
+) -> None:
+    request = build_d_us_schema_probe_request(metadata_insufficient=True)
+    with pytest.raises(DiscoveryFailure, match=reason):
+        execute_discovery(
+            request,
+            FakeTransport(response(request.url, payload, media_type)),
+            RETRIEVED,
+        )
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    (
+        (b"<message:StructureSpecificData", "schema_response_malformed"),
+        (
+            b'<!DOCTYPE x [<!ELEMENT x ANY>]><x />',
+            "schema_response_malformed",
+        ),
+        (
+            b'<!DOCTYPE x [<!ENTITY secret "x">]><x>&secret;</x>',
+            "schema_response_malformed",
+        ),
+        (
+            b"\xff\xfe"
+            + '<!DOCTYPE x [<!ENTITY secret "x">]><x>&secret;</x>'.encode(
+                "utf-16-le"
+            ),
+            "schema_response_malformed",
+        ),
+        (b"<html><body>error</body></html>", "schema_representation_mismatch"),
+        (
+            probe_xml(message_namespace=SDMX_21_MESSAGE.replace("v2_1", "v2_0")),
+            "schema_representation_mismatch",
+        ),
+    ),
+)
+def test_probe_rejects_unsafe_or_incompatible_xml(payload: bytes, reason: str) -> None:
+    request = build_d_us_schema_probe_request(metadata_insufficient=True)
+    with pytest.raises(DiscoveryFailure, match=reason):
+        execute_discovery(
+            request,
+            FakeTransport(response(request.url, payload, "application/xml")),
+            RETRIEVED,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        probe_xml(agency="ECB"),
+        probe_xml(flow="OTHER_FLOW"),
+        probe_xml(version="2.0"),
+        probe_xml(observation_dimension="OTHER_TIME"),
+        probe_xml(dataset_structure_ref="OTHER_STRUCTURE"),
+        probe_xml(dataset_type_namespace="urn:example:unrelated"),
+    ),
+)
+def test_probe_rejects_wrong_structure_specific_binding(payload: bytes) -> None:
+    request = build_d_us_schema_probe_request(metadata_insufficient=True)
+    with pytest.raises(DiscoveryFailure, match="response_series_mismatch"):
+        execute_discovery(
+            request,
+            FakeTransport(response(request.url, payload, "application/xml")),
+            RETRIEVED,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        probe_xml(dataset_count=0),
+        probe_xml(dataset_count=2),
+        probe_xml(series_count=0),
+        probe_xml(series_count=2),
+        probe_xml(frequency="M"),
+        probe_xml(reference_area="CA"),
+        probe_xml(unit_measure=None),
+        probe_xml(unit_mult=None),
+        probe_xml(missing_observation_field="TIME_PERIOD"),
+        probe_xml(missing_observation_field="OBS_VALUE"),
+        probe_xml(missing_observation_field="OBS_STATUS"),
+    ),
+)
+def test_probe_rejects_missing_or_inconsistent_required_structure(payload: bytes) -> None:
+    request = build_d_us_schema_probe_request(metadata_insufficient=True)
+    with pytest.raises(DiscoveryFailure):
+        execute_discovery(
+            request,
+            FakeTransport(response(request.url, payload, "application/xml")),
+            RETRIEVED,
+        )
+
+
+@pytest.mark.parametrize(
+    "dates",
+    (
+        tuple(f"2023-01-{day:02d}" for day in range(1, 31)),
+        tuple(f"2023-01-{day:02d}" for day in range(1, 31)) + ("2023-01-30",),
+        ("not-a-date",) + tuple(f"2023-01-{day:02d}" for day in range(2, 32)),
+        ("2022-12-31",) + tuple(f"2023-01-{day:02d}" for day in range(2, 32)),
+        tuple(f"2023-01-{day:02d}" for day in range(1, 31)) + ("2023-02-01",),
+    ),
+)
+def test_probe_requires_exact_complete_january_2023_date_set(dates: tuple[str, ...]) -> None:
+    request = build_d_us_schema_probe_request(metadata_insufficient=True)
+    with pytest.raises(DiscoveryFailure):
+        execute_discovery(
+            request,
+            FakeTransport(response(request.url, probe_xml(dates=dates), "application/xml")),
+            RETRIEVED,
+        )
+
+
+def test_probe_rejects_post_2023_before_observation_value_validation(monkeypatch) -> None:
+    request = build_d_us_schema_probe_request(metadata_insufficient=True)
+    contaminated_dates = tuple(f"2023-01-{day:02d}" for day in range(1, 31)) + (
+        "2024-01-01",
+    )
+    payload = probe_xml(dates=contaminated_dates).replace(
+        b'OBS_VALUE="0.31"', b'OBS_VALUE="SECRET_SENTINEL"'
+    )
+
+    def fail_if_values_are_touched(_observations) -> None:
+        pytest.fail("observation values accessed before sealed dates passed")
+
+    monkeypatch.setattr(
+        discovery,
+        "_validate_probe_observation_values",
+        fail_if_values_are_touched,
+        raising=False,
+    )
+    with pytest.raises(DiscoveryFailure, match="sealed_window_violation"):
+        execute_discovery(
+            request,
+            FakeTransport(response(request.url, payload, "application/xml")),
+            RETRIEVED,
+        )
 
 
 @pytest.mark.parametrize(
@@ -498,8 +760,11 @@ def test_malformed_metadata_and_unexpected_media_type_fail_closed() -> None:
 
 def test_probe_rejects_post_2023_response_without_truncation() -> None:
     request = build_d_us_schema_probe_request(metadata_insufficient=True)
-    contaminated = PROBE_CSV + b"D,US,2024-01-02,SECRET_SENTINEL,A,PCT,0\n"
-    transport = FakeTransport(response(request.url, contaminated, "text/csv"))
+    contaminated_dates = tuple(f"2023-01-{day:02d}" for day in range(1, 31)) + (
+        "2024-01-02",
+    )
+    contaminated = probe_xml(dates=contaminated_dates)
+    transport = FakeTransport(response(request.url, contaminated, "application/xml"))
     with pytest.raises(DiscoveryFailure, match="sealed_window_violation"):
         execute_discovery(request, transport, RETRIEVED)
     assert len(transport.calls) == 1
@@ -507,18 +772,21 @@ def test_probe_rejects_post_2023_response_without_truncation() -> None:
 
 def test_request_response_mismatch_and_outside_probe_interval_fail_closed() -> None:
     request = build_d_us_schema_probe_request(metadata_insufficient=True)
-    wrong_series = PROBE_CSV.replace(b"D,US,", b"D,CA,")
+    wrong_series = probe_xml(reference_area="CA")
     with pytest.raises(DiscoveryFailure, match="response_series_mismatch"):
         execute_discovery(
             request,
-            FakeTransport(response(request.url, wrong_series, "text/csv")),
+            FakeTransport(response(request.url, wrong_series, "application/xml")),
             RETRIEVED,
         )
-    outside = PROBE_CSV.replace(b"2023-01-03", b"2023-02-01")
+    outside_dates = tuple(f"2023-01-{day:02d}" for day in range(1, 31)) + (
+        "2023-02-01",
+    )
+    outside = probe_xml(dates=outside_dates)
     with pytest.raises(DiscoveryFailure, match="observation_outside_request"):
         execute_discovery(
             request,
-            FakeTransport(response(request.url, outside, "text/csv")),
+            FakeTransport(response(request.url, outside, "application/xml")),
             RETRIEVED,
         )
 

@@ -9,7 +9,6 @@ contracts.
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import io
 import sys
@@ -20,6 +19,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
@@ -48,7 +48,7 @@ _PROBE_URL = (
     "?startPeriod=2023-01-01&endPeriod=2023-01-31"
 )
 _STRUCTURE_ACCEPT = "application/vnd.sdmx.structure+xml;version=2.1"
-_PROBE_ACCEPT = "text/csv"
+_PROBE_ACCEPT = "application/vnd.sdmx.structurespecificdata+xml;version=2.1"
 _RETAINED_HEADERS = frozenset(
     {
         "cache-control",
@@ -66,10 +66,24 @@ _STRUCTURE_MEDIA_TYPES = frozenset(
         "text/xml",
     }
 )
-_PROBE_MEDIA_TYPES = frozenset({"application/vnd.sdmx.data+csv", "text/csv"})
+_PROBE_MEDIA_TYPES = frozenset(
+    {"application/vnd.sdmx.structurespecificdata+xml", "application/xml"}
+)
 _SDMX_21_MESSAGE_NAMESPACE = (
     "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message"
 )
+_SDMX_21_COMMON_NAMESPACE = "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common"
+_XSI_NAMESPACE = "http://www.w3.org/2001/XMLSchema-instance"
+_STRUCTURE_SPECIFIC_NAMESPACE = (
+    "urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow="
+    "BIS:WS_CBPOL(1.0):ObsLevelDim:TIME_PERIOD"
+)
+_STRUCTURE_SPECIFIC_ROOT_QNAME = (
+    f"{{{_SDMX_21_MESSAGE_NAMESPACE}}}StructureSpecificData"
+)
+_PROBE_REPRESENTATION_IDENTITY = "SDMX_ML_2_1_STRUCTURE_SPECIFIC_DATA"
+_PROBE_STRUCTURE_ID = "BIS_WS_CBPOL_1_0"
+_PROBE_DATE_SET = tuple(date(2023, 1, day) for day in range(1, 32))
 
 
 class DiscoveryFailure(ValueError):
@@ -229,6 +243,13 @@ class _SchemaFacts:
     scales: tuple[str, ...] = ()
     dsd_content_fingerprint: str | None = None
     codelist_content_fingerprints: tuple[tuple[str, str], ...] = ()
+    representation_identity: str | None = None
+    root_qname: str | None = None
+    structure_specific_namespace: str | None = None
+    series_count: int = 0
+    observation_count: int = 0
+    parsed_min_observation_date: date | None = None
+    parsed_max_observation_date: date | None = None
 
 
 @dataclass(frozen=True)
@@ -254,6 +275,13 @@ class BisDiscoveryArtifact:
     scales: tuple[str, ...]
     dsd_content_fingerprint: str | None
     codelist_content_fingerprints: tuple[tuple[str, str], ...]
+    representation_identity: str | None
+    root_qname: str | None
+    structure_specific_namespace: str | None
+    series_count: int
+    observation_count: int
+    parsed_min_observation_date: date | None
+    parsed_max_observation_date: date | None
     schema_fingerprint: str
     discovery_id: str
     authoritative_qualification_eligible: bool = False
@@ -499,63 +527,228 @@ def _parse_structure_xml(raw_bytes: bytes) -> _SchemaFacts:
     )
 
 
-def _parse_probe_csv(raw_bytes: bytes, request: DiscoveryRequest) -> _SchemaFacts:
+def _parse_xml_with_namespaces(
+    raw_bytes: bytes,
+) -> tuple[ET.Element, Mapping[str, str]]:
     try:
-        reader = csv.DictReader(io.StringIO(raw_bytes.decode("utf-8-sig", errors="strict")))
-        columns = tuple(reader.fieldnames or ())
-        rows = tuple(reader)
-    except (csv.Error, UnicodeError) as exc:
+        decoded_xml = raw_bytes.decode("utf-8-sig", errors="strict")
+    except UnicodeError as exc:
         raise DiscoveryFailure("schema_response_malformed") from exc
-    if (
-        not columns
-        or len(columns) != len(set(columns))
-        or not {"FREQ", "REF_AREA", "TIME_PERIOD"}.issubset(columns)
-        or not rows
-    ):
+    upper = decoded_xml.upper()
+    if "<!DOCTYPE" in upper or "<!ENTITY" in upper:
         raise DiscoveryFailure("schema_response_malformed")
-
-    inspected_dates: list[date] = []
+    namespaces: dict[str, str] = {}
     try:
-        for row in rows:
-            timestamp = row["TIME_PERIOD"]
+        for _, (prefix, namespace) in ET.iterparse(
+            io.BytesIO(raw_bytes), events=("start-ns",)
+        ):
+            previous = namespaces.get(prefix)
+            if previous is not None and previous != namespace:
+                raise DiscoveryFailure("schema_response_malformed")
+            namespaces[prefix] = namespace
+        root = ET.fromstring(raw_bytes)
+    except DiscoveryFailure:
+        raise
+    except (ET.ParseError, UnicodeError, ValueError) as exc:
+        raise DiscoveryFailure("schema_response_malformed") from exc
+    return root, MappingProxyType(dict(namespaces))
+
+
+def _expanded_lexical_qname(value: str | None, namespaces: Mapping[str, str]) -> str:
+    if not value or value.count(":") != 1:
+        raise DiscoveryFailure("response_series_mismatch")
+    prefix, local_name = value.split(":", 1)
+    namespace = namespaces.get(prefix)
+    if not namespace or not local_name:
+        raise DiscoveryFailure("response_series_mismatch")
+    return f"{{{namespace}}}{local_name}"
+
+
+def _validate_probe_observation_values(
+    observations: tuple[ET.Element, ...],
+) -> tuple[tuple[str, ...], bool]:
+    statuses: set[str] = set()
+    has_observation_confidence = False
+    for observation in observations:
+        value = observation.attrib.get("OBS_VALUE")
+        status = observation.attrib.get("OBS_STATUS")
+        if not value or not status:
+            raise DiscoveryFailure("schema_response_malformed")
+        try:
+            parsed_value = Decimal(value)
+        except (InvalidOperation, ValueError) as exc:
+            raise DiscoveryFailure("schema_response_malformed") from exc
+        if not parsed_value.is_finite():
+            raise DiscoveryFailure("schema_response_malformed")
+        statuses.add(status)
+        if "OBS_CONF" in observation.attrib:
+            if not observation.attrib["OBS_CONF"]:
+                raise DiscoveryFailure("schema_response_malformed")
+            has_observation_confidence = True
+    return tuple(sorted(statuses)), has_observation_confidence
+
+
+def _parse_probe_structure_specific_xml(
+    raw_bytes: bytes, request: DiscoveryRequest
+) -> _SchemaFacts:
+    root, namespaces = _parse_xml_with_namespaces(raw_bytes)
+    if root.tag != _STRUCTURE_SPECIFIC_ROOT_QNAME:
+        raise DiscoveryFailure("schema_representation_mismatch")
+    if _STRUCTURE_SPECIFIC_NAMESPACE not in namespaces.values():
+        raise DiscoveryFailure("response_series_mismatch")
+
+    header_qname = f"{{{_SDMX_21_MESSAGE_NAMESPACE}}}Header"
+    structure_qname = f"{{{_SDMX_21_MESSAGE_NAMESPACE}}}Structure"
+    usage_qname = f"{{{_SDMX_21_COMMON_NAMESPACE}}}StructureUsage"
+    headers = root.findall(header_qname)
+    if len(headers) != 1:
+        raise DiscoveryFailure("response_series_mismatch")
+    structures = headers[0].findall(structure_qname)
+    if len(structures) != 1:
+        raise DiscoveryFailure("response_series_mismatch")
+    structure = structures[0]
+    if (
+        structure.attrib.get("structureID") != _PROBE_STRUCTURE_ID
+        or structure.attrib.get("namespace") != _STRUCTURE_SPECIFIC_NAMESPACE
+        or structure.attrib.get("dimensionAtObservation") != "TIME_PERIOD"
+    ):
+        raise DiscoveryFailure("response_series_mismatch")
+    usages = structure.findall(usage_qname)
+    if len(usages) != 1:
+        raise DiscoveryFailure("response_series_mismatch")
+    references = [element for element in usages[0] if element.tag == "Ref"]
+    if len(references) != 1 or (
+        references[0].attrib.get("agencyID"),
+        references[0].attrib.get("id"),
+        references[0].attrib.get("version"),
+    ) != ("BIS", "WS_CBPOL", "1.0"):
+        raise DiscoveryFailure("response_series_mismatch")
+
+    dataset_qname = f"{{{_SDMX_21_MESSAGE_NAMESPACE}}}DataSet"
+    datasets = root.findall(dataset_qname)
+    all_datasets = [item for item in root.iter() if _local_name(item.tag) == "DataSet"]
+    if len(datasets) != 1 or all_datasets != datasets:
+        raise DiscoveryFailure("schema_response_malformed")
+    dataset = datasets[0]
+    unit_measure = dataset.attrib.get("UNIT_MEASURE")
+    unit_mult = dataset.attrib.get("UNIT_MULT")
+    if not unit_measure or not unit_mult:
+        raise DiscoveryFailure("schema_response_malformed")
+    if (
+        dataset.attrib.get("dataScope") != "DataStructure"
+        or dataset.attrib.get("structureRef") != _PROBE_STRUCTURE_ID
+        or _expanded_lexical_qname(
+            dataset.attrib.get(f"{{{_XSI_NAMESPACE}}}type"), namespaces
+        )
+        != f"{{{_STRUCTURE_SPECIFIC_NAMESPACE}}}DataSetType"
+    ):
+        raise DiscoveryFailure("response_series_mismatch")
+
+    series = [element for element in dataset if element.tag == "Series"]
+    all_series = [item for item in root.iter() if _local_name(item.tag) == "Series"]
+    if len(series) != 1 or all_series != series:
+        raise DiscoveryFailure("schema_response_malformed")
+    series_element = series[0]
+    if (
+        series_element.attrib.get("FREQ") != "D"
+        or series_element.attrib.get("REF_AREA") != "US"
+    ):
+        raise DiscoveryFailure("response_series_mismatch")
+
+    observations = tuple(element for element in series_element if element.tag == "Obs")
+    all_observations = [
+        item for item in root.iter() if _local_name(item.tag) == "Obs"
+    ]
+    if (
+        len(observations) != len(_PROBE_DATE_SET)
+        or all_observations != list(observations)
+    ):
+        raise DiscoveryFailure("probe_date_set_mismatch")
+
+    observed_dates: list[date] = []
+    for observation in observations:
+        timestamp = observation.attrib.get("TIME_PERIOD")
+        try:
             if timestamp is None or len(timestamp) != 10:
                 raise ValueError
             observed = date.fromisoformat(timestamp)
-            if observed > MAX_OBSERVATION_DATE:
-                raise DiscoveryFailure("sealed_window_violation")
-            inspected_dates.append(observed)
-    except DiscoveryFailure:
-        raise
-    except (KeyError, TypeError, ValueError) as exc:
-        raise DiscoveryFailure("observation_timestamp_invalid") from exc
+        except (TypeError, ValueError) as exc:
+            raise DiscoveryFailure("observation_timestamp_invalid") from exc
+        if observed > MAX_OBSERVATION_DATE:
+            raise DiscoveryFailure("sealed_window_violation")
+        observed_dates.append(observed)
 
     if request.start is None or request.end is None:
         raise DiscoveryFailure("request_not_approved")
-    if any(item < request.start or item > request.end for item in inspected_dates):
+    if any(observed < request.start or observed > request.end for observed in observed_dates):
         raise DiscoveryFailure("observation_outside_request")
-    if any(row.get("FREQ") != "D" or row.get("REF_AREA") != "US" for row in rows):
-        raise DiscoveryFailure("response_series_mismatch")
+    if len(set(observed_dates)) != len(observed_dates):
+        raise DiscoveryFailure("duplicate_observation")
+    if set(observed_dates) != set(_PROBE_DATE_SET):
+        raise DiscoveryFailure("probe_date_set_mismatch")
 
-    def values(column: str) -> tuple[str, ...]:
-        if column not in columns:
-            return ()
-        found = [row[column] for row in rows if row.get(column)]
-        return tuple(sorted(set(found)))
-
+    statuses, has_observation_confidence = _validate_probe_observation_values(
+        observations
+    )
+    returned_columns = (
+        "FREQ",
+        "REF_AREA",
+        "UNIT_MEASURE",
+        "UNIT_MULT",
+        "TIME_PERIOD",
+        "OBS_VALUE",
+        "OBS_STATUS",
+    ) + (("OBS_CONF",) if has_observation_confidence else ())
+    attributes = ("OBS_STATUS", "UNIT_MEASURE", "UNIT_MULT") + (
+        ("OBS_CONF",) if has_observation_confidence else ()
+    )
     return _SchemaFacts(
-        returned_columns=columns,
-        dimensions=tuple(item for item in ("FREQ", "REF_AREA", "TIME_PERIOD") if item in columns),
-        attributes=tuple(
-            item for item in ("OBS_STATUS", "UNIT_MEASURE", "UNIT_MULT") if item in columns
-        ),
-        status_vocabulary=values("OBS_STATUS"),
-        units=values("UNIT_MEASURE"),
-        scales=values("UNIT_MULT"),
+        structure_identifiers=("BIS:WS_CBPOL(1.0)", _STRUCTURE_SPECIFIC_NAMESPACE),
+        returned_columns=returned_columns,
+        dimensions=("FREQ", "REF_AREA", "TIME_PERIOD"),
+        attributes=attributes,
+        status_vocabulary=statuses,
+        units=(unit_measure,),
+        scales=(unit_mult,),
+        representation_identity=_PROBE_REPRESENTATION_IDENTITY,
+        root_qname=root.tag,
+        structure_specific_namespace=_STRUCTURE_SPECIFIC_NAMESPACE,
+        series_count=1,
+        observation_count=len(observations),
+        parsed_min_observation_date=min(observed_dates),
+        parsed_max_observation_date=max(observed_dates),
     )
 
 
 def _normalized_media_type(value: str) -> str:
     return value.split(";", 1)[0].strip().lower()
+
+
+def _validated_probe_media_type(value: str) -> str:
+    parts = tuple(part.strip().lower() for part in value.split(";"))
+    base = parts[0]
+    parameters: dict[str, str] = {}
+    for part in parts[1:]:
+        if not part or part.count("=") != 1:
+            raise DiscoveryFailure("media_type_not_approved")
+        key, parameter_value = (item.strip() for item in part.split("=", 1))
+        parameter_value = parameter_value.strip('"')
+        if not key or not parameter_value or key in parameters:
+            raise DiscoveryFailure("media_type_not_approved")
+        parameters[key] = parameter_value
+    if base == "application/vnd.sdmx.structurespecificdata+xml":
+        if parameters.get("version") != "2.1" or not set(parameters).issubset(
+            {"version", "charset"}
+        ):
+            raise DiscoveryFailure("media_type_not_approved")
+    elif base == "application/xml":
+        if not set(parameters).issubset({"charset"}):
+            raise DiscoveryFailure("media_type_not_approved")
+    else:
+        raise DiscoveryFailure("media_type_not_approved")
+    if "charset" in parameters and parameters["charset"] not in {"utf-8", "utf8"}:
+        raise DiscoveryFailure("media_type_not_approved")
+    return base
 
 
 def _validated_retrieval_timestamp(retrieved_at: datetime) -> datetime:
@@ -602,7 +795,11 @@ def _build_discovery_result(
     if not response.raw_bytes:
         raise DiscoveryFailure("empty_response")
 
-    media_type = _normalized_media_type(response.media_type)
+    media_type = (
+        _validated_probe_media_type(response.media_type)
+        if request.target == DiscoveryTarget.D_US_SCHEMA_PROBE
+        else _normalized_media_type(response.media_type)
+    )
     allowed = (
         _STRUCTURE_MEDIA_TYPES
         if request.target == DiscoveryTarget.STRUCTURE
@@ -613,7 +810,7 @@ def _build_discovery_result(
     facts = (
         _parse_structure_xml(response.raw_bytes)
         if request.target == DiscoveryTarget.STRUCTURE
-        else _parse_probe_csv(response.raw_bytes, request)
+        else _parse_probe_structure_specific_xml(response.raw_bytes, request)
     )
     headers = {
         key: value
@@ -664,6 +861,13 @@ def _build_discovery_result(
         scales=facts.scales,
         dsd_content_fingerprint=facts.dsd_content_fingerprint,
         codelist_content_fingerprints=facts.codelist_content_fingerprints,
+        representation_identity=facts.representation_identity,
+        root_qname=facts.root_qname,
+        structure_specific_namespace=facts.structure_specific_namespace,
+        series_count=facts.series_count,
+        observation_count=facts.observation_count,
+        parsed_min_observation_date=facts.parsed_min_observation_date,
+        parsed_max_observation_date=facts.parsed_max_observation_date,
         schema_fingerprint=schema_fingerprint,
         discovery_id=discovery_id,
     )
