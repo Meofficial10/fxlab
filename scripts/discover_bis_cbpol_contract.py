@@ -15,6 +15,7 @@ import io
 import sys
 import urllib.error
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from urllib.parse import parse_qsl, urlsplit
 from fxlab.data.policy_rates import MAX_OBSERVATION_DATE, canonical_json, canonical_sha256
 
 DISCOVERY_CLASSIFICATION = "NON_AUTHORITATIVE_DISCOVERY"
+FAILED_DISCOVERY_CLASSIFICATION = "NON_AUTHORITATIVE_DISCOVERY_FAILED"
 BIS_API_HOST = "stats.bis.org"
 BIS_API_PREFIX = "/api/v2/"
 DISCOVERY_SAMPLE_START = date(2023, 1, 1)
@@ -38,13 +40,14 @@ _READ_CHUNK_BYTES = 64 * 1024
 RAW_DISCOVERY_ROOT = Path("data/raw/candidate_b/bis_discovery")
 
 _STRUCTURE_URL = (
-    "https://stats.bis.org/api/v2/structure/dataflow/BIS/WS_CBPOL/1.0?references=all"
+    "https://stats.bis.org/api/v2/structure/dataflow/BIS/WS_CBPOL/1.0"
+    "?detail=referencepartial&references=descendants"
 )
 _PROBE_URL = (
     "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.US"
     "?startPeriod=2023-01-01&endPeriod=2023-01-31"
 )
-_STRUCTURE_ACCEPT = "application/vnd.sdmx.structure+xml;version=2.0"
+_STRUCTURE_ACCEPT = "application/vnd.sdmx.structure+xml;version=2.1"
 _PROBE_ACCEPT = "text/csv"
 _RETAINED_HEADERS = frozenset(
     {
@@ -64,6 +67,9 @@ _STRUCTURE_MEDIA_TYPES = frozenset(
     }
 )
 _PROBE_MEDIA_TYPES = frozenset({"application/vnd.sdmx.data+csv", "text/csv"})
+_SDMX_21_MESSAGE_NAMESPACE = (
+    "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message"
+)
 
 
 class DiscoveryFailure(ValueError):
@@ -142,7 +148,7 @@ def _validate_request_values(request: DiscoveryRequest) -> None:
         raise DiscoveryFailure("request_not_approved")
     query = tuple(parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True))
     expected_query = (
-        (("references", "all"),)
+        (("detail", "referencepartial"), ("references", "descendants"))
         if request.target == DiscoveryTarget.STRUCTURE
         else (("startPeriod", "2023-01-01"), ("endPeriod", "2023-01-31"))
     )
@@ -279,8 +285,52 @@ class BisDiscoveryResult:
     artifact: BisDiscoveryArtifact
 
 
+@dataclass(frozen=True)
+class FailedBisDiscoveryArtifact:
+    classification: str
+    target: DiscoveryTarget
+    retrieved_at: datetime
+    request_identity: str
+    exact_url: str
+    http_status: int
+    content_type: str
+    raw_sha256: str
+    byte_count: int
+    response_headers: Mapping[str, str]
+    failure_reason: str
+    authoritative_qualification_eligible: bool = False
+    final_run_identity_eligible: bool = False
+    r4_evidence_eligible: bool = False
+
+    def __post_init__(self) -> None:
+        if self.classification != FAILED_DISCOVERY_CLASSIFICATION:
+            raise DiscoveryFailure("discovery_classification_invalid")
+        if any(
+            (
+                self.authoritative_qualification_eligible,
+                self.final_run_identity_eligible,
+                self.r4_evidence_eligible,
+            )
+        ):
+            raise DiscoveryFailure("discovery_cannot_be_authoritative")
+        if not isinstance(self.failure_reason, str) or not self.failure_reason:
+            raise DiscoveryFailure("discovery_artifact_invalid")
+        headers = {str(key).lower(): str(value) for key, value in self.response_headers.items()}
+        if not set(headers).issubset(_RETAINED_HEADERS):
+            raise DiscoveryFailure("response_header_not_approved")
+        object.__setattr__(
+            self, "response_headers", MappingProxyType(dict(sorted(headers.items())))
+        )
+
+
 def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
+
+
+def _namespace(tag: str) -> str | None:
+    if not tag.startswith("{") or "}" not in tag:
+        return None
+    return tag[1:].split("}", 1)[0]
 
 
 def _sdmx_identity(element: ET.Element) -> str | None:
@@ -328,6 +378,11 @@ def _parse_structure_xml(raw_bytes: bytes) -> _SchemaFacts:
         root = ET.fromstring(raw_bytes)
     except (ET.ParseError, ValueError) as exc:
         raise DiscoveryFailure("metadata_response_malformed") from exc
+    if (
+        _local_name(root.tag) != "Structure"
+        or _namespace(root.tag) != _SDMX_21_MESSAGE_NAMESPACE
+    ):
+        raise DiscoveryFailure("metadata_representation_mismatch")
 
     flows = [
         element
@@ -335,6 +390,8 @@ def _parse_structure_xml(raw_bytes: bytes) -> _SchemaFacts:
         if _local_name(element.tag) == "Dataflow"
         and _sdmx_identity(element) == "BIS:WS_CBPOL(1.0)"
     ]
+    if not flows:
+        raise DiscoveryFailure("metadata_structure_incomplete")
     if len(flows) != 1:
         raise DiscoveryFailure("metadata_response_malformed")
     flow = flows[0]
@@ -354,6 +411,8 @@ def _parse_structure_xml(raw_bytes: bytes) -> _SchemaFacts:
         if identity:
             dsd_references.append(identity)
     dsd_refs = _ordered_unique(dsd_references)
+    if not dsd_refs:
+        raise DiscoveryFailure("metadata_structure_incomplete")
     if len(dsd_refs) != 1:
         raise DiscoveryFailure("metadata_response_malformed")
     dsd_identity = dsd_refs[0]
@@ -363,6 +422,8 @@ def _parse_structure_xml(raw_bytes: bytes) -> _SchemaFacts:
         for element in root.iter()
         if _local_name(element.tag) in {"DataStructure", "DataStructureDefinition"}
     ]
+    if not dsd_elements:
+        raise DiscoveryFailure("metadata_structure_incomplete")
     if len(dsd_elements) != 1 or _sdmx_identity(dsd_elements[0]) != dsd_identity:
         raise DiscoveryFailure("metadata_response_malformed")
     dsd_element = dsd_elements[0]
@@ -497,17 +558,17 @@ def _normalized_media_type(value: str) -> str:
     return value.split(";", 1)[0].strip().lower()
 
 
-def execute_discovery(
-    request: DiscoveryRequest,
-    transport: DiscoveryTransport,
-    retrieved_at: datetime,
-) -> BisDiscoveryResult:
-    """Execute exactly one already-approved discovery request."""
-
-    validate_discovery_request(request)
+def _validated_retrieval_timestamp(retrieved_at: datetime) -> datetime:
     if not isinstance(retrieved_at, datetime) or retrieved_at.tzinfo is None:
         raise DiscoveryFailure("retrieval_timestamp_invalid")
-    retrieved = retrieved_at.astimezone(UTC)
+    return retrieved_at.astimezone(UTC)
+
+
+def _fetch_discovery_response(
+    request: DiscoveryRequest,
+    transport: DiscoveryTransport,
+) -> DiscoveryHttpResponse:
+    validate_discovery_request(request)
     try:
         response = transport.fetch(
             request,
@@ -522,6 +583,14 @@ def execute_discovery(
         raise DiscoveryFailure("transport_failure") from exc
     if not isinstance(response, DiscoveryHttpResponse):
         raise DiscoveryFailure("transport_response_invalid")
+    return response
+
+
+def _build_discovery_result(
+    request: DiscoveryRequest,
+    response: DiscoveryHttpResponse,
+    retrieved: datetime,
+) -> BisDiscoveryResult:
     if 300 <= response.status_code <= 399:
         raise DiscoveryFailure("redirect_rejected")
     if response.status_code != 200:
@@ -601,8 +670,26 @@ def execute_discovery(
     return BisDiscoveryResult(response.raw_bytes, artifact)
 
 
+def execute_discovery(
+    request: DiscoveryRequest,
+    transport: DiscoveryTransport,
+    retrieved_at: datetime,
+) -> BisDiscoveryResult:
+    """Execute exactly one already-approved discovery request."""
+
+    retrieved = _validated_retrieval_timestamp(retrieved_at)
+    response = _fetch_discovery_response(request, transport)
+    return _build_discovery_result(request, response, retrieved)
+
+
 def discovery_artifact_json(artifact: BisDiscoveryArtifact) -> bytes:
     if not isinstance(artifact, BisDiscoveryArtifact):
+        raise DiscoveryFailure("discovery_artifact_invalid")
+    return (canonical_json(artifact) + "\n").encode("utf-8")
+
+
+def failed_discovery_artifact_json(artifact: FailedBisDiscoveryArtifact) -> bytes:
+    if not isinstance(artifact, FailedBisDiscoveryArtifact):
         raise DiscoveryFailure("discovery_artifact_invalid")
     return (canonical_json(artifact) + "\n").encode("utf-8")
 
@@ -628,6 +715,100 @@ def persist_discovery_result(
     raw_path.write_bytes(result.raw_bytes)
     manifest_path.write_bytes(discovery_artifact_json(result.artifact))
     return raw_path, manifest_path
+
+
+def _failed_artifact_directory(
+    request: DiscoveryRequest, retrieved: datetime, raw_sha256: str
+) -> Path:
+    timestamp = retrieved.strftime("%Y%m%dT%H%M%S%fZ")
+    return (
+        RAW_DISCOVERY_ROOT
+        / f"{request.target.value}-{request.request_identity[:16]}"
+        / f"failed-{timestamp}-{raw_sha256[:12]}"
+    )
+
+
+def persist_failed_discovery_response(
+    request: DiscoveryRequest,
+    response: DiscoveryHttpResponse,
+    retrieved_at: datetime,
+    failure_reason: str,
+) -> tuple[Path, Path]:
+    """Atomically retain a returned but rejected response as ineligible audit evidence."""
+
+    validate_discovery_request(request)
+    retrieved = _validated_retrieval_timestamp(retrieved_at)
+    if (
+        not isinstance(response, DiscoveryHttpResponse)
+        or response.final_url != request.url
+        or response.status_code != 200
+        or not response.raw_bytes
+        or len(response.raw_bytes) > MAX_RESPONSE_BYTES
+    ):
+        raise DiscoveryFailure("failed_response_not_persistable")
+    headers = {
+        key: value
+        for key, value in response.headers.items()
+        if key.lower() in _RETAINED_HEADERS
+    }
+    raw_sha256 = hashlib.sha256(response.raw_bytes).hexdigest()
+    artifact = FailedBisDiscoveryArtifact(
+        classification=FAILED_DISCOVERY_CLASSIFICATION,
+        target=request.target,
+        retrieved_at=retrieved,
+        request_identity=request.request_identity,
+        exact_url=request.url,
+        http_status=response.status_code,
+        content_type=_normalized_media_type(response.media_type),
+        raw_sha256=raw_sha256,
+        byte_count=len(response.raw_bytes),
+        response_headers=headers,
+        failure_reason=failure_reason,
+    )
+    final_directory = _failed_artifact_directory(request, retrieved, raw_sha256)
+    final_directory.parent.mkdir(parents=True, exist_ok=True)
+    staging_directory = final_directory.parent / f".tmp-{uuid.uuid4().hex[:12]}"
+    try:
+        staging_directory.mkdir(exist_ok=False)
+        raw_path = staging_directory / "response.bin"
+        manifest_path = staging_directory / "failure.json"
+        raw_path.write_bytes(response.raw_bytes)
+        manifest_path.write_bytes(failed_discovery_artifact_json(artifact))
+        staging_directory.replace(final_directory)
+    except Exception:
+        for path in (
+            staging_directory / "response.bin",
+            staging_directory / "failure.json",
+        ):
+            if path.exists():
+                path.unlink()
+        if staging_directory.exists():
+            staging_directory.rmdir()
+        raise
+    return final_directory / "response.bin", final_directory / "failure.json"
+
+
+def execute_and_persist_discovery(
+    request: DiscoveryRequest,
+    transport: DiscoveryTransport,
+    retrieved_at: datetime,
+) -> tuple[BisDiscoveryResult, tuple[Path, Path]]:
+    """Execute one request, atomically preserving any returned response rejected by parsing."""
+
+    retrieved = _validated_retrieval_timestamp(retrieved_at)
+    response = _fetch_discovery_response(request, transport)
+    try:
+        result = _build_discovery_result(request, response, retrieved)
+    except DiscoveryFailure as exc:
+        if (
+            response.status_code == 200
+            and response.final_url == request.url
+            and response.raw_bytes
+            and len(response.raw_bytes) <= MAX_RESPONSE_BYTES
+        ):
+            persist_failed_discovery_response(request, response, retrieved, exc.reason)
+        raise
+    return result, persist_discovery_result(request, result)
 
 
 class _RejectRedirects(urllib.request.HTTPRedirectHandler):
@@ -719,8 +900,9 @@ def main(argv: list[str] | None = None) -> int:
         request = build_d_us_schema_probe_request(
             metadata_insufficient=args.metadata_insufficient
         )
-    result = execute_discovery(request, _build_network_transport(), datetime.now(UTC))
-    raw_path, manifest_path = persist_discovery_result(request, result)
+    _, (raw_path, manifest_path) = execute_and_persist_discovery(
+        request, _build_network_transport(), datetime.now(UTC)
+    )
     print(f"{DISCOVERY_CLASSIFICATION}: {raw_path} {manifest_path}")
     return 0
 

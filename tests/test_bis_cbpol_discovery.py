@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import urllib.error
 from dataclasses import fields, replace
 from datetime import UTC, date, datetime
@@ -86,7 +87,7 @@ def structure_xml(
     )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
-        '<Structure xmlns="urn:sdmx:org.sdmx.infomodel.structure:2.1">'
+        '<Structure xmlns="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">'
         '<Dataflow agencyID="BIS" id="WS_CBPOL" version="1.0" '
         f'structure="BIS:{flow_dsd_id}(1.0)" />'
         f"{dsd}{orphan}{codelists}</Structure>"
@@ -98,6 +99,75 @@ PROBE_CSV = (
     b"FREQ,REF_AREA,TIME_PERIOD,OBS_VALUE,OBS_STATUS,UNIT_MEASURE,UNIT_MULT\n"
     b"D,US,2023-01-03,4.50,A,PCT,0\n"
 )
+
+
+def realistic_sdmx21_xml(*, include_flow: bool = True, include_dsd: bool = True) -> bytes:
+    flow = (
+        ""
+        if not include_flow
+        else (
+            '<str:Dataflows><str:Dataflow agencyID="BIS" id="WS_CBPOL" version="1.0">'
+            "<str:Structure>"
+            '<com:Ref agencyID="BIS" id="DSD_CBPOL" version="1.0" '
+            'class="DataStructure" package="datastructure" />'
+            "</str:Structure></str:Dataflow></str:Dataflows>"
+        )
+    )
+    components = "".join(
+        (
+            '<str:Dimension id="FREQ"><str:LocalRepresentation><str:Enumeration>'
+            '<com:Ref agencyID="BIS" id="CL_FREQ" version="1.0" class="Codelist" />'
+            "</str:Enumeration></str:LocalRepresentation></str:Dimension>",
+            '<str:Dimension id="REF_AREA"><str:LocalRepresentation><str:Enumeration>'
+            '<com:Ref agencyID="BIS" id="CL_REF_AREA" version="1.0" '
+            'class="Codelist" />'
+            "</str:Enumeration></str:LocalRepresentation></str:Dimension>",
+            '<str:Attribute id="OBS_STATUS"><str:LocalRepresentation><str:Enumeration>'
+            '<com:Ref agencyID="BIS" id="CL_OBS_STATUS" version="1.0" '
+            'class="Codelist" />'
+            "</str:Enumeration></str:LocalRepresentation></str:Attribute>",
+            '<str:Attribute id="UNIT_MEASURE"><str:LocalRepresentation><str:Enumeration>'
+            '<com:Ref agencyID="BIS" id="CL_UNIT_MEASURE" version="1.0" '
+            'class="Codelist" />'
+            "</str:Enumeration></str:LocalRepresentation></str:Attribute>",
+            '<str:Attribute id="UNIT_MULT"><str:LocalRepresentation><str:Enumeration>'
+            '<com:Ref agencyID="BIS" id="CL_UNIT_MULT" version="1.0" '
+            'class="Codelist" />'
+            "</str:Enumeration></str:LocalRepresentation></str:Attribute>",
+        )
+    )
+    dsd = (
+        ""
+        if not include_dsd
+        else (
+            '<str:DataStructures><str:DataStructure agencyID="BIS" id="DSD_CBPOL" '
+            'version="1.0"><str:DataStructureComponents>'
+            f"{components}"
+            "</str:DataStructureComponents></str:DataStructure></str:DataStructures>"
+        )
+    )
+    vocabularies = {
+        "CL_FREQ": ("D",),
+        "CL_REF_AREA": ("US",),
+        "CL_OBS_STATUS": ("A",),
+        "CL_UNIT_MEASURE": ("PCT",),
+        "CL_UNIT_MULT": ("0",),
+    }
+    codelists = "".join(
+        '<str:Codelist agencyID="BIS" id="{}" version="1.0">{}</str:Codelist>'.format(
+            identity,
+            "".join(f'<str:Code id="{code}" />' for code in codes),
+        )
+        for identity, codes in vocabularies.items()
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<mes:Structure xmlns:mes="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message" '
+        'xmlns:str="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure" '
+        'xmlns:com="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common">'
+        f"<mes:Structures>{flow}{dsd}<str:Codelists>{codelists}</str:Codelists>"
+        "</mes:Structures></mes:Structure>"
+    ).encode()
 
 
 class FakeTransport:
@@ -120,7 +190,7 @@ class FakeWireResponse:
         self._offset = 0
         self.read_requests: list[int] = []
         self.headers = {
-            "Content-Type": "application/vnd.sdmx.structure+xml;version=2.0"
+            "Content-Type": "application/vnd.sdmx.structure+xml;version=2.1"
         }
 
     def __enter__(self):
@@ -158,7 +228,7 @@ class FakeOpener:
 def response(
     request_url: str,
     raw: bytes = STRUCTURE_XML,
-    media_type: str = "application/vnd.sdmx.structure+xml;version=2.0",
+    media_type: str = "application/vnd.sdmx.structure+xml;version=2.1",
     *,
     status: int = 200,
     final_url: str | None = None,
@@ -195,14 +265,15 @@ def test_only_exact_bis_host_path_and_query_are_accepted() -> None:
     approved = build_structure_request()
     assert approved.url == (
         "https://stats.bis.org/api/v2/structure/dataflow/BIS/WS_CBPOL/1.0"
-        "?references=all"
+        "?detail=referencepartial&references=descendants"
     )
+    assert approved.accept == "application/vnd.sdmx.structure+xml;version=2.1"
     rejected = (
         approved.url.replace("https://", "http://"),
         approved.url.replace("stats.bis.org", "stats.bis.org.evil.test"),
         approved.url.replace("/api/v2/", "/api/v1/"),
         approved.url + "&token=secret",
-        approved.url.replace("references=all", "references=all%26latest=true"),
+        approved.url.replace("references=descendants", "references=descendants%26latest=true"),
         approved.url.replace("stats.bis.org", "user:pass@stats.bis.org"),
         approved.url + "#fragment",
     )
@@ -254,10 +325,44 @@ def test_structure_discovery_captures_bounded_metadata_and_allowlisted_headers()
     assert artifact.schema_fingerprint
 
 
+def test_realistic_sdmx21_descendants_response_cross_binds_flow_dsd_and_codelists() -> None:
+    request = build_structure_request()
+    result = execute_discovery(
+        request,
+        FakeTransport(response(request.url, realistic_sdmx21_xml())),
+        RETRIEVED,
+    )
+    assert result.artifact.structure_identifiers == (
+        "BIS:WS_CBPOL(1.0)",
+        "BIS:DSD_CBPOL(1.0)",
+    )
+    assert result.artifact.status_vocabulary == ("A",)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        realistic_sdmx21_xml(include_dsd=False),
+        realistic_sdmx21_xml(include_flow=False),
+    ),
+)
+def test_incomplete_dataflow_or_dsd_representation_is_diagnosed(payload: bytes) -> None:
+    request = build_structure_request()
+    with pytest.raises(DiscoveryFailure, match="metadata_structure_incomplete"):
+        execute_discovery(request, FakeTransport(response(request.url, payload)), RETRIEVED)
+
+
+def test_sdmx20_representation_is_rejected_as_request_parser_mismatch() -> None:
+    request = build_structure_request()
+    payload = realistic_sdmx21_xml().replace(b"v2_1", b"v2_0")
+    with pytest.raises(DiscoveryFailure, match="metadata_representation_mismatch"):
+        execute_discovery(request, FakeTransport(response(request.url, payload)), RETRIEVED)
+
+
 def test_structure_rejects_dsd_reference_without_actual_dsd_content() -> None:
     request = build_structure_request()
     bare_reference = structure_xml(actual_dsd_id=None, orphan_components=True)
-    with pytest.raises(DiscoveryFailure, match="metadata_response_malformed"):
+    with pytest.raises(DiscoveryFailure, match="metadata_structure_incomplete"):
         execute_discovery(request, FakeTransport(response(request.url, bare_reference)), RETRIEVED)
 
 
@@ -383,7 +488,7 @@ def test_real_urllib_transport_rejects_redirect_without_reading_body() -> None:
 def test_malformed_metadata_and_unexpected_media_type_fail_closed() -> None:
     request = build_structure_request()
     malformed = FakeTransport(response(request.url, b"<root />"))
-    with pytest.raises(DiscoveryFailure, match="metadata_response_malformed"):
+    with pytest.raises(DiscoveryFailure, match="metadata_representation_mismatch"):
         execute_discovery(request, malformed, RETRIEVED)
     unexpected = FakeTransport(response(request.url, STRUCTURE_XML, "text/html"))
     with pytest.raises(DiscoveryFailure, match="media_type_not_approved"):
@@ -459,3 +564,94 @@ def test_discovery_identity_is_header_insertion_order_invariant() -> None:
     first_artifact = execute_discovery(request, FakeTransport(first), RETRIEVED).artifact
     second_artifact = execute_discovery(request, FakeTransport(second), RETRIEVED).artifact
     assert first_artifact.discovery_id == second_artifact.discovery_id
+
+
+def test_returned_but_malformed_response_is_atomically_preserved_as_failed_evidence(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "data/raw/candidate_b/bis_discovery"
+    monkeypatch.setattr(discovery, "RAW_DISCOVERY_ROOT", root)
+    request = build_structure_request()
+    raw = realistic_sdmx21_xml(include_dsd=False)
+    transport = FakeTransport(response(request.url, raw, headers={"ETag": '"failed"'}))
+
+    with pytest.raises(DiscoveryFailure, match="metadata_structure_incomplete"):
+        discovery.execute_and_persist_discovery(request, transport, RETRIEVED)
+
+    assert len(transport.calls) == 1
+    raw_paths = tuple(root.rglob("response.bin"))
+    manifest_paths = tuple(root.rglob("failure.json"))
+    assert len(raw_paths) == len(manifest_paths) == 1
+    assert raw_paths[0].read_bytes() == raw
+    failure = json.loads(manifest_paths[0].read_text(encoding="utf-8"))
+    assert failure["classification"] == "NON_AUTHORITATIVE_DISCOVERY_FAILED"
+    assert failure["failure_reason"] == "metadata_structure_incomplete"
+    assert failure["request_identity"] == request.request_identity
+    assert failure["exact_url"] == request.url
+    assert failure["http_status"] == 200
+    assert failure["content_type"] == "application/vnd.sdmx.structure+xml"
+    assert failure["raw_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert failure["byte_count"] == len(raw)
+    assert failure["response_headers"] == {"etag": '"failed"'}
+    assert failure["authoritative_qualification_eligible"] is False
+    assert failure["final_run_identity_eligible"] is False
+    assert failure["r4_evidence_eligible"] is False
+    assert not tuple(root.rglob("*.tmp-*"))
+    assert not tuple(root.rglob("discovery.json"))
+
+
+def test_transport_failure_without_response_persists_nothing(monkeypatch, tmp_path: Path) -> None:
+    root = tmp_path / "data/raw/candidate_b/bis_discovery"
+    monkeypatch.setattr(discovery, "RAW_DISCOVERY_ROOT", root)
+    request = build_structure_request()
+    transport = FakeTransport(TimeoutError("synthetic timeout"))
+
+    with pytest.raises(DiscoveryFailure, match="discovery_timeout"):
+        discovery.execute_and_persist_discovery(request, transport, RETRIEVED)
+
+    assert len(transport.calls) == 1
+    assert not root.exists()
+
+
+def test_failed_discovery_is_not_automatically_followed_by_another_request(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        discovery,
+        "RAW_DISCOVERY_ROOT",
+        tmp_path / "data/raw/candidate_b/bis_discovery",
+    )
+    request = build_structure_request()
+    transport = FakeTransport(
+        response(request.url, realistic_sdmx21_xml(include_dsd=False))
+    )
+
+    with pytest.raises(DiscoveryFailure, match="metadata_structure_incomplete"):
+        discovery.execute_and_persist_discovery(request, transport, RETRIEVED)
+
+    assert len(transport.calls) == 1
+
+
+def test_failed_discovery_artifact_cannot_masquerade_as_authoritative(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "data/raw/candidate_b/bis_discovery"
+    monkeypatch.setattr(discovery, "RAW_DISCOVERY_ROOT", root)
+    request = build_structure_request()
+    with pytest.raises(DiscoveryFailure):
+        discovery.execute_and_persist_discovery(
+            request,
+            FakeTransport(response(request.url, b"<not-sdmx />")),
+            RETRIEVED,
+        )
+    failure = json.loads(next(root.rglob("failure.json")).read_text(encoding="utf-8"))
+    assert failure["classification"] != DISCOVERY_CLASSIFICATION
+    assert not isinstance(failure, CandidateBQualificationResult)
+    assert all(
+        failure[field] is False
+        for field in (
+            "authoritative_qualification_eligible",
+            "final_run_identity_eligible",
+            "r4_evidence_eligible",
+        )
+    )
