@@ -7,22 +7,42 @@ retry, cache, or fallback behavior.
 
 from __future__ import annotations
 
+import hashlib
+import os
+import shutil
+import socket
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, date, datetime
+from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from fxlab.data.policy_rates import (
     APPROVED_BIS_SERIES,
     APPROVED_REQUEST_END,
     APPROVED_REQUEST_START,
+    AUTHORITATIVE_D_US_ACCEPT,
+    AUTHORITATIVE_D_US_URL,
     PolicyRateMetadata,
+    PolicyRateQualificationError,
     PolicyRateRequest,
     PolicyRateSeriesManifest,
     PolicyRateSeriesSpec,
+    authoritative_d_us_request,
     build_series_manifest,
+    canonical_json,
+    canonical_sha256,
+    parse_authoritative_bis_d_us_sdmx,
 )
+
+AUTHORITATIVE_TIMEOUT_SECONDS = 15
+AUTHORITATIVE_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+AUTHORITATIVE_BIS_ROOT = Path("data/raw/candidate_b/bis/authoritative")
+AUTHORITATIVE_D_US_REPRESENTATION = "SDMX_ML_2_1_STRUCTURE_SPECIFIC_DATA"
 
 
 @dataclass(frozen=True)
@@ -42,6 +62,277 @@ class BisTransportResponse:
 
 class BisTransport(Protocol):
     def fetch(self, request: PolicyRateRequest) -> BisTransportResponse: ...
+
+
+@dataclass(frozen=True)
+class AuthoritativeBisHttpResponse:
+    status_code: int
+    final_url: str
+    media_type: str
+    headers: Mapping[str, str]
+    raw_bytes: bytes
+
+    def __post_init__(self) -> None:
+        if isinstance(self.status_code, bool) or not isinstance(self.status_code, int):
+            raise ValueError("transport response status is invalid")
+        if not isinstance(self.final_url, str) or not self.final_url:
+            raise ValueError("transport response final URL is required")
+        if not isinstance(self.media_type, str) or not self.media_type:
+            raise ValueError("transport response media type is required")
+        if not isinstance(self.raw_bytes, bytes):
+            raise ValueError("transport response bytes are required")
+        normalized_headers = {
+            str(key).lower(): str(value) for key, value in self.headers.items()
+        }
+        object.__setattr__(
+            self,
+            "headers",
+            MappingProxyType(dict(sorted(normalized_headers.items()))),
+        )
+
+
+class AuthoritativeBisTransport(Protocol):
+    def fetch(
+        self,
+        request: PolicyRateRequest,
+        *,
+        exact_url: str,
+        accept: str,
+        timeout_seconds: int,
+        max_response_bytes: int,
+    ) -> AuthoritativeBisHttpResponse: ...
+
+
+class _NoAuthoritativeRedirects(HTTPRedirectHandler):
+    def http_error_302(self, request, response, code, message, headers):
+        del request, code, message, headers
+        return response
+
+    http_error_300 = http_error_302
+    http_error_301 = http_error_302
+    http_error_303 = http_error_302
+    http_error_307 = http_error_302
+    http_error_308 = http_error_302
+
+
+@dataclass(frozen=True)
+class UrllibAuthoritativeBisTransport:
+    opener: object | None = None
+
+    def __post_init__(self) -> None:
+        if self.opener is None:
+            object.__setattr__(
+                self,
+                "opener",
+                build_opener(_NoAuthoritativeRedirects()),
+            )
+
+    def fetch(
+        self,
+        request: PolicyRateRequest,
+        *,
+        exact_url: str,
+        accept: str,
+        timeout_seconds: int,
+        max_response_bytes: int,
+    ) -> AuthoritativeBisHttpResponse:
+        del request
+        http_request = Request(
+            exact_url,
+            headers={"Accept": accept},
+            method="GET",
+        )
+        try:
+            response = self.opener.open(http_request, timeout=timeout_seconds)
+        except HTTPError as exc:
+            response = exc
+        except URLError as exc:
+            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                raise TimeoutError("authoritative BIS request timed out") from exc
+            raise
+        with response:
+            status_code = getattr(response, "status", None)
+            if status_code is None:
+                status_code = response.getcode()
+            final_url = response.geturl()
+            headers = {str(key): str(value) for key, value in response.headers.items()}
+            content_type = next(
+                (
+                    value.split(";", 1)[0].strip().lower()
+                    for key, value in headers.items()
+                    if key.lower() == "content-type"
+                ),
+                "",
+            )
+            raw_bytes = response.read(max_response_bytes + 1)
+        return AuthoritativeBisHttpResponse(
+            status_code=status_code,
+            final_url=final_url,
+            media_type=content_type,
+            headers=headers,
+            raw_bytes=raw_bytes,
+        )
+
+
+def fetch_authoritative_d_us_response(
+    request: PolicyRateRequest,
+    transport: AuthoritativeBisTransport,
+) -> AuthoritativeBisHttpResponse:
+    if request != authoritative_d_us_request():
+        raise PolicyRateQualificationError("request_not_approved")
+    try:
+        response = transport.fetch(
+            request,
+            exact_url=AUTHORITATIVE_D_US_URL,
+            accept=AUTHORITATIVE_D_US_ACCEPT,
+            timeout_seconds=AUTHORITATIVE_TIMEOUT_SECONDS,
+            max_response_bytes=AUTHORITATIVE_MAX_RESPONSE_BYTES,
+        )
+    except TimeoutError as exc:
+        raise PolicyRateQualificationError("acquisition_timeout") from exc
+    except PolicyRateQualificationError:
+        raise
+    except Exception as exc:
+        raise PolicyRateQualificationError("transport_failure") from exc
+    if not isinstance(response, AuthoritativeBisHttpResponse):
+        raise PolicyRateQualificationError("transport_response_invalid")
+    if 300 <= response.status_code <= 399:
+        raise PolicyRateQualificationError("redirect_rejected")
+    if response.status_code != 200:
+        raise PolicyRateQualificationError("http_status_not_success")
+    if response.final_url != AUTHORITATIVE_D_US_URL:
+        raise PolicyRateQualificationError("redirect_rejected")
+    if response.media_type != "application/xml":
+        raise PolicyRateQualificationError("media_type_not_approved")
+    if len(response.raw_bytes) > AUTHORITATIVE_MAX_RESPONSE_BYTES:
+        raise PolicyRateQualificationError("response_too_large")
+    return response
+
+
+@dataclass(frozen=True)
+class AuthoritativeDUsManifest:
+    request_fingerprint: str
+    exact_url: str
+    representation_identity: str
+    series_key: str
+    frequency: str
+    reference_area: str
+    unit_measure: str
+    unit_mult: str
+    status_semantics: tuple[str, ...]
+    raw_sha256: str
+    canonical_observation_hash: str
+    row_count: int
+    min_observation_date: date
+    max_observation_date: date
+    retrieved_at: datetime
+    response_media_type: str
+    byte_count: int
+    dataset_id: str
+    manifest_id: str
+
+
+@dataclass(frozen=True)
+class AuthoritativeDUsPublication:
+    destination: Path
+    raw_path: Path
+    manifest_path: Path
+    manifest: AuthoritativeDUsManifest
+
+
+def _authoritative_d_us_manifest(
+    request: PolicyRateRequest,
+    response: AuthoritativeBisHttpResponse,
+    retrieved_at: datetime,
+) -> AuthoritativeDUsManifest:
+    if retrieved_at.tzinfo is None or retrieved_at.utcoffset() is None:
+        raise ValueError("retrieval timestamp must be timezone-aware")
+    retrieved = retrieved_at.astimezone(UTC)
+    observations = parse_authoritative_bis_d_us_sdmx(response.raw_bytes, request)
+    raw_sha256 = hashlib.sha256(response.raw_bytes).hexdigest()
+    observation_hash = canonical_sha256(observations)
+    semantic = {
+        "format": 1,
+        "request_fingerprint": request.fingerprint,
+        "exact_url": AUTHORITATIVE_D_US_URL,
+        "representation_identity": AUTHORITATIVE_D_US_REPRESENTATION,
+        "series_key": "D.US",
+        "frequency": "D",
+        "reference_area": "US",
+        "unit_measure": "368",
+        "unit_mult": "0",
+        "status_semantics": ("A=normal",),
+        "raw_sha256": raw_sha256,
+        "canonical_observation_hash": observation_hash,
+        "row_count": len(observations),
+        "min_observation_date": observations[0].observation_date,
+        "max_observation_date": observations[-1].observation_date,
+    }
+    dataset_id = canonical_sha256(semantic)
+    audit = {
+        "format": 1,
+        "dataset_id": dataset_id,
+        "retrieved_at": retrieved,
+        "returned_url": response.final_url,
+        "response_media_type": response.media_type,
+        "byte_count": len(response.raw_bytes),
+        "headers": response.headers,
+    }
+    manifest_values = dict(semantic)
+    del manifest_values["format"]
+    return AuthoritativeDUsManifest(
+        **manifest_values,
+        retrieved_at=retrieved,
+        response_media_type=response.media_type,
+        byte_count=len(response.raw_bytes),
+        dataset_id=dataset_id,
+        manifest_id=canonical_sha256(audit),
+    )
+
+
+def _write_fully(path: Path, payload: bytes) -> None:
+    with path.open("xb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def acquire_and_publish_authoritative_d_us(
+    request: PolicyRateRequest,
+    transport: AuthoritativeBisTransport,
+    retrieved_at: datetime,
+) -> AuthoritativeDUsPublication:
+    if request != authoritative_d_us_request():
+        raise PolicyRateQualificationError("request_not_approved")
+    destination = AUTHORITATIVE_BIS_ROOT / f"d_us-{request.fingerprint}"
+    if destination.exists():
+        raise PolicyRateQualificationError("destination_exists")
+
+    response = fetch_authoritative_d_us_response(request, transport)
+    manifest = _authoritative_d_us_manifest(request, response, retrieved_at)
+
+    AUTHORITATIVE_BIS_ROOT.mkdir(parents=True, exist_ok=True)
+    temporary = Path(
+        tempfile.mkdtemp(prefix=".tmp-", dir=AUTHORITATIVE_BIS_ROOT)
+    )
+    try:
+        raw_path = temporary / "response.xml"
+        manifest_path = temporary / "manifest.json"
+        _write_fully(raw_path, response.raw_bytes)
+        _write_fully(manifest_path, canonical_json(manifest).encode("utf-8"))
+        if destination.exists():
+            raise PolicyRateQualificationError("destination_exists")
+        temporary.replace(destination)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+    return AuthoritativeDUsPublication(
+        destination=destination,
+        raw_path=destination / "response.xml",
+        manifest_path=destination / "manifest.json",
+        manifest=manifest,
+    )
 
 
 @dataclass(frozen=True)

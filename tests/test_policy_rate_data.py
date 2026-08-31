@@ -61,6 +61,870 @@ SHA_B = "b" * 64
 RETRIEVED = datetime(2026, 8, 29, 10, tzinfo=UTC)
 
 
+def authoritative_d_us_xml() -> bytes:
+    observations = "".join(
+        f'<Obs TIME_PERIOD="{observed.isoformat()}" OBS_VALUE="5.25" OBS_STATUS="A" />'
+        for observed in (
+            APPROVED_REQUEST_START + timedelta(days=offset)
+            for offset in range((APPROVED_REQUEST_END - APPROVED_REQUEST_START).days + 1)
+        )
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<mes:StructureSpecificData '
+        'xmlns:mes="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message" '
+        'xmlns:com="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common" '
+        'xmlns:ss="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/data/structurespecific" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        'xmlns:cbpol="urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow='
+        'BIS:WS_CBPOL(1.0):ObsLevelDim:TIME_PERIOD">'
+        '<mes:Header><mes:Structure structureID="BIS_WS_CBPOL_1_0" '
+        'namespace="urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow='
+        'BIS:WS_CBPOL(1.0):ObsLevelDim:TIME_PERIOD" '
+        'dimensionAtObservation="TIME_PERIOD"><com:StructureUsage><Ref '
+        'agencyID="BIS" id="WS_CBPOL" version="1.0" /></com:StructureUsage>'
+        '</mes:Structure></mes:Header>'
+        '<mes:DataSet UNIT_MEASURE="368" UNIT_MULT="0" '
+        'ss:dataScope="DataStructure" ss:structureRef="BIS_WS_CBPOL_1_0" '
+        'xsi:type="cbpol:DataSetType"><Series FREQ="D" REF_AREA="US">'
+        f"{observations}</Series></mes:DataSet></mes:StructureSpecificData>"
+    ).encode()
+
+
+def test_authoritative_d_us_sdmx_contract_accepts_full_frozen_request() -> None:
+    from fxlab.data.policy_rates import (
+        AUTHORITATIVE_D_US_ACCEPT,
+        AUTHORITATIVE_D_US_URL,
+        authoritative_d_us_request,
+        parse_authoritative_bis_d_us_sdmx,
+    )
+
+    item = authoritative_d_us_request()
+    assert item.series == spec("USD")
+    assert item.start == date(2014, 1, 1)
+    assert item.end == date(2023, 12, 31)
+    assert AUTHORITATIVE_D_US_URL == (
+        "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.US"
+        "?startPeriod=2014-01-01&endPeriod=2023-12-31"
+    )
+    assert AUTHORITATIVE_D_US_ACCEPT == (
+        "application/vnd.sdmx.structurespecificdata+xml;version=2.1"
+    )
+    parsed = parse_authoritative_bis_d_us_sdmx(authoritative_d_us_xml(), item)
+    assert len(parsed) == 3652
+    assert parsed[0].observation_date == date(2014, 1, 1)
+    assert parsed[-1].observation_date == date(2023, 12, 31)
+    assert all(
+        observation.series_key == "D.US" and observation.status == "A"
+        for observation in parsed
+    )
+
+
+def _replace_authoritative_xml(old: bytes, new: bytes, *, count: int = -1) -> bytes:
+    raw = authoritative_d_us_xml()
+    assert old in raw
+    return raw.replace(old, new, count)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        _replace_authoritative_xml(
+            b"<mes:StructureSpecificData ",
+            b"<mes:GenericData ",
+            count=1,
+        ).replace(b"</mes:StructureSpecificData>", b"</mes:GenericData>", 1),
+        _replace_authoritative_xml(
+            b"urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow="
+            b"BIS:WS_CBPOL(1.0):ObsLevelDim:TIME_PERIOD",
+            b"urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow="
+            b"BIS:OTHER(1.0):ObsLevelDim:TIME_PERIOD",
+        ),
+        _replace_authoritative_xml(b"ss:dataScope=", b"dataScope=", count=1),
+        _replace_authoritative_xml(b"ss:structureRef=", b"structureRef=", count=1),
+        _replace_authoritative_xml(
+            b'UNIT_MEASURE="368"', b'UNIT_MEASURE="999"', count=1
+        ),
+        _replace_authoritative_xml(b'UNIT_MULT="0"', b'UNIT_MULT="1"', count=1),
+        _replace_authoritative_xml(b' OBS_STATUS="A"', b"", count=1),
+        _replace_authoritative_xml(
+            b' OBS_STATUS="A"', b' OBS_CONF="A"', count=1
+        ),
+        _replace_authoritative_xml(
+            b' OBS_STATUS="A"', b' OBS_STATUS="B"', count=1
+        ),
+    ],
+    ids=(
+        "wrong_root",
+        "wrong_structure_namespace",
+        "unqualified_data_scope",
+        "unqualified_structure_ref",
+        "wrong_unit_measure",
+        "wrong_unit_mult",
+        "missing_status",
+        "obs_conf_cannot_substitute",
+        "non_a_status",
+    ),
+)
+def test_authoritative_d_us_adversarial_contract_mismatches_fail(raw: bytes) -> None:
+    from fxlab.data.policy_rates import (
+        authoritative_d_us_request,
+        parse_authoritative_bis_d_us_sdmx,
+    )
+
+    with pytest.raises(PolicyRateQualificationError):
+        parse_authoritative_bis_d_us_sdmx(raw, authoritative_d_us_request())
+
+
+def test_authoritative_d_us_adversarial_duplicate_date_fails() -> None:
+    from fxlab.data.policy_rates import (
+        authoritative_d_us_request,
+        parse_authoritative_bis_d_us_sdmx,
+    )
+
+    raw = _replace_authoritative_xml(b"2014-01-02", b"2014-01-01", count=1)
+    with pytest.raises(PolicyRateQualificationError, match="duplicate_observation"):
+        parse_authoritative_bis_d_us_sdmx(raw, authoritative_d_us_request())
+
+
+def test_authoritative_d_us_adversarial_missing_required_date_fails() -> None:
+    from fxlab.data.policy_rates import (
+        authoritative_d_us_request,
+        parse_authoritative_bis_d_us_sdmx,
+    )
+
+    raw = _replace_authoritative_xml(
+        b'<Obs TIME_PERIOD="2014-01-02" OBS_VALUE="5.25" OBS_STATUS="A" />',
+        b"",
+        count=1,
+    )
+    with pytest.raises(PolicyRateQualificationError, match="observation_date_set_mismatch"):
+        parse_authoritative_bis_d_us_sdmx(raw, authoritative_d_us_request())
+
+
+def test_authoritative_d_us_adversarial_post_2023_rejects_before_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fxlab.data.policy_rates as policy_rates
+
+    raw = _replace_authoritative_xml(b"2014-01-01", b"2024-01-01", count=1)
+
+    def forbidden_decimal_access(_: object) -> None:
+        raise AssertionError("OBS_VALUE accessed before sealed date rejection")
+
+    monkeypatch.setattr(policy_rates, "Decimal", forbidden_decimal_access)
+    with pytest.raises(PolicyRateQualificationError, match="sealed_window_violation"):
+        policy_rates.parse_authoritative_bis_d_us_sdmx(
+            raw, policy_rates.authoritative_d_us_request()
+        )
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "not-a-decimal"])
+def test_authoritative_d_us_adversarial_invalid_or_nonfinite_value_fails(
+    value: str,
+) -> None:
+    from fxlab.data.policy_rates import (
+        authoritative_d_us_request,
+        parse_authoritative_bis_d_us_sdmx,
+    )
+
+    raw = _replace_authoritative_xml(
+        b'OBS_VALUE="5.25"',
+        f'OBS_VALUE="{value}"'.encode(),
+        count=1,
+    )
+    with pytest.raises(PolicyRateQualificationError, match="observation_value_invalid"):
+        parse_authoritative_bis_d_us_sdmx(raw, authoritative_d_us_request())
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        b'<!DOCTYPE data SYSTEM "http://example.invalid/schema.dtd">',
+        b'<!ENTITY secret "forbidden">',
+    ],
+)
+def test_authoritative_d_us_adversarial_dtd_or_entity_fails(
+    declaration: bytes,
+) -> None:
+    from fxlab.data.policy_rates import (
+        authoritative_d_us_request,
+        parse_authoritative_bis_d_us_sdmx,
+    )
+
+    raw = authoritative_d_us_xml().replace(b"?>", b"?>" + declaration, 1)
+    with pytest.raises(PolicyRateQualificationError, match="response_schema_invalid"):
+        parse_authoritative_bis_d_us_sdmx(raw, authoritative_d_us_request())
+
+
+class FakeAuthoritativeTransport:
+    def __init__(self, response: object = None, error: Exception | None = None):
+        self.response = response
+        self.error = error
+        self.calls: list[tuple[object, str, str, int, int]] = []
+
+    def fetch(
+        self,
+        request: object,
+        *,
+        exact_url: str,
+        accept: str,
+        timeout_seconds: int,
+        max_response_bytes: int,
+    ) -> object:
+        self.calls.append(
+            (request, exact_url, accept, timeout_seconds, max_response_bytes)
+        )
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+def test_authoritative_d_us_transport_uses_exact_fixed_contract_once() -> None:
+    from urllib.parse import parse_qsl, urlsplit
+
+    from scripts.ingest_bis_policy_rates import (
+        AUTHORITATIVE_MAX_RESPONSE_BYTES,
+        AUTHORITATIVE_TIMEOUT_SECONDS,
+        AuthoritativeBisHttpResponse,
+        fetch_authoritative_d_us_response,
+    )
+
+    from fxlab.data.policy_rates import (
+        AUTHORITATIVE_D_US_ACCEPT,
+        AUTHORITATIVE_D_US_URL,
+        authoritative_d_us_request,
+    )
+
+    item = authoritative_d_us_request()
+    response = AuthoritativeBisHttpResponse(
+        status_code=200,
+        final_url=AUTHORITATIVE_D_US_URL,
+        media_type="application/xml",
+        headers={"Content-Type": "application/xml"},
+        raw_bytes=b"<response/>",
+    )
+    transport = FakeAuthoritativeTransport(response)
+    assert fetch_authoritative_d_us_response(item, transport) is response
+    assert transport.calls == [
+        (
+            item,
+            AUTHORITATIVE_D_US_URL,
+            AUTHORITATIVE_D_US_ACCEPT,
+            15,
+            4 * 1024 * 1024,
+        )
+    ]
+    assert AUTHORITATIVE_TIMEOUT_SECONDS == 15
+    assert AUTHORITATIVE_MAX_RESPONSE_BYTES == 4 * 1024 * 1024
+    parsed = urlsplit(transport.calls[0][1])
+    assert parsed.scheme == "https"
+    assert parsed.hostname == "stats.bis.org"
+    assert parsed.path == "/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.US"
+    assert tuple(parse_qsl(parsed.query)) == (
+        ("startPeriod", "2014-01-01"),
+        ("endPeriod", "2023-12-31"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("status_code", "final_url", "media_type", "reason"),
+    [
+        (302, "https://stats.bis.org/redirect", "application/xml", "redirect_rejected"),
+        (
+            500,
+            "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.US"
+            "?startPeriod=2014-01-01&endPeriod=2023-12-31",
+            "application/xml",
+            "http_status_not_success",
+        ),
+        (
+            200,
+            "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.US"
+            "?startPeriod=2014-01-01&endPeriod=2023-12-30",
+            "application/xml",
+            "redirect_rejected",
+        ),
+        (
+            200,
+            "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.US"
+            "?startPeriod=2014-01-01&endPeriod=2023-12-31",
+            "text/xml",
+            "media_type_not_approved",
+        ),
+    ],
+)
+def test_authoritative_d_us_transport_rejects_redirect_status_url_or_media(
+    status_code: int,
+    final_url: str,
+    media_type: str,
+    reason: str,
+) -> None:
+    from scripts.ingest_bis_policy_rates import (
+        AuthoritativeBisHttpResponse,
+        fetch_authoritative_d_us_response,
+    )
+
+    from fxlab.data.policy_rates import authoritative_d_us_request
+
+    response = AuthoritativeBisHttpResponse(
+        status_code=status_code,
+        final_url=final_url,
+        media_type=media_type,
+        headers={},
+        raw_bytes=b"<response/>",
+    )
+    transport = FakeAuthoritativeTransport(response)
+    with pytest.raises(PolicyRateQualificationError, match=reason):
+        fetch_authoritative_d_us_response(authoritative_d_us_request(), transport)
+    assert len(transport.calls) == 1
+
+
+def test_authoritative_d_us_transport_timeout_has_no_retry_or_fallback() -> None:
+    from scripts.ingest_bis_policy_rates import fetch_authoritative_d_us_response
+
+    from fxlab.data.policy_rates import authoritative_d_us_request
+
+    transport = FakeAuthoritativeTransport(error=TimeoutError("synthetic timeout"))
+    with pytest.raises(PolicyRateQualificationError, match="acquisition_timeout"):
+        fetch_authoritative_d_us_response(authoritative_d_us_request(), transport)
+    assert len(transport.calls) == 1
+
+
+def test_authoritative_d_us_transport_rejects_more_than_four_mib_once() -> None:
+    from scripts.ingest_bis_policy_rates import (
+        AUTHORITATIVE_MAX_RESPONSE_BYTES,
+        AuthoritativeBisHttpResponse,
+        fetch_authoritative_d_us_response,
+    )
+
+    from fxlab.data.policy_rates import AUTHORITATIVE_D_US_URL, authoritative_d_us_request
+
+    response = AuthoritativeBisHttpResponse(
+        status_code=200,
+        final_url=AUTHORITATIVE_D_US_URL,
+        media_type="application/xml",
+        headers={},
+        raw_bytes=b"x" * (AUTHORITATIVE_MAX_RESPONSE_BYTES + 1),
+    )
+    transport = FakeAuthoritativeTransport(response)
+    with pytest.raises(PolicyRateQualificationError, match="response_too_large"):
+        fetch_authoritative_d_us_response(authoritative_d_us_request(), transport)
+    assert len(transport.calls) == 1
+
+
+def test_authoritative_d_us_transport_never_continues_to_another_series() -> None:
+    from scripts.ingest_bis_policy_rates import fetch_authoritative_d_us_response
+
+    from fxlab.data.policy_rates import authoritative_d_us_request
+
+    transport = FakeAuthoritativeTransport(error=ValueError("synthetic invalid response"))
+    with pytest.raises(PolicyRateQualificationError, match="transport_failure"):
+        fetch_authoritative_d_us_response(authoritative_d_us_request(), transport)
+    assert [call[0] for call in transport.calls] == [authoritative_d_us_request()]
+
+
+class FakeUrllibResponse:
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        status: int = 200,
+        final_url: str,
+        content_type: str = "application/xml",
+    ) -> None:
+        self._body = body
+        self._offset = 0
+        self.status = status
+        self._final_url = final_url
+        self.headers = {"Content-Type": content_type, "ETag": "synthetic"}
+        self.read_sizes: list[int] = []
+        self.bytes_served = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        del exc_type, exc, traceback
+
+    def geturl(self) -> str:
+        return self._final_url
+
+    def getcode(self) -> int:
+        return self.status
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            raise AssertionError("authoritative adapter attempted an unbounded read")
+        self.read_sizes.append(size)
+        chunk = self._body[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        self.bytes_served += len(chunk)
+        return chunk
+
+
+class FakeUrllibOpener:
+    def __init__(
+        self,
+        response: FakeUrllibResponse | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        self.response = response
+        self.error = error
+        self.calls: list[tuple[object, int]] = []
+
+    def open(self, request, *, timeout: int):
+        self.calls.append((request, timeout))
+        if self.error is not None:
+            raise self.error
+        assert self.response is not None
+        return self.response
+
+
+def test_authoritative_d_us_real_http_adapter_uses_exact_bounded_get() -> None:
+    from scripts.ingest_bis_policy_rates import (
+        AUTHORITATIVE_MAX_RESPONSE_BYTES,
+        UrllibAuthoritativeBisTransport,
+        fetch_authoritative_d_us_response,
+    )
+
+    from fxlab.data.policy_rates import authoritative_d_us_request
+
+    exact_url = (
+        "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.US"
+        "?startPeriod=2014-01-01&endPeriod=2023-12-31"
+    )
+    raw = b"<synthetic-authoritative-response/>"
+    response = FakeUrllibResponse(raw, final_url=exact_url)
+    opener = FakeUrllibOpener(response)
+    result = fetch_authoritative_d_us_response(
+        authoritative_d_us_request(), UrllibAuthoritativeBisTransport(opener)
+    )
+
+    assert len(opener.calls) == 1
+    request, timeout = opener.calls[0]
+    assert request.full_url == exact_url
+    assert request.get_method() == "GET"
+    assert request.get_header("Accept") == (
+        "application/vnd.sdmx.structurespecificdata+xml;version=2.1"
+    )
+    assert timeout == 15
+    assert response.read_sizes
+    assert all(0 < size <= AUTHORITATIVE_MAX_RESPONSE_BYTES + 1 for size in response.read_sizes)
+    assert result.raw_bytes == raw
+    assert result.final_url == exact_url
+    assert result.media_type == "application/xml"
+    assert result.headers["content-type"] == "application/xml"
+
+
+def test_authoritative_d_us_real_http_adapter_rejects_max_plus_one() -> None:
+    from scripts.ingest_bis_policy_rates import (
+        AUTHORITATIVE_MAX_RESPONSE_BYTES,
+        UrllibAuthoritativeBisTransport,
+        fetch_authoritative_d_us_response,
+    )
+
+    from fxlab.data.policy_rates import AUTHORITATIVE_D_US_URL, authoritative_d_us_request
+
+    response = FakeUrllibResponse(
+        b"x" * (AUTHORITATIVE_MAX_RESPONSE_BYTES + 1),
+        final_url=AUTHORITATIVE_D_US_URL,
+    )
+    opener = FakeUrllibOpener(response)
+    with pytest.raises(PolicyRateQualificationError, match="response_too_large"):
+        fetch_authoritative_d_us_response(
+            authoritative_d_us_request(), UrllibAuthoritativeBisTransport(opener)
+        )
+    assert len(opener.calls) == 1
+    assert response.bytes_served == AUTHORITATIVE_MAX_RESPONSE_BYTES + 1
+    assert all(size <= AUTHORITATIVE_MAX_RESPONSE_BYTES + 1 for size in response.read_sizes)
+
+
+def test_authoritative_d_us_real_http_adapter_redirect_is_not_followed() -> None:
+    from scripts.ingest_bis_policy_rates import (
+        UrllibAuthoritativeBisTransport,
+        fetch_authoritative_d_us_response,
+    )
+
+    from fxlab.data.policy_rates import AUTHORITATIVE_D_US_URL, authoritative_d_us_request
+
+    opener = FakeUrllibOpener(
+        FakeUrllibResponse(
+            b"redirect",
+            status=302,
+            final_url="https://stats.bis.org/redirected",
+        )
+    )
+    with pytest.raises(PolicyRateQualificationError, match="redirect_rejected"):
+        fetch_authoritative_d_us_response(
+            authoritative_d_us_request(), UrllibAuthoritativeBisTransport(opener)
+        )
+    assert len(opener.calls) == 1
+    assert opener.calls[0][0].full_url == AUTHORITATIVE_D_US_URL
+
+
+def test_authoritative_d_us_real_http_adapter_rejects_changed_final_url() -> None:
+    from scripts.ingest_bis_policy_rates import (
+        UrllibAuthoritativeBisTransport,
+        fetch_authoritative_d_us_response,
+    )
+
+    from fxlab.data.policy_rates import authoritative_d_us_request
+
+    opener = FakeUrllibOpener(
+        FakeUrllibResponse(
+            b"xml",
+            final_url="https://stats.bis.org/api/v2/data/alternate",
+        )
+    )
+    with pytest.raises(PolicyRateQualificationError, match="redirect_rejected"):
+        fetch_authoritative_d_us_response(
+            authoritative_d_us_request(), UrllibAuthoritativeBisTransport(opener)
+        )
+    assert len(opener.calls) == 1
+
+
+def test_authoritative_d_us_real_http_adapter_requires_http_200() -> None:
+    from scripts.ingest_bis_policy_rates import (
+        UrllibAuthoritativeBisTransport,
+        fetch_authoritative_d_us_response,
+    )
+
+    from fxlab.data.policy_rates import AUTHORITATIVE_D_US_URL, authoritative_d_us_request
+
+    opener = FakeUrllibOpener(
+        FakeUrllibResponse(b"failure", status=503, final_url=AUTHORITATIVE_D_US_URL)
+    )
+    with pytest.raises(PolicyRateQualificationError, match="http_status_not_success"):
+        fetch_authoritative_d_us_response(
+            authoritative_d_us_request(), UrllibAuthoritativeBisTransport(opener)
+        )
+    assert len(opener.calls) == 1
+
+
+def test_authoritative_d_us_real_http_adapter_timeout_has_no_retry() -> None:
+    from scripts.ingest_bis_policy_rates import (
+        UrllibAuthoritativeBisTransport,
+        fetch_authoritative_d_us_response,
+    )
+
+    from fxlab.data.policy_rates import authoritative_d_us_request
+
+    opener = FakeUrllibOpener(error=TimeoutError("synthetic timeout"))
+    with pytest.raises(PolicyRateQualificationError, match="acquisition_timeout"):
+        fetch_authoritative_d_us_response(
+            authoritative_d_us_request(), UrllibAuthoritativeBisTransport(opener)
+        )
+    assert len(opener.calls) == 1
+
+
+def test_authoritative_d_us_offline_end_to_end_integration(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+    import json
+
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    from fxlab.data.policy_rates import (
+        AUTHORITATIVE_D_US_URL,
+        authoritative_d_us_request,
+        canonical_sha256,
+    )
+
+    root = tmp_path / "authoritative"
+    monkeypatch.setattr(ingestion, "AUTHORITATIVE_BIS_ROOT", root)
+    item = authoritative_d_us_request()
+    destination = root / f"d_us-{item.fingerprint}"
+    raw = authoritative_d_us_xml()
+    response = FakeUrllibResponse(raw, final_url=AUTHORITATIVE_D_US_URL)
+    opener = FakeUrllibOpener(response)
+    validated_counts: list[int] = []
+    original_parse = ingestion.parse_authoritative_bis_d_us_sdmx
+
+    def recording_parse(raw_bytes: bytes, request: PolicyRateRequest):
+        assert not destination.exists()
+        observations = original_parse(raw_bytes, request)
+        validated_counts.append(len(observations))
+        assert not destination.exists()
+        return observations
+
+    monkeypatch.setattr(
+        ingestion,
+        "parse_authoritative_bis_d_us_sdmx",
+        recording_parse,
+    )
+    published = ingestion.acquire_and_publish_authoritative_d_us(
+        item,
+        ingestion.UrllibAuthoritativeBisTransport(opener),
+        RETRIEVED,
+    )
+
+    assert validated_counts == [3652]
+    assert len(opener.calls) == 1
+    http_request, timeout = opener.calls[0]
+    assert http_request.full_url == AUTHORITATIVE_D_US_URL
+    assert http_request.get_method() == "GET"
+    assert http_request.get_header("Accept") == (
+        "application/vnd.sdmx.structurespecificdata+xml;version=2.1"
+    )
+    assert timeout == 15
+    assert published.destination == destination
+    assert destination.is_dir()
+    assert published.raw_path.read_bytes() == raw
+    persisted = json.loads(published.manifest_path.read_text(encoding="utf-8"))
+    assert persisted["manifest_id"] == published.manifest.manifest_id
+    assert persisted["dataset_id"] == published.manifest.dataset_id
+
+    manifest = published.manifest
+    expected_dataset_id = canonical_sha256(
+        {
+            "format": 1,
+            "request_fingerprint": item.fingerprint,
+            "exact_url": AUTHORITATIVE_D_US_URL,
+            "representation_identity": "SDMX_ML_2_1_STRUCTURE_SPECIFIC_DATA",
+            "series_key": "D.US",
+            "frequency": "D",
+            "reference_area": "US",
+            "unit_measure": "368",
+            "unit_mult": "0",
+            "status_semantics": ("A=normal",),
+            "raw_sha256": hashlib.sha256(raw).hexdigest(),
+            "canonical_observation_hash": manifest.canonical_observation_hash,
+            "row_count": 3652,
+            "min_observation_date": date(2014, 1, 1),
+            "max_observation_date": date(2023, 12, 31),
+        }
+    )
+    assert manifest.dataset_id == expected_dataset_id
+    assert item.series.series_key == "D.US"
+    assert [call[0].full_url for call in opener.calls] == [AUTHORITATIVE_D_US_URL]
+
+
+def _authoritative_transport_with_raw(raw_bytes: bytes) -> FakeAuthoritativeTransport:
+    from scripts.ingest_bis_policy_rates import AuthoritativeBisHttpResponse
+
+    from fxlab.data.policy_rates import AUTHORITATIVE_D_US_URL
+
+    return FakeAuthoritativeTransport(
+        AuthoritativeBisHttpResponse(
+            status_code=200,
+            final_url=AUTHORITATIVE_D_US_URL,
+            media_type="application/xml",
+            headers={
+                "Content-Type": "application/xml",
+                "ETag": "synthetic-etag",
+            },
+            raw_bytes=raw_bytes,
+        )
+    )
+
+
+def test_authoritative_d_us_storage_existing_destination_precedes_transport(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    from fxlab.data.policy_rates import authoritative_d_us_request
+
+    root = tmp_path / "authoritative"
+    monkeypatch.setattr(ingestion, "AUTHORITATIVE_BIS_ROOT", root)
+    item = authoritative_d_us_request()
+    destination = root / f"d_us-{item.fingerprint}"
+    destination.mkdir(parents=True)
+    transport = _authoritative_transport_with_raw(authoritative_d_us_xml())
+    with pytest.raises(PolicyRateQualificationError, match="destination_exists"):
+        ingestion.acquire_and_publish_authoritative_d_us(item, transport, RETRIEVED)
+    assert transport.calls == []
+
+
+def test_authoritative_d_us_storage_publishes_raw_and_manifest_atomically(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    from pathlib import Path
+
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    from fxlab.data.policy_rates import authoritative_d_us_request
+
+    root = tmp_path / "authoritative"
+    monkeypatch.setattr(ingestion, "AUTHORITATIVE_BIS_ROOT", root)
+    replacements: list[tuple[Path, Path, bool]] = []
+    original_replace = Path.replace
+
+    def recording_replace(source: Path, target: Path) -> Path:
+        replacements.append((source, target, target.exists()))
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", recording_replace)
+    item = authoritative_d_us_request()
+    raw = authoritative_d_us_xml()
+    published = ingestion.acquire_and_publish_authoritative_d_us(
+        item, _authoritative_transport_with_raw(raw), RETRIEVED
+    )
+    expected_destination = root / f"d_us-{item.fingerprint}"
+    assert published.destination == expected_destination
+    assert published.raw_path == expected_destination / "response.xml"
+    assert published.manifest_path == expected_destination / "manifest.json"
+    assert published.raw_path.read_bytes() == raw
+    persisted = json.loads(published.manifest_path.read_text(encoding="utf-8"))
+    assert persisted["dataset_id"] == published.manifest.dataset_id
+    assert persisted["manifest_id"] == published.manifest.manifest_id
+    assert replacements == [
+        (
+            replacements[0][0],
+            expected_destination,
+            False,
+        )
+    ]
+    assert replacements[0][0].parent == expected_destination.parent
+    assert replacements[0][0].name.startswith(".tmp-")
+
+
+def test_authoritative_d_us_storage_atomic_failure_leaves_no_final_destination(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pathlib import Path
+
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    from fxlab.data.policy_rates import authoritative_d_us_request
+
+    root = tmp_path / "authoritative"
+    monkeypatch.setattr(ingestion, "AUTHORITATIVE_BIS_ROOT", root)
+
+    def fail_replace(source: Path, target: Path) -> Path:
+        del source, target
+        raise OSError("synthetic atomic publication failure")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    item = authoritative_d_us_request()
+    with pytest.raises(OSError, match="synthetic atomic publication failure"):
+        ingestion.acquire_and_publish_authoritative_d_us(
+            item,
+            _authoritative_transport_with_raw(authoritative_d_us_xml()),
+            RETRIEVED,
+        )
+    destination = root / f"d_us-{item.fingerprint}"
+    assert not destination.exists()
+    assert not tuple(root.glob(".tmp-*"))
+
+
+def test_authoritative_d_us_storage_invalid_body_never_publishes(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    from fxlab.data.policy_rates import authoritative_d_us_request
+
+    root = tmp_path / "authoritative"
+    monkeypatch.setattr(ingestion, "AUTHORITATIVE_BIS_ROOT", root)
+    item = authoritative_d_us_request()
+    with pytest.raises(PolicyRateQualificationError, match="response_schema_invalid"):
+        ingestion.acquire_and_publish_authoritative_d_us(
+            item, _authoritative_transport_with_raw(b"<unrelated/>"), RETRIEVED
+        )
+    assert not (root / f"d_us-{item.fingerprint}").exists()
+    assert not root.exists()
+
+
+def test_authoritative_d_us_manifest_binds_frozen_semantic_evidence(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    from fxlab.data.policy_rates import (
+        AUTHORITATIVE_D_US_URL,
+        authoritative_d_us_request,
+        canonical_sha256,
+        parse_authoritative_bis_d_us_sdmx,
+    )
+
+    root = tmp_path / "authoritative"
+    monkeypatch.setattr(ingestion, "AUTHORITATIVE_BIS_ROOT", root)
+    item = authoritative_d_us_request()
+    raw = authoritative_d_us_xml()
+    published = ingestion.acquire_and_publish_authoritative_d_us(
+        item, _authoritative_transport_with_raw(raw), RETRIEVED
+    )
+    manifest = published.manifest
+    assert manifest.request_fingerprint == item.fingerprint
+    assert manifest.exact_url == AUTHORITATIVE_D_US_URL
+    assert manifest.representation_identity == "SDMX_ML_2_1_STRUCTURE_SPECIFIC_DATA"
+    assert (manifest.series_key, manifest.frequency, manifest.reference_area) == (
+        "D.US",
+        "D",
+        "US",
+    )
+    assert (manifest.unit_measure, manifest.unit_mult) == ("368", "0")
+    assert manifest.status_semantics == ("A=normal",)
+    assert manifest.raw_sha256 == hashlib.sha256(raw).hexdigest()
+    assert manifest.canonical_observation_hash == canonical_sha256(
+        parse_authoritative_bis_d_us_sdmx(raw, item)
+    )
+    assert manifest.row_count == 3652
+    assert manifest.min_observation_date == date(2014, 1, 1)
+    assert manifest.max_observation_date == date(2023, 12, 31)
+
+
+def test_authoritative_d_us_manifest_separates_semantic_and_audit_identity(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    from fxlab.data.policy_rates import authoritative_d_us_request
+
+    item = authoritative_d_us_request()
+    raw = authoritative_d_us_xml()
+    manifests = []
+    for index, retrieved_at in enumerate((RETRIEVED, RETRIEVED + timedelta(days=1))):
+        monkeypatch.setattr(
+            ingestion,
+            "AUTHORITATIVE_BIS_ROOT",
+            tmp_path / f"root-{index}",
+        )
+        manifests.append(
+            ingestion.acquire_and_publish_authoritative_d_us(
+                item,
+                _authoritative_transport_with_raw(raw),
+                retrieved_at,
+            ).manifest
+        )
+    assert manifests[0].dataset_id == manifests[1].dataset_id
+    assert manifests[0].manifest_id != manifests[1].manifest_id
+
+    monkeypatch.setattr(ingestion, "AUTHORITATIVE_BIS_ROOT", tmp_path / "third-root")
+    same_time_different_path = ingestion.acquire_and_publish_authoritative_d_us(
+        item, _authoritative_transport_with_raw(raw), RETRIEVED
+    ).manifest
+    assert same_time_different_path.dataset_id == manifests[0].dataset_id
+
+
+@pytest.mark.parametrize(
+    "classification",
+    ("NON_AUTHORITATIVE_DISCOVERY", "NON_AUTHORITATIVE_DISCOVERY_FAILED"),
+)
+def test_authoritative_d_us_manifest_discovery_classification_cannot_be_promoted(
+    classification: str,
+) -> None:
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    from fxlab.data.policy_rates import authoritative_d_us_request
+
+    transport = _authoritative_transport_with_raw(authoritative_d_us_xml())
+    with pytest.raises(TypeError):
+        ingestion.acquire_and_publish_authoritative_d_us(
+            authoritative_d_us_request(),
+            transport,
+            RETRIEVED,
+            classification=classification,
+        )
+    assert transport.calls == []
+
+
 def spec(currency: str = "AUD") -> PolicyRateSeriesSpec:
     return PolicyRateSeriesSpec(currency, APPROVED_BIS_SERIES[currency])
 
