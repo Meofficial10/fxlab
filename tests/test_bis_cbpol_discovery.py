@@ -196,6 +196,16 @@ def probe_xml(
 PROBE_XML = probe_xml()
 
 
+def probe_xml_with_first_status_value(
+    *, reference_area: str, status: str, value: str
+) -> bytes:
+    payload = probe_xml(reference_area=reference_area)
+    original = b'OBS_VALUE="0.01" OBS_STATUS="A"'
+    replacement = f'OBS_VALUE="{value}" OBS_STATUS="{status}"'.encode()
+    assert original in payload
+    return payload.replace(original, replacement, 1)
+
+
 def realistic_sdmx21_xml(*, include_flow: bool = True, include_dsd: bool = True) -> bytes:
     flow = (
         ""
@@ -618,6 +628,56 @@ def test_sparse_schema_probe_rejects_empty_observation_set() -> None:
                     "application/xml",
                 )
             ),
+            RETRIEVED,
+        )
+
+
+def test_probe_value_status_accepts_real_d_ca_normal_and_missing_pattern() -> None:
+    request = discovery.build_schema_probe_request(
+        DiscoveryTarget.D_CA_SCHEMA_PROBE, metadata_insufficient=True
+    )
+    payload = probe_xml_with_first_status_value(
+        reference_area="CA", status="M", value="NaN"
+    ).replace(b'OBS_VALUE="0.02"', b'OBS_VALUE="4.25"', 1)
+
+    artifact = execute_discovery(
+        request,
+        FakeTransport(response(request.url, payload, "application/xml")),
+        RETRIEVED,
+    ).artifact
+
+    assert artifact.observation_count == 31
+    assert artifact.status_vocabulary == ("A", "M")
+    assert "OBS_CONF" in artifact.returned_columns
+    assert artifact.classification == DISCOVERY_CLASSIFICATION
+    assert artifact.authoritative_qualification_eligible is False
+    assert artifact.final_run_identity_eligible is False
+    assert artifact.r4_evidence_eligible is False
+
+
+@pytest.mark.parametrize(
+    ("status", "value"),
+    (
+        ("M", "4.25"),
+        ("A", "NaN"),
+        ("M", "not-a-value"),
+        ("E", "4.25"),
+    ),
+)
+def test_probe_value_status_rejects_invalid_combinations(
+    status: str, value: str
+) -> None:
+    request = discovery.build_schema_probe_request(
+        DiscoveryTarget.D_CA_SCHEMA_PROBE, metadata_insufficient=True
+    )
+    payload = probe_xml_with_first_status_value(
+        reference_area="CA", status=status, value=value
+    )
+
+    with pytest.raises(DiscoveryFailure, match="schema_response_malformed"):
+        execute_discovery(
+            request,
+            FakeTransport(response(request.url, payload, "application/xml")),
             RETRIEVED,
         )
 

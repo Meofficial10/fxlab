@@ -624,11 +624,17 @@ def _validate_probe_observation_values(
         status = observation.attrib.get("OBS_STATUS")
         if not value or not status:
             raise DiscoveryFailure("schema_response_malformed")
-        try:
-            parsed_value = Decimal(value)
-        except (InvalidOperation, ValueError) as exc:
-            raise DiscoveryFailure("schema_response_malformed") from exc
-        if not parsed_value.is_finite():
+        if status == "M":
+            if value != "NaN":
+                raise DiscoveryFailure("schema_response_malformed")
+        elif status == "A":
+            try:
+                parsed_value = Decimal(value)
+            except (InvalidOperation, ValueError) as exc:
+                raise DiscoveryFailure("schema_response_malformed") from exc
+            if not parsed_value.is_finite():
+                raise DiscoveryFailure("schema_response_malformed")
+        else:
             raise DiscoveryFailure("schema_response_malformed")
         statuses.add(status)
         if "OBS_CONF" in observation.attrib:
