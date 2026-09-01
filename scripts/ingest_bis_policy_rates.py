@@ -25,6 +25,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from fxlab.data.candidate_b_evidence import (
+    BIS_PERSISTED_SCHEMA,
     build_candidate_b_bis_migration_persisted_manifest,
     build_candidate_b_bis_persisted_manifest,
 )
@@ -741,6 +742,9 @@ _LEGACY_AUTHORITATIVE_MANIFEST_FIELDS = frozenset(
         "manifest_id",
     }
 )
+_EXPLICIT_COUNT_LEGACY_MANIFEST_FIELDS = (
+    _LEGACY_AUTHORITATIVE_MANIFEST_FIELDS - {"row_count"}
+) | {"raw_row_count", "numeric_observation_count"}
 
 
 def _is_sha256(value: object) -> bool:
@@ -753,23 +757,69 @@ def _is_sha256(value: object) -> bool:
 
 def _legacy_migration_contract(
     series_key: object,
+    *,
+    explicit_counts: bool,
 ) -> tuple[PolicyRateRequest, str, str, str, str]:
-    if series_key == "D.AU":
-        return (
+    contracts = {
+        "D.AU": (
             authoritative_d_au_request(),
             "d_au",
             AUTHORITATIVE_D_AU_URL,
             AUTHORITATIVE_D_AU_REPRESENTATION,
             "AU",
-        )
-    if series_key == "D.US":
-        return (
+        ),
+        "D.CA": (
+            authoritative_d_ca_request(),
+            "d_ca",
+            AUTHORITATIVE_D_CA_URL,
+            AUTHORITATIVE_D_CA_REPRESENTATION,
+            "CA",
+        ),
+        "D.CH": (
+            authoritative_d_ch_request(),
+            "d_ch",
+            AUTHORITATIVE_D_CH_URL,
+            AUTHORITATIVE_D_CH_REPRESENTATION,
+            "CH",
+        ),
+        "D.XM": (
+            authoritative_d_xm_request(),
+            "d_xm",
+            AUTHORITATIVE_D_XM_URL,
+            AUTHORITATIVE_D_XM_REPRESENTATION,
+            "XM",
+        ),
+        "D.GB": (
+            authoritative_d_gb_request(),
+            "d_gb",
+            AUTHORITATIVE_D_GB_URL,
+            AUTHORITATIVE_D_GB_REPRESENTATION,
+            "GB",
+        ),
+        "D.JP": (
+            authoritative_d_jp_request(),
+            "d_jp",
+            AUTHORITATIVE_D_JP_URL,
+            AUTHORITATIVE_D_JP_REPRESENTATION,
+            "JP",
+        ),
+        "D.NZ": (
+            authoritative_d_nz_request(),
+            "d_nz",
+            AUTHORITATIVE_D_NZ_URL,
+            AUTHORITATIVE_D_NZ_REPRESENTATION,
+            "NZ",
+        ),
+        "D.US": (
             authoritative_d_us_request(),
             "d_us",
             AUTHORITATIVE_D_US_URL,
             AUTHORITATIVE_D_US_REPRESENTATION,
             "US",
-        )
+        ),
+    }
+    if series_key in contracts and (explicit_counts or series_key in {"D.AU", "D.US"}):
+        return contracts[series_key]
     raise PolicyRateQualificationError("migration_scope_not_approved")
 
 
@@ -828,15 +878,27 @@ def migrate_legacy_authoritative_bis_manifest(
     has_legacy_count = "row_count" in legacy
     has_raw_count = "raw_row_count" in legacy
     has_numeric_count = "numeric_observation_count" in legacy
-    if not has_legacy_count and has_raw_count and has_numeric_count:
+    if legacy.get("schema") == BIS_PERSISTED_SCHEMA and has_raw_count and has_numeric_count:
         raise PolicyRateQualificationError("manifest_already_current")
-    if has_raw_count or has_numeric_count or not has_legacy_count:
-        raise PolicyRateQualificationError("legacy_manifest_shape_invalid")
-    if frozenset(legacy) != _LEGACY_AUTHORITATIVE_MANIFEST_FIELDS:
+    legacy_count_shape = (
+        has_legacy_count
+        and not has_raw_count
+        and not has_numeric_count
+        and frozenset(legacy) == _LEGACY_AUTHORITATIVE_MANIFEST_FIELDS
+    )
+    explicit_count_shape = (
+        not has_legacy_count
+        and has_raw_count
+        and has_numeric_count
+        and frozenset(legacy) == _EXPLICIT_COUNT_LEGACY_MANIFEST_FIELDS
+    )
+    if not legacy_count_shape and not explicit_count_shape:
         raise PolicyRateQualificationError("legacy_manifest_shape_invalid")
 
     request, slug, exact_url, representation, reference_area = (
-        _legacy_migration_contract(legacy["series_key"])
+        _legacy_migration_contract(
+            legacy["series_key"], explicit_counts=explicit_count_shape
+        )
     )
     if resolved_directory.name != f"{slug}-{request.fingerprint}":
         raise PolicyRateQualificationError("migration_path_not_approved")
@@ -849,13 +911,25 @@ def migrate_legacy_authoritative_bis_manifest(
         or legacy["reference_area"] != reference_area
         or legacy["unit_measure"] != "368"
         or legacy["unit_mult"] != "0"
-        or legacy["status_semantics"] != ["A=normal"]
+        or legacy["status_semantics"]
+        != (
+            list(AUTHORITATIVE_BIS_RAW_STATUS_SEMANTICS)
+            if explicit_count_shape
+            else ["A=normal"]
+        )
         or legacy["response_media_type"] != "application/xml"
     ):
         raise PolicyRateQualificationError("legacy_manifest_inconsistent")
 
     byte_count = legacy["byte_count"]
-    legacy_row_count = legacy["row_count"]
+    legacy_row_count = (
+        legacy["numeric_observation_count"]
+        if explicit_count_shape
+        else legacy["row_count"]
+    )
+    legacy_raw_row_count = (
+        legacy["raw_row_count"] if explicit_count_shape else legacy_row_count
+    )
     if (
         isinstance(byte_count, bool)
         or not isinstance(byte_count, int)
@@ -863,6 +937,9 @@ def migrate_legacy_authoritative_bis_manifest(
         or isinstance(legacy_row_count, bool)
         or not isinstance(legacy_row_count, int)
         or legacy_row_count < 1
+        or isinstance(legacy_raw_row_count, bool)
+        or not isinstance(legacy_raw_row_count, int)
+        or legacy_raw_row_count < legacy_row_count
     ):
         raise PolicyRateQualificationError("legacy_manifest_inconsistent")
     if not all(
@@ -900,6 +977,8 @@ def migrate_legacy_authoritative_bis_manifest(
         raise PolicyRateQualificationError("observation_hash_mismatch")
     if legacy_row_count != numeric_observation_count:
         raise PolicyRateQualificationError("legacy_row_count_mismatch")
+    if legacy_raw_row_count != raw_row_count:
+        raise PolicyRateQualificationError("legacy_row_count_mismatch")
     if (
         observations[0].observation_date != legacy_minimum
         or observations[-1].observation_date != legacy_maximum
@@ -916,13 +995,23 @@ def migrate_legacy_authoritative_bis_manifest(
         "reference_area": reference_area,
         "unit_measure": "368",
         "unit_mult": "0",
-        "status_semantics": ("A=normal",),
+        "status_semantics": (
+            AUTHORITATIVE_BIS_RAW_STATUS_SEMANTICS
+            if explicit_count_shape
+            else ("A=normal",)
+        ),
         "raw_sha256": raw_sha256,
         "canonical_observation_hash": observation_hash,
-        "row_count": legacy_row_count,
         "min_observation_date": legacy_minimum,
         "max_observation_date": legacy_maximum,
     }
+    if explicit_count_shape:
+        legacy_semantic.update(
+            raw_row_count=legacy_raw_row_count,
+            numeric_observation_count=legacy_row_count,
+        )
+    else:
+        legacy_semantic["row_count"] = legacy_row_count
     if canonical_sha256(legacy_semantic) != legacy["dataset_id"]:
         raise PolicyRateQualificationError("legacy_dataset_id_mismatch")
 

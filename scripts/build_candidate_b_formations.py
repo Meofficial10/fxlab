@@ -6,9 +6,14 @@ construction, return calculation, or experiment logging.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, time, timedelta
+from pathlib import Path
 
+from fxlab.data.candidate_b_evidence import (
+    AuthoritativeSdmxPolicyRateSeriesManifest,
+    load_candidate_b_verified_evidence,
+)
 from fxlab.data.policy_rates import (
     APPROVED_BIS_SERIES,
     APPROVED_PAIRS,
@@ -93,6 +98,9 @@ def _validate_series_manifest(manifest: PolicyRateSeriesManifest) -> None:
         or manifest.parsed_max_observation_date != dates[-1]
     ):
         _fail("series_manifest_invalid")
+    if isinstance(manifest, AuthoritativeSdmxPolicyRateSeriesManifest):
+        manifest.revalidate()
+        return
     expected_dataset_id = canonical_sha256(
         {
             "format": 1,
@@ -320,3 +328,23 @@ def build_candidate_b_formation_manifest(
     ):
         _fail("measured_formation_contract_incomplete")
     return manifest
+
+
+def build_candidate_b_formation_manifest_from_persisted_evidence(
+    *,
+    bis_publication_paths: Mapping[str, Path],
+    policy_event_publication_path: Path,
+    spot_panel_publication_path: Path,
+) -> CandidateBFormationManifest:
+    """Verify all persisted categories before invoking the existing formation builder."""
+
+    bundle = load_candidate_b_verified_evidence(
+        bis_publication_paths=bis_publication_paths,
+        policy_event_publication_path=policy_event_publication_path,
+        spot_panel_publication_path=spot_panel_publication_path,
+    )
+    return build_candidate_b_formation_manifest(
+        series_manifests=bundle.series_manifests,
+        event_manifest=bundle.event_manifest,
+        spot_panel=bundle.spot_panel,
+    )
