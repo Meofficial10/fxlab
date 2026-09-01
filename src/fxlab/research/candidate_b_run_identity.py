@@ -48,11 +48,12 @@ from fxlab.research.candidate_b_measurement import (
 
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
-_ADR_SHA256 = "10359fceddf5ef3f19327a0d43e6e3fba2886eae25d847388718a398eee58444"
+_ADR_SHA256 = "a13f2a79f9890b99c388bd2e59ef1d8ab3a20fa4bffea1575df72dad10680603"
 _ADR_COMMITS = (
     "83ba9a2f7792d3cd1cacbd0a684dfcde51bd1bae",
     "95f903fc8c50d1bb5c181e75beae5cff1a45629b",
     "eee70b30456c913dfa94e96d5b6cf3e470b9d4fe",
+    "7d073e5d6a06e80ee1efd16f1b6a7b8053b93df4",
 )
 
 

@@ -51,7 +51,7 @@ from test_policy_rate_data import (  # noqa: E402
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
-CURRENT_ADR_SHA256 = "10359fceddf5ef3f19327a0d43e6e3fba2886eae25d847388718a398eee58444"
+CURRENT_ADR_SHA256 = "a13f2a79f9890b99c388bd2e59ef1d8ab3a20fa4bffea1575df72dad10680603"
 
 
 def test_spot_semantic_evidence_factory_is_required() -> None:
@@ -156,9 +156,7 @@ def test_spot_post_2023_actual_bound_rejected_before_frame_access() -> None:
 def test_spot_mixed_2023_2024_rows_fail_without_value_access_or_truncation() -> None:
     *_, spots, _formations, _qualification, semantic = evidence_bundle()
     original = semantic.pair_datasets[0]
-    mixed_index = original.frame.index.append(
-        pd.DatetimeIndex([datetime(2024, 1, 2, tzinfo=UTC)])
-    )
+    mixed_index = original.frame.index.append(pd.DatetimeIndex([datetime(2024, 1, 2, tzinfo=UTC)]))
     sentinel = _ExplodingSpotFrame(mixed_index)
     contaminated = _spot_dataset_with_exploding_frame(
         original,
@@ -274,30 +272,28 @@ def _spot_provenance_and_panel(spots: SpotPanelManifestReference):
         dataset_id = dataset_identity("dukascopy", "1", query.fingerprint, content_hash)
         dataset_by_pair[pair] = dataset_id
         provenance = DataProvenance(
-                provider_id="dukascopy",
-                provider_version="1",
-                normalization_version="dukascopy_bid_v1",
-                canonical_symbol=pair,
-                provider_symbol=DUKASCOPY_SYMBOLS[pair],
-                timeframe="D1",
-                query_start=first,
-                query_end=end,
-                query_as_of=end,
-                retrieved_at=end + timedelta(days=1),
-                actual_first_observation=first,
-                actual_last_observation=last,
-                row_count=len(references),
-                content_hash=content_hash,
-                query_fingerprint=query.fingerprint,
-                dataset_id=dataset_id,
-                revision="synthetic_revision_1",
-                source_timezone="UTC",
-                provenance_quality=ProvenanceQuality.VERIFIED,
-                sanitized_source_reference="dukascopy:historical:bid",
+            provider_id="dukascopy",
+            provider_version="1",
+            normalization_version="dukascopy_bid_v1",
+            canonical_symbol=pair,
+            provider_symbol=DUKASCOPY_SYMBOLS[pair],
+            timeframe="D1",
+            query_start=first,
+            query_end=end,
+            query_as_of=end,
+            retrieved_at=end + timedelta(days=1),
+            actual_first_observation=first,
+            actual_last_observation=last,
+            row_count=len(references),
+            content_hash=content_hash,
+            query_fingerprint=query.fingerprint,
+            dataset_id=dataset_id,
+            revision="synthetic_revision_1",
+            source_timezone="UTC",
+            provenance_quality=ProvenanceQuality.VERIFIED,
+            sanitized_source_reference="dukascopy:historical:bid",
         )
-        datasets.append(
-            BarDataset(query, frame, provenance)
-        )
+        datasets.append(BarDataset(query, frame, provenance))
     observations = tuple(
         replace(item, dataset_id=dataset_by_pair[item.pair]) for item in spots.observations
     )
@@ -390,6 +386,7 @@ def test_static_contract_is_zero_parameter_frozen_and_matches_current_adr() -> N
     assert contract.identity.clarification_commits == (
         "95f903fc8c50d1bb5c181e75beae5cff1a45629b",
         "eee70b30456c913dfa94e96d5b6cf3e470b9d4fe",
+        "7d073e5d6a06e80ee1efd16f1b6a7b8053b93df4",
     )
     assert contract.formation.train_count == 83
     assert contract.formation.validation_count == 23
@@ -716,9 +713,7 @@ def test_retrieval_time_changes_audit_identity_but_not_semantic_run_id() -> None
 
 def test_spot_retrieval_audit_change_does_not_change_semantic_run_id() -> None:
     original_bundle = evidence_bundle()
-    changed_bundle = _replace_spot_audit_manifest(
-        original_bundle, "e" * 64, timedelta(days=7)
-    )
+    changed_bundle = _replace_spot_audit_manifest(original_bundle, "e" * 64, timedelta(days=7))
     original = _bindings_from_bundle(original_bundle)
     changed = _bindings_from_bundle(changed_bundle)
     static = build_candidate_b_static_run_contract()
@@ -750,9 +745,7 @@ def test_spot_semantic_changes_fail_closed(field: str, value: str) -> None:
         _tampered_dataset(first, replace(first.provenance, **{field: value})),
     ) + semantic.pair_datasets[1:]
     with pytest.raises(ValueError, match="dataset evidence|semantic provenance"):
-        build_candidate_b_spot_semantic_evidence(
-            spot_panel=spots, pair_datasets=changed
-        )
+        build_candidate_b_spot_semantic_evidence(spot_panel=spots, pair_datasets=changed)
 
 
 def test_spot_semantic_evidence_rejects_legacy_missing_duplicate_and_naked_hashes() -> None:
@@ -780,8 +773,7 @@ def test_spot_semantic_evidence_rejects_legacy_missing_duplicate_and_naked_hashe
     with pytest.raises(ValueError, match="exact Candidate B pair"):
         build_candidate_b_spot_semantic_evidence(
             spot_panel=spots,
-            pair_datasets=semantic.pair_datasets[:-1]
-            + (semantic.pair_datasets[0],),
+            pair_datasets=semantic.pair_datasets[:-1] + (semantic.pair_datasets[0],),
         )
     with pytest.raises(TypeError):
         CandidateBSpotSemanticEvidence(
@@ -837,9 +829,7 @@ def test_spot_semantic_evidence_tampering_and_panel_mismatch_are_revalidated() -
 
 
 def test_missing_spot_semantic_evidence_cannot_finalize() -> None:
-    manifests, events, concordance, spots, formations, qualification, _semantic = (
-        evidence_bundle()
-    )
+    manifests, events, concordance, spots, formations, qualification, _semantic = evidence_bundle()
     with pytest.raises(TypeError):
         build_candidate_b_qualified_run_bindings(  # type: ignore[call-arg]
             static_contract=build_candidate_b_static_run_contract(),
