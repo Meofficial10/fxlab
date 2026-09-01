@@ -2856,6 +2856,8 @@ def _create_legacy_authoritative_publication(
 
     current = json.loads(published.manifest_path.read_text(encoding="utf-8"))
     legacy = dict(current)
+    for v2_only in ("schema", "audit_contract", "returned_url", "response_headers"):
+        legacy.pop(v2_only)
     raw_count = legacy.pop("raw_row_count")
     numeric_count = legacy.pop("numeric_observation_count")
     assert raw_count == numeric_count
@@ -2916,6 +2918,15 @@ def test_legacy_authoritative_manifest_migration_d_au_preserves_evidence(
     assert migrated["manifest_id"] != legacy["manifest_id"]
     assert result.dataset_id == migrated["dataset_id"]
     assert result.manifest_id == migrated["manifest_id"]
+    assert migrated["schema"] == "candidate_b_bis_authoritative.v2"
+    assert migrated["audit_contract"] == "candidate_b_bis_migration_audit.v1"
+    assert migrated["migration_contract"] == (
+        ingestion.LEGACY_AUTHORITATIVE_MANIFEST_MIGRATION_CONTRACT
+    )
+    assert migrated["legacy_dataset_id"] == legacy["dataset_id"]
+    assert migrated["legacy_manifest_id"] == legacy["manifest_id"]
+    assert "returned_url" not in migrated
+    assert "response_headers" not in migrated
 
 
 def test_legacy_authoritative_manifest_migration_d_us_preserves_evidence(

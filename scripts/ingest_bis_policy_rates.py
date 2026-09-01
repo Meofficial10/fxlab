@@ -24,6 +24,10 @@ from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from fxlab.data.candidate_b_evidence import (
+    build_candidate_b_bis_migration_persisted_manifest,
+    build_candidate_b_bis_persisted_manifest,
+)
 from fxlab.data.policy_rates import (
     APPROVED_BIS_SERIES,
     APPROVED_REQUEST_END,
@@ -125,6 +129,22 @@ class AuthoritativeBisHttpResponse:
             "headers",
             MappingProxyType(dict(sorted(normalized_headers.items()))),
         )
+
+
+def persisted_authoritative_bis_manifest(
+    manifest: object,
+    response: AuthoritativeBisHttpResponse,
+) -> dict[str, object]:
+    """Materialize the complete, independently verifiable acquisition manifest."""
+
+    values = json.loads(canonical_json(manifest))
+    if not isinstance(values, dict):
+        raise PolicyRateQualificationError("authoritative_manifest_invalid")
+    return build_candidate_b_bis_persisted_manifest(
+        manifest=values,
+        returned_url=response.final_url,
+        response_headers=response.headers,
+    )
 
 
 class AuthoritativeBisTransport(Protocol):
@@ -947,7 +967,13 @@ def migrate_legacy_authoritative_bis_manifest(
             "manifest_id": manifest_id,
         }
     )
-    payload = canonical_json(migrated).encode("utf-8")
+    persisted_migration = build_candidate_b_bis_migration_persisted_manifest(
+        manifest=migrated,
+        migration_contract=LEGACY_AUTHORITATIVE_MANIFEST_MIGRATION_CONTRACT,
+        legacy_dataset_id=legacy["dataset_id"],
+        legacy_manifest_id=legacy["manifest_id"],
+    )
+    payload = canonical_json(persisted_migration).encode("utf-8")
 
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".manifest-migration-",
@@ -1181,7 +1207,8 @@ def acquire_and_publish_authoritative_d_us(
         raw_path = temporary / "response.xml"
         manifest_path = temporary / "manifest.json"
         _write_fully(raw_path, response.raw_bytes)
-        _write_fully(manifest_path, canonical_json(manifest).encode("utf-8"))
+        persisted = persisted_authoritative_bis_manifest(manifest, response)
+        _write_fully(manifest_path, canonical_json(persisted).encode("utf-8"))
         if destination.exists():
             raise PolicyRateQualificationError("destination_exists")
         temporary.replace(destination)
@@ -1244,7 +1271,8 @@ def _publish_authoritative_sparse_series(
         raw_path = temporary / "response.xml"
         manifest_path = temporary / "manifest.json"
         _write_fully(raw_path, response.raw_bytes)
-        _write_fully(manifest_path, canonical_json(manifest).encode("utf-8"))
+        persisted = persisted_authoritative_bis_manifest(manifest, response)
+        _write_fully(manifest_path, canonical_json(persisted).encode("utf-8"))
         if destination.exists():
             raise PolicyRateQualificationError("destination_exists")
         temporary.replace(destination)
