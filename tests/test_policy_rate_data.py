@@ -6,6 +6,7 @@ import calendar
 from dataclasses import FrozenInstanceError, asdict, fields, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from scripts.ingest_bis_policy_rates import (
@@ -49,6 +50,7 @@ from fxlab.data.policy_rates import (
     SpotPanelManifestReference,
     TimePrecision,
     build_series_manifest,
+    canonical_json,
     canonical_sha256,
     event_is_eligible,
     parse_bis_csv,
@@ -2797,6 +2799,281 @@ def test_authoritative_d_jp_cli_exact_authorized_target_invokes_once(
         f"dataset_id={publication.manifest.dataset_id}",
         f"manifest_id={publication.manifest.manifest_id}",
     ]
+
+
+def _legacy_authoritative_semantic(manifest: dict[str, object]) -> dict[str, object]:
+    return {
+        "format": 1,
+        "request_fingerprint": manifest["request_fingerprint"],
+        "exact_url": manifest["exact_url"],
+        "representation_identity": manifest["representation_identity"],
+        "series_key": manifest["series_key"],
+        "frequency": manifest["frequency"],
+        "reference_area": manifest["reference_area"],
+        "unit_measure": manifest["unit_measure"],
+        "unit_mult": manifest["unit_mult"],
+        "status_semantics": ("A=normal",),
+        "raw_sha256": manifest["raw_sha256"],
+        "canonical_observation_hash": manifest["canonical_observation_hash"],
+        "row_count": manifest["row_count"],
+        "min_observation_date": manifest["min_observation_date"],
+        "max_observation_date": manifest["max_observation_date"],
+    }
+
+
+def _create_legacy_authoritative_publication(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    series_key: str,
+) -> tuple[Path, bytes, dict[str, object]]:
+    import json
+
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    monkeypatch.setattr(ingestion, "AUTHORITATIVE_BIS_ROOT", root)
+    if series_key == "D.AU":
+        from fxlab.data.policy_rates import authoritative_d_au_request
+
+        request_item = authoritative_d_au_request()
+        raw = _authoritative_d_au_raw()
+        published = ingestion.acquire_and_publish_authoritative_d_au(
+            request_item,
+            _authoritative_d_au_transport(raw),
+            RETRIEVED,
+        )
+    elif series_key == "D.US":
+        from fxlab.data.policy_rates import authoritative_d_us_request
+
+        request_item = authoritative_d_us_request()
+        raw = authoritative_d_us_xml()
+        published = ingestion.acquire_and_publish_authoritative_d_us(
+            request_item,
+            _authoritative_transport_with_raw(raw),
+            RETRIEVED,
+        )
+    else:
+        raise AssertionError("test helper only creates D.AU or D.US")
+
+    current = json.loads(published.manifest_path.read_text(encoding="utf-8"))
+    legacy = dict(current)
+    raw_count = legacy.pop("raw_row_count")
+    numeric_count = legacy.pop("numeric_observation_count")
+    assert raw_count == numeric_count
+    legacy["row_count"] = numeric_count
+    legacy["status_semantics"] = ["A=normal"]
+    legacy["dataset_id"] = canonical_sha256(_legacy_authoritative_semantic(legacy))
+    legacy["manifest_id"] = canonical_sha256(
+        {
+            "legacy_dataset_id": legacy["dataset_id"],
+            "synthetic_preserved_audit": True,
+        }
+    )
+    published.manifest_path.write_text(canonical_json(legacy), encoding="utf-8")
+    return published.destination, raw, legacy
+
+
+def _rewrite_manifest(path: Path, changes: dict[str, object]) -> bytes:
+    import json
+
+    original = path.read_bytes()
+    manifest = json.loads(original)
+    manifest.update(changes)
+    path.write_text(canonical_json(manifest), encoding="utf-8")
+    return path.read_bytes()
+
+
+def test_legacy_authoritative_manifest_migration_d_au_preserves_evidence(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    destination, raw, legacy = _create_legacy_authoritative_publication(
+        tmp_path / "authoritative", monkeypatch, "D.AU"
+    )
+    raw_before = (destination / "response.xml").read_bytes()
+
+    result = ingestion.migrate_legacy_authoritative_bis_manifest(destination)
+
+    migrated = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
+    assert result.status == "migrated"
+    assert result.manifest_path == destination / "manifest.json"
+    assert (destination / "response.xml").read_bytes() == raw_before == raw
+    assert migrated["raw_sha256"] == legacy["raw_sha256"]
+    assert migrated["canonical_observation_hash"] == (
+        legacy["canonical_observation_hash"]
+    )
+    assert migrated["retrieved_at"] == legacy["retrieved_at"]
+    assert migrated["raw_row_count"] == 3
+    assert migrated["numeric_observation_count"] == 3
+    assert "row_count" not in migrated
+    assert migrated["status_semantics"] == [
+        "A=normal",
+        "M=missing_value_data_cannot_exist",
+    ]
+    assert migrated["dataset_id"] != legacy["dataset_id"]
+    assert migrated["manifest_id"] != legacy["manifest_id"]
+    assert result.dataset_id == migrated["dataset_id"]
+    assert result.manifest_id == migrated["manifest_id"]
+
+
+def test_legacy_authoritative_manifest_migration_d_us_preserves_evidence(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    destination, raw, legacy = _create_legacy_authoritative_publication(
+        tmp_path / "authoritative", monkeypatch, "D.US"
+    )
+
+    ingestion.migrate_legacy_authoritative_bis_manifest(destination)
+
+    migrated = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
+    assert (destination / "response.xml").read_bytes() == raw
+    assert migrated["raw_row_count"] == 3652
+    assert migrated["numeric_observation_count"] == 3652
+    assert migrated["retrieved_at"] == legacy["retrieved_at"]
+    assert migrated["dataset_id"] != legacy["dataset_id"]
+    assert migrated["manifest_id"] != legacy["manifest_id"]
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement", "reason"),
+    (
+        ("raw_sha256", "0" * 64, "raw_sha256_mismatch"),
+        ("byte_count", 1, "byte_count_mismatch"),
+        ("canonical_observation_hash", "0" * 64, "observation_hash_mismatch"),
+        ("request_fingerprint", "0" * 64, "request_fingerprint_mismatch"),
+        ("dataset_id", "0" * 64, "legacy_dataset_id_mismatch"),
+        ("series_key", "D.CA", "migration_scope_not_approved"),
+    ),
+)
+def test_legacy_authoritative_manifest_migration_rejects_forged_bindings(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    replacement: object,
+    reason: str,
+) -> None:
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    destination, _, _ = _create_legacy_authoritative_publication(
+        tmp_path / "authoritative", monkeypatch, "D.AU"
+    )
+    manifest_path = destination / "manifest.json"
+    forged = _rewrite_manifest(manifest_path, {field_name: replacement})
+
+    with pytest.raises(PolicyRateQualificationError, match=reason):
+        ingestion.migrate_legacy_authoritative_bis_manifest(destination)
+
+    assert manifest_path.read_bytes() == forged
+
+
+def test_legacy_authoritative_manifest_migration_rejects_unsupported_status_value(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+    import json
+
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    destination, _, _ = _create_legacy_authoritative_publication(
+        tmp_path / "authoritative", monkeypatch, "D.AU"
+    )
+    invalid_raw = authoritative_sparse_xml(
+        reference_area="AU",
+        observations=(
+            ("2014-01-03", "2.50", "A"),
+            ("2014-01-07", "2.50", "M"),
+            ("2023-12-29", "4.35", "A"),
+        ),
+    )
+    (destination / "response.xml").write_bytes(invalid_raw)
+    manifest_path = destination / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["raw_sha256"] = hashlib.sha256(invalid_raw).hexdigest()
+    manifest["byte_count"] = len(invalid_raw)
+    manifest_path.write_text(canonical_json(manifest), encoding="utf-8")
+
+    with pytest.raises(
+        PolicyRateQualificationError, match="observation_status_value_invalid"
+    ):
+        ingestion.migrate_legacy_authoritative_bis_manifest(destination)
+
+
+def test_legacy_authoritative_manifest_migration_is_idempotently_fail_closed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    destination, _, _ = _create_legacy_authoritative_publication(
+        tmp_path / "authoritative", monkeypatch, "D.AU"
+    )
+    ingestion.migrate_legacy_authoritative_bis_manifest(destination)
+    manifest_path = destination / "manifest.json"
+    migrated = manifest_path.read_bytes()
+
+    with pytest.raises(PolicyRateQualificationError, match="manifest_already_current"):
+        ingestion.migrate_legacy_authoritative_bis_manifest(destination)
+
+    assert manifest_path.read_bytes() == migrated
+
+
+def test_legacy_authoritative_manifest_migration_rejects_outside_root(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    root = tmp_path / "authoritative"
+    destination, _, _ = _create_legacy_authoritative_publication(
+        root, monkeypatch, "D.AU"
+    )
+    outside = tmp_path / "outside"
+    destination.rename(outside)
+
+    with pytest.raises(PolicyRateQualificationError, match="migration_path_not_approved"):
+        ingestion.migrate_legacy_authoritative_bis_manifest(outside)
+
+
+def test_legacy_authoritative_manifest_migration_rejects_missing_files(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    root = tmp_path / "authoritative"
+    monkeypatch.setattr(ingestion, "AUTHORITATIVE_BIS_ROOT", root)
+    destination = root / "d_au-missing"
+    destination.mkdir(parents=True)
+
+    with pytest.raises(PolicyRateQualificationError, match="migration_evidence_missing"):
+        ingestion.migrate_legacy_authoritative_bis_manifest(destination)
+
+
+def test_legacy_authoritative_manifest_migration_atomic_failure_preserves_manifest(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.ingest_bis_policy_rates as ingestion
+
+    destination, raw, _ = _create_legacy_authoritative_publication(
+        tmp_path / "authoritative", monkeypatch, "D.AU"
+    )
+    manifest_path = destination / "manifest.json"
+    original_manifest = manifest_path.read_bytes()
+
+    def fail_replace(source, target):
+        raise OSError("synthetic atomic replacement failure")
+
+    monkeypatch.setattr(ingestion.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="synthetic atomic replacement failure"):
+        ingestion.migrate_legacy_authoritative_bis_manifest(destination)
+
+    assert manifest_path.read_bytes() == original_manifest
+    assert (destination / "response.xml").read_bytes() == raw
+    assert not tuple(destination.glob(".manifest-migration-*"))
 
 
 def spec(currency: str = "AUD") -> PolicyRateSeriesSpec:

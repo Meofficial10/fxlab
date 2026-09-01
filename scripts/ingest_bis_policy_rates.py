@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import socket
@@ -75,6 +76,9 @@ AUTHORITATIVE_D_GB_REPRESENTATION = AUTHORITATIVE_D_US_REPRESENTATION
 AUTHORITATIVE_D_NZ_REPRESENTATION = AUTHORITATIVE_D_US_REPRESENTATION
 AUTHORITATIVE_D_JP_REPRESENTATION = AUTHORITATIVE_D_US_REPRESENTATION
 AUTHORITATIVE_D_XM_REPRESENTATION = AUTHORITATIVE_D_US_REPRESENTATION
+LEGACY_AUTHORITATIVE_MANIFEST_MIGRATION_CONTRACT = (
+    "candidate_b_bis_authoritative_manifest_explicit_counts_v1"
+)
 
 
 @dataclass(frozen=True)
@@ -627,6 +631,15 @@ class AuthoritativeDJpPublication:
     manifest: AuthoritativeDJpManifest
 
 
+@dataclass(frozen=True)
+class AuthoritativeManifestMigrationResult:
+    status: str
+    publication_directory: Path
+    manifest_path: Path
+    dataset_id: str
+    manifest_id: str
+
+
 def _authoritative_d_us_manifest(
     request: PolicyRateRequest,
     response: AuthoritativeBisHttpResponse,
@@ -683,6 +696,284 @@ def _write_fully(path: Path, payload: bytes) -> None:
         stream.write(payload)
         stream.flush()
         os.fsync(stream.fileno())
+
+
+_LEGACY_AUTHORITATIVE_MANIFEST_FIELDS = frozenset(
+    {
+        "request_fingerprint",
+        "exact_url",
+        "representation_identity",
+        "series_key",
+        "frequency",
+        "reference_area",
+        "unit_measure",
+        "unit_mult",
+        "status_semantics",
+        "raw_sha256",
+        "canonical_observation_hash",
+        "row_count",
+        "min_observation_date",
+        "max_observation_date",
+        "retrieved_at",
+        "response_media_type",
+        "byte_count",
+        "dataset_id",
+        "manifest_id",
+    }
+)
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _legacy_migration_contract(
+    series_key: object,
+) -> tuple[PolicyRateRequest, str, str, str, str]:
+    if series_key == "D.AU":
+        return (
+            authoritative_d_au_request(),
+            "d_au",
+            AUTHORITATIVE_D_AU_URL,
+            AUTHORITATIVE_D_AU_REPRESENTATION,
+            "AU",
+        )
+    if series_key == "D.US":
+        return (
+            authoritative_d_us_request(),
+            "d_us",
+            AUTHORITATIVE_D_US_URL,
+            AUTHORITATIVE_D_US_REPRESENTATION,
+            "US",
+        )
+    raise PolicyRateQualificationError("migration_scope_not_approved")
+
+
+def _parse_migration_timestamp(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise PolicyRateQualificationError("legacy_manifest_inconsistent")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise PolicyRateQualificationError("legacy_manifest_inconsistent") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise PolicyRateQualificationError("legacy_manifest_inconsistent")
+    return parsed
+
+
+def _parse_migration_date(value: object) -> date:
+    if not isinstance(value, str):
+        raise PolicyRateQualificationError("legacy_manifest_inconsistent")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise PolicyRateQualificationError("legacy_manifest_inconsistent") from exc
+
+
+def migrate_legacy_authoritative_bis_manifest(
+    publication_directory: Path,
+) -> AuthoritativeManifestMigrationResult:
+    """Migrate one verified D.AU/D.US legacy manifest without touching raw bytes."""
+
+    if not isinstance(publication_directory, Path):
+        raise PolicyRateQualificationError("migration_path_not_approved")
+    approved_root = AUTHORITATIVE_BIS_ROOT.resolve()
+    resolved_directory = publication_directory.resolve()
+    if resolved_directory.parent != approved_root:
+        raise PolicyRateQualificationError("migration_path_not_approved")
+
+    raw_path = resolved_directory / "response.xml"
+    manifest_path = resolved_directory / "manifest.json"
+    if (
+        not resolved_directory.is_dir()
+        or not raw_path.is_file()
+        or not manifest_path.is_file()
+    ):
+        raise PolicyRateQualificationError("migration_evidence_missing")
+
+    original_manifest_bytes = manifest_path.read_bytes()
+    try:
+        legacy = json.loads(original_manifest_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PolicyRateQualificationError("legacy_manifest_invalid") from exc
+    if not isinstance(legacy, dict) or any(
+        not isinstance(key, str) for key in legacy
+    ):
+        raise PolicyRateQualificationError("legacy_manifest_invalid")
+
+    has_legacy_count = "row_count" in legacy
+    has_raw_count = "raw_row_count" in legacy
+    has_numeric_count = "numeric_observation_count" in legacy
+    if not has_legacy_count and has_raw_count and has_numeric_count:
+        raise PolicyRateQualificationError("manifest_already_current")
+    if has_raw_count or has_numeric_count or not has_legacy_count:
+        raise PolicyRateQualificationError("legacy_manifest_shape_invalid")
+    if frozenset(legacy) != _LEGACY_AUTHORITATIVE_MANIFEST_FIELDS:
+        raise PolicyRateQualificationError("legacy_manifest_shape_invalid")
+
+    request, slug, exact_url, representation, reference_area = (
+        _legacy_migration_contract(legacy["series_key"])
+    )
+    if resolved_directory.name != f"{slug}-{request.fingerprint}":
+        raise PolicyRateQualificationError("migration_path_not_approved")
+    if legacy["request_fingerprint"] != request.fingerprint:
+        raise PolicyRateQualificationError("request_fingerprint_mismatch")
+    if (
+        legacy["exact_url"] != exact_url
+        or legacy["representation_identity"] != representation
+        or legacy["frequency"] != "D"
+        or legacy["reference_area"] != reference_area
+        or legacy["unit_measure"] != "368"
+        or legacy["unit_mult"] != "0"
+        or legacy["status_semantics"] != ["A=normal"]
+        or legacy["response_media_type"] != "application/xml"
+    ):
+        raise PolicyRateQualificationError("legacy_manifest_inconsistent")
+
+    byte_count = legacy["byte_count"]
+    legacy_row_count = legacy["row_count"]
+    if (
+        isinstance(byte_count, bool)
+        or not isinstance(byte_count, int)
+        or byte_count < 1
+        or isinstance(legacy_row_count, bool)
+        or not isinstance(legacy_row_count, int)
+        or legacy_row_count < 1
+    ):
+        raise PolicyRateQualificationError("legacy_manifest_inconsistent")
+    if not all(
+        _is_sha256(legacy[field_name])
+        for field_name in (
+            "raw_sha256",
+            "canonical_observation_hash",
+            "dataset_id",
+            "manifest_id",
+        )
+    ):
+        raise PolicyRateQualificationError("legacy_manifest_invalid")
+
+    retrieved_at = _parse_migration_timestamp(legacy["retrieved_at"])
+    legacy_minimum = _parse_migration_date(legacy["min_observation_date"])
+    legacy_maximum = _parse_migration_date(legacy["max_observation_date"])
+    raw_bytes = raw_path.read_bytes()
+    if len(raw_bytes) != byte_count:
+        raise PolicyRateQualificationError("byte_count_mismatch")
+    raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    if raw_sha256 != legacy["raw_sha256"]:
+        raise PolicyRateQualificationError("raw_sha256_mismatch")
+
+    if legacy["series_key"] == "D.US":
+        observations = parse_authoritative_bis_d_us_sdmx(raw_bytes, request)
+        raw_row_count = len(observations)
+        numeric_observation_count = len(observations)
+    else:
+        parsed = parse_authoritative_bis_sdmx(raw_bytes, request)
+        observations = parsed.observations
+        raw_row_count = parsed.raw_row_count
+        numeric_observation_count = parsed.numeric_observation_count
+    observation_hash = canonical_sha256(observations)
+    if observation_hash != legacy["canonical_observation_hash"]:
+        raise PolicyRateQualificationError("observation_hash_mismatch")
+    if legacy_row_count != numeric_observation_count:
+        raise PolicyRateQualificationError("legacy_row_count_mismatch")
+    if (
+        observations[0].observation_date != legacy_minimum
+        or observations[-1].observation_date != legacy_maximum
+    ):
+        raise PolicyRateQualificationError("observation_bounds_mismatch")
+
+    legacy_semantic = {
+        "format": 1,
+        "request_fingerprint": request.fingerprint,
+        "exact_url": exact_url,
+        "representation_identity": representation,
+        "series_key": legacy["series_key"],
+        "frequency": "D",
+        "reference_area": reference_area,
+        "unit_measure": "368",
+        "unit_mult": "0",
+        "status_semantics": ("A=normal",),
+        "raw_sha256": raw_sha256,
+        "canonical_observation_hash": observation_hash,
+        "row_count": legacy_row_count,
+        "min_observation_date": legacy_minimum,
+        "max_observation_date": legacy_maximum,
+    }
+    if canonical_sha256(legacy_semantic) != legacy["dataset_id"]:
+        raise PolicyRateQualificationError("legacy_dataset_id_mismatch")
+
+    semantic = {
+        "format": 1,
+        "request_fingerprint": request.fingerprint,
+        "exact_url": exact_url,
+        "representation_identity": representation,
+        "series_key": legacy["series_key"],
+        "frequency": "D",
+        "reference_area": reference_area,
+        "unit_measure": "368",
+        "unit_mult": "0",
+        "status_semantics": AUTHORITATIVE_BIS_RAW_STATUS_SEMANTICS,
+        "raw_sha256": raw_sha256,
+        "canonical_observation_hash": observation_hash,
+        "raw_row_count": raw_row_count,
+        "numeric_observation_count": numeric_observation_count,
+        "min_observation_date": legacy_minimum,
+        "max_observation_date": legacy_maximum,
+    }
+    dataset_id = canonical_sha256(semantic)
+    migration_audit = {
+        "format": 1,
+        "migration_contract": LEGACY_AUTHORITATIVE_MANIFEST_MIGRATION_CONTRACT,
+        "dataset_id": dataset_id,
+        "retrieved_at": retrieved_at,
+        "byte_count": byte_count,
+        "response_media_type": legacy["response_media_type"],
+        "legacy_manifest_id": legacy["manifest_id"],
+        "legacy_dataset_id": legacy["dataset_id"],
+    }
+    manifest_id = canonical_sha256(migration_audit)
+    migrated = dict(semantic)
+    del migrated["format"]
+    migrated.update(
+        {
+            "retrieved_at": legacy["retrieved_at"],
+            "response_media_type": legacy["response_media_type"],
+            "byte_count": byte_count,
+            "dataset_id": dataset_id,
+            "manifest_id": manifest_id,
+        }
+    )
+    payload = canonical_json(migrated).encode("utf-8")
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".manifest-migration-",
+        suffix=".tmp",
+        dir=resolved_directory,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if manifest_path.read_bytes() != original_manifest_bytes:
+            raise PolicyRateQualificationError("manifest_changed_during_migration")
+        os.replace(temporary_path, manifest_path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+    return AuthoritativeManifestMigrationResult(
+        status="migrated",
+        publication_directory=resolved_directory,
+        manifest_path=manifest_path,
+        dataset_id=dataset_id,
+        manifest_id=manifest_id,
+    )
 
 
 def _authoritative_sparse_manifest_values(
