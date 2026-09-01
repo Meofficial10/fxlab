@@ -34,6 +34,8 @@ from fxlab.data.policy_rates import (
     AUTHORITATIVE_D_CA_URL,
     AUTHORITATIVE_D_CH_ACCEPT,
     AUTHORITATIVE_D_CH_URL,
+    AUTHORITATIVE_D_GB_ACCEPT,
+    AUTHORITATIVE_D_GB_URL,
     AUTHORITATIVE_D_JP_ACCEPT,
     AUTHORITATIVE_D_JP_URL,
     AUTHORITATIVE_D_US_ACCEPT,
@@ -48,6 +50,7 @@ from fxlab.data.policy_rates import (
     authoritative_d_au_request,
     authoritative_d_ca_request,
     authoritative_d_ch_request,
+    authoritative_d_gb_request,
     authoritative_d_jp_request,
     authoritative_d_us_request,
     authoritative_d_xm_request,
@@ -65,6 +68,7 @@ AUTHORITATIVE_D_US_REPRESENTATION = "SDMX_ML_2_1_STRUCTURE_SPECIFIC_DATA"
 AUTHORITATIVE_D_AU_REPRESENTATION = AUTHORITATIVE_D_US_REPRESENTATION
 AUTHORITATIVE_D_CA_REPRESENTATION = AUTHORITATIVE_D_US_REPRESENTATION
 AUTHORITATIVE_D_CH_REPRESENTATION = AUTHORITATIVE_D_US_REPRESENTATION
+AUTHORITATIVE_D_GB_REPRESENTATION = AUTHORITATIVE_D_US_REPRESENTATION
 AUTHORITATIVE_D_JP_REPRESENTATION = AUTHORITATIVE_D_US_REPRESENTATION
 AUTHORITATIVE_D_XM_REPRESENTATION = AUTHORITATIVE_D_US_REPRESENTATION
 
@@ -324,6 +328,19 @@ def fetch_authoritative_d_xm_response(
     )
 
 
+def fetch_authoritative_d_gb_response(
+    request: PolicyRateRequest,
+    transport: AuthoritativeBisTransport,
+) -> AuthoritativeBisHttpResponse:
+    return _fetch_authoritative_sparse_response(
+        request,
+        transport,
+        approved_request=authoritative_d_gb_request(),
+        exact_url=AUTHORITATIVE_D_GB_URL,
+        accept=AUTHORITATIVE_D_GB_ACCEPT,
+    )
+
+
 def fetch_authoritative_d_jp_response(
     request: PolicyRateRequest,
     transport: AuthoritativeBisTransport,
@@ -495,6 +512,38 @@ class AuthoritativeDXmPublication:
     raw_path: Path
     manifest_path: Path
     manifest: AuthoritativeDXmManifest
+
+
+@dataclass(frozen=True)
+class AuthoritativeDGbManifest:
+    request_fingerprint: str
+    exact_url: str
+    representation_identity: str
+    series_key: str
+    frequency: str
+    reference_area: str
+    unit_measure: str
+    unit_mult: str
+    status_semantics: tuple[str, ...]
+    raw_sha256: str
+    canonical_observation_hash: str
+    raw_row_count: int
+    numeric_observation_count: int
+    min_observation_date: date
+    max_observation_date: date
+    retrieved_at: datetime
+    response_media_type: str
+    byte_count: int
+    dataset_id: str
+    manifest_id: str
+
+
+@dataclass(frozen=True)
+class AuthoritativeDGbPublication:
+    destination: Path
+    raw_path: Path
+    manifest_path: Path
+    manifest: AuthoritativeDGbManifest
 
 
 @dataclass(frozen=True)
@@ -716,6 +765,24 @@ def _authoritative_d_xm_manifest(
     )
 
 
+def _authoritative_d_gb_manifest(
+    request: PolicyRateRequest,
+    response: AuthoritativeBisHttpResponse,
+    retrieved_at: datetime,
+) -> AuthoritativeDGbManifest:
+    return AuthoritativeDGbManifest(
+        **_authoritative_sparse_manifest_values(
+            request,
+            response,
+            retrieved_at,
+            exact_url=AUTHORITATIVE_D_GB_URL,
+            representation_identity=AUTHORITATIVE_D_GB_REPRESENTATION,
+            series_key="D.GB",
+            reference_area="GB",
+        )
+    )
+
+
 def _authoritative_d_jp_manifest(
     request: PolicyRateRequest,
     response: AuthoritativeBisHttpResponse,
@@ -787,6 +854,7 @@ def _publish_authoritative_sparse_series(
         AuthoritativeDAuManifest
         | AuthoritativeDCaManifest
         | AuthoritativeDChManifest
+        | AuthoritativeDGbManifest
         | AuthoritativeDJpManifest
         | AuthoritativeDXmManifest,
     ],
@@ -797,6 +865,7 @@ def _publish_authoritative_sparse_series(
     AuthoritativeDAuManifest
     | AuthoritativeDCaManifest
     | AuthoritativeDChManifest
+    | AuthoritativeDGbManifest
     | AuthoritativeDJpManifest
     | AuthoritativeDXmManifest,
 ]:
@@ -927,6 +996,30 @@ def acquire_and_publish_authoritative_d_xm(
     )
 
 
+def acquire_and_publish_authoritative_d_gb(
+    request: PolicyRateRequest,
+    transport: AuthoritativeBisTransport,
+    retrieved_at: datetime,
+) -> AuthoritativeDGbPublication:
+    destination, raw_path, manifest_path, manifest = _publish_authoritative_sparse_series(
+        request,
+        transport,
+        retrieved_at,
+        approved_request=authoritative_d_gb_request(),
+        destination_slug="d_gb",
+        fetch_response=fetch_authoritative_d_gb_response,
+        build_manifest=_authoritative_d_gb_manifest,
+    )
+    if not isinstance(manifest, AuthoritativeDGbManifest):
+        raise TypeError("D.GB manifest type mismatch")
+    return AuthoritativeDGbPublication(
+        destination=destination,
+        raw_path=raw_path,
+        manifest_path=manifest_path,
+        manifest=manifest,
+    )
+
+
 def acquire_and_publish_authoritative_d_jp(
     request: PolicyRateRequest,
     transport: AuthoritativeBisTransport,
@@ -991,7 +1084,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--target",
-        choices=("d_us", "d_au", "d_ca", "d_ch", "d_xm", "d_jp"),
+        choices=("d_us", "d_au", "d_ca", "d_ch", "d_xm", "d_gb", "d_jp"),
     )
     args = parser.parse_args([] if argv is None else argv)
 
@@ -1028,6 +1121,12 @@ def main(argv: list[str] | None = None) -> None:
     elif args.target == "d_xm":
         publication = acquire_and_publish_authoritative_d_xm(
             authoritative_d_xm_request(),
+            UrllibAuthoritativeBisTransport(),
+            datetime.now(UTC),
+        )
+    elif args.target == "d_gb":
+        publication = acquire_and_publish_authoritative_d_gb(
+            authoritative_d_gb_request(),
             UrllibAuthoritativeBisTransport(),
             datetime.now(UTC),
         )
