@@ -59,6 +59,11 @@ AUTHORITATIVE_D_GB_URL = (
     "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.GB"
     "?startPeriod=2014-01-01&endPeriod=2023-12-31"
 )
+AUTHORITATIVE_D_NZ_ACCEPT = AUTHORITATIVE_D_US_ACCEPT
+AUTHORITATIVE_D_NZ_URL = (
+    "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.NZ"
+    "?startPeriod=2014-01-01&endPeriod=2023-12-31"
+)
 AUTHORITATIVE_D_JP_ACCEPT = AUTHORITATIVE_D_US_ACCEPT
 AUTHORITATIVE_D_JP_URL = (
     "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.JP"
@@ -358,6 +363,14 @@ def authoritative_d_xm_request() -> PolicyRateRequest:
 def authoritative_d_gb_request() -> PolicyRateRequest:
     return PolicyRateRequest(
         PolicyRateSeriesSpec("GBP", "D.GB"),
+        APPROVED_REQUEST_START,
+        APPROVED_REQUEST_END,
+    )
+
+
+def authoritative_d_nz_request() -> PolicyRateRequest:
+    return PolicyRateRequest(
+        PolicyRateSeriesSpec("NZD", "D.NZ"),
         APPROVED_REQUEST_START,
         APPROVED_REQUEST_END,
     )
