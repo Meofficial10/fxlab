@@ -1,24 +1,28 @@
 """Bounded Dukascopy historical BID-bar provider.
 
-The provider deliberately owns no cache and performs no retry.  Its transport is
-injectable so normal tests never use the network and callers receive only the
-existing canonical provider contracts.
+The provider deliberately owns no cache.  Its BI5 transport applies only a
+fixed, bounded retry policy to explicitly transient failures and is injectable
+so normal tests never use the network and callers receive only the existing
+canonical provider contracts.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import lzma
 import math
 import re
+import struct
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 import pandas as pd
 
@@ -45,6 +49,17 @@ _SOURCE_REFERENCE = "dukascopy:historical:bid"
 _ENDPOINT = "https://freeserv.dukascopy.com/2.0/index.php"
 _CALLBACK = "fxlab_callback"
 _MAX_PROVIDER_PAGE_SIZE = 30_000
+_BI5_ENDPOINT = "https://datafeed.dukascopy.com/datafeed"
+_BI5_RECORD = struct.Struct(">IIIff")
+_BI5_MAX_DECOMPRESSED_HOUR_BYTES = 64 * 1024 * 1024
+_BI5_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+_BI5_MAX_TIMEOUT_SECONDS = 30.0
+_BI5_RETRY_BACKOFF_SECONDS = (1.0, 2.0)
+_BI5_SOURCE_REFERENCE = "dukascopy:datafeed:bi5:hourly:bid"
+_BI5_IMPLEMENTATION_VERSION = "2"
+_BI5_NORMALIZATION_VERSION = "dukascopy_bi5_bid_d1_v1"
+BI5_RESEARCH_START = datetime(2014, 1, 1, tzinfo=UTC)
+BI5_RESEARCH_END = datetime(2024, 1, 1, tzinfo=UTC)
 _REVISION_RE = re.compile(r"^[A-Za-z0-9._:\-/ ]{1,128}$")
 
 DUKASCOPY_SYMBOLS: Mapping[str, str] = MappingProxyType(
@@ -105,6 +120,18 @@ def symbol_mapping_fingerprint(mapping: Mapping[str, str]) -> str:
 
 
 DUKASCOPY_MAPPING_FINGERPRINT = symbol_mapping_fingerprint(DUKASCOPY_SYMBOLS)
+
+DUKASCOPY_BI5_PRICE_DIVISORS: Mapping[str, int] = MappingProxyType(
+    {
+        "AUDUSD": 100_000,
+        "EURUSD": 100_000,
+        "GBPUSD": 100_000,
+        "NZDUSD": 100_000,
+        "USDCAD": 100_000,
+        "USDCHF": 100_000,
+        "USDJPY": 1_000,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -180,6 +207,279 @@ class DukascopyTransportFailure(RuntimeError):
 
 
 @dataclass(frozen=True)
+class DukascopyBi5Tick:
+    timestamp: datetime
+    ask: float
+    bid: float
+    ask_volume: float
+    bid_volume: float
+
+    def __post_init__(self) -> None:
+        timestamp = _aware_utc(self.timestamp, "timestamp")
+        values = (self.ask, self.bid, self.ask_volume, self.bid_volume)
+        if not all(
+            isinstance(value, (int, float)) and math.isfinite(float(value)) for value in values
+        ):
+            raise ValueError("tick values must be finite numbers")
+        if self.ask <= 0 or self.bid <= 0 or self.ask < self.bid:
+            raise ValueError("tick prices are invalid")
+        if self.ask_volume < 0 or self.bid_volume < 0:
+            raise ValueError("tick volumes are invalid")
+        object.__setattr__(self, "timestamp", timestamp)
+        for name in ("ask", "bid", "ask_volume", "bid_volume"):
+            object.__setattr__(self, name, float(getattr(self, name)))
+
+
+@dataclass(frozen=True)
+class DukascopyBi5Hour:
+    hour_start: datetime
+    body: bytes
+    revision: str | None = None
+    is_absent: bool = False
+
+    def __post_init__(self) -> None:
+        hour_start = _hour_start(self.hour_start)
+        if not isinstance(self.body, bytes):
+            raise ValueError("bi5 body must be immutable bytes")
+        if not isinstance(self.is_absent, bool):
+            raise ValueError("absent marker must be boolean")
+        if self.is_absent and self.body:
+            raise ValueError("absent hour cannot contain a body")
+        object.__setattr__(self, "hour_start", hour_start)
+        object.__setattr__(self, "revision", _safe_revision(self.revision))
+
+    @classmethod
+    def absent(cls, hour_start: datetime) -> DukascopyBi5Hour:
+        return cls(hour_start, b"", None, True)
+
+    @property
+    def raw_sha256(self) -> str:
+        return hashlib.sha256(self.body).hexdigest()
+
+
+class DukascopyBi5Transport(Protocol):
+    def fetch_hour(
+        self,
+        *,
+        native_symbol: str,
+        hour_start: datetime,
+        timeout_seconds: float,
+        max_response_bytes: int,
+    ) -> DukascopyBi5Hour: ...
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+
+def _bi5_default_opener() -> Callable[..., object]:
+    return build_opener(_NoRedirectHandler()).open
+
+
+@dataclass(frozen=True)
+class DukascopyBi5HttpTransport:
+    """Bounded HTTP transport for one allow-listed hourly .bi5 partition."""
+
+    opener: Callable[..., object] = field(default_factory=_bi5_default_opener, repr=False)
+    sleeper: Callable[[float], None] = field(default=time.sleep, repr=False)
+
+    def fetch_hour(
+        self,
+        *,
+        native_symbol: str,
+        hour_start: datetime,
+        timeout_seconds: float,
+        max_response_bytes: int,
+    ) -> DukascopyBi5Hour:
+        for attempt in range(len(_BI5_RETRY_BACKOFF_SECONDS) + 1):
+            try:
+                return self._fetch_hour_once(
+                    native_symbol=native_symbol,
+                    hour_start=hour_start,
+                    timeout_seconds=timeout_seconds,
+                    max_response_bytes=max_response_bytes,
+                )
+            except DukascopyTransportFailure as exc:
+                if not exc.retryable or attempt == len(_BI5_RETRY_BACKOFF_SECONDS):
+                    raise
+                self.sleeper(_BI5_RETRY_BACKOFF_SECONDS[attempt])
+        raise AssertionError("unreachable")
+
+    def _fetch_hour_once(
+        self,
+        *,
+        native_symbol: str,
+        hour_start: datetime,
+        timeout_seconds: float,
+        max_response_bytes: int,
+    ) -> DukascopyBi5Hour:
+        url = dukascopy_bi5_url(native_symbol, hour_start)
+        request = Request(
+            url,
+            method="GET",
+            headers={
+                "Accept": "application/octet-stream",
+                "User-Agent": "fxlab-market-data/1",
+            },
+        )
+        try:
+            response = self.opener(request, timeout=timeout_seconds)
+        except HTTPError as exc:
+            if exc.code == 404:
+                return DukascopyBi5Hour.absent(hour_start)
+            raise _bi5_http_failure(exc.code) from None
+        except (TimeoutError, URLError, OSError):
+            raise DukascopyTransportFailure(
+                ProviderFailureCategory.TRANSIENT,
+                "network_unavailable",
+                retryable=True,
+            ) from None
+
+        try:
+            with response:
+                status = int(getattr(response, "status", 200))
+                if status == 404:
+                    return DukascopyBi5Hour.absent(hour_start)
+                if status != 200:
+                    raise _bi5_http_failure(status)
+                returned_url = _response_url(response)
+                if returned_url != url:
+                    raise DukascopyTransportFailure(
+                        ProviderFailureCategory.INCOMPATIBLE_SCHEMA,
+                        "unexpected_response_url",
+                    )
+                headers = getattr(response, "headers", {})
+                content_type = (_header_value_unchecked(headers, "Content-Type") or "").lower()
+                if content_type != "application/octet-stream":
+                    raise DukascopyTransportFailure(
+                        ProviderFailureCategory.INCOMPATIBLE_SCHEMA,
+                        "unexpected_media_type",
+                    )
+                body = response.read(max_response_bytes + 1)
+                if len(body) > max_response_bytes:
+                    raise DukascopyTransportFailure(
+                        ProviderFailureCategory.INCOMPATIBLE_SCHEMA,
+                        "response_too_large",
+                    )
+                revision = _header_value(headers, "ETag") or _header_value(
+                    headers, "Last-Modified"
+                )
+        except DukascopyTransportFailure:
+            raise
+        except (TimeoutError, URLError, OSError):
+            raise DukascopyTransportFailure(
+                ProviderFailureCategory.TRANSIENT,
+                "network_unavailable",
+                retryable=True,
+            ) from None
+        return DukascopyBi5Hour(hour_start, body, revision)
+
+
+@dataclass(frozen=True)
+class DukascopyBi5Settings:
+    timeout_seconds: float = 30.0
+    max_response_bytes: int = 8 * 1024 * 1024
+    max_hours: int = 24 * 366 * 10
+
+    def __post_init__(self) -> None:
+        try:
+            timeout = float(self.timeout_seconds)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("timeout_seconds must be finite and positive") from exc
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout_seconds must be finite and positive")
+        if timeout > _BI5_MAX_TIMEOUT_SECONDS:
+            raise ValueError("timeout_seconds exceeds the fixed transport ceiling")
+        for name in ("max_response_bytes", "max_hours"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.max_response_bytes > _BI5_MAX_RESPONSE_BYTES:
+            raise ValueError("max_response_bytes exceeds the fixed transport ceiling")
+        object.__setattr__(self, "timeout_seconds", timeout)
+
+
+def dukascopy_bi5_url(native_symbol: str, hour_start: datetime) -> str:
+    if native_symbol not in DUKASCOPY_BI5_PRICE_DIVISORS:
+        raise ValueError("symbol_unsupported")
+    hour = _hour_start(hour_start)
+    if hour < BI5_RESEARCH_START or hour >= BI5_RESEARCH_END:
+        raise ValueError("research_window_violation")
+    return (
+        f"{_BI5_ENDPOINT}/{native_symbol}/{hour.year:04d}/{hour.month - 1:02d}/"
+        f"{hour.day:02d}/{hour.hour:02d}h_ticks.bi5"
+    )
+
+
+def decode_dukascopy_bi5_hour(
+    payload: bytes, hour_start: datetime, native_symbol: str
+) -> tuple[DukascopyBi5Tick, ...]:
+    if not isinstance(payload, bytes):
+        raise DukascopyTransportFailure(
+            ProviderFailureCategory.INCOMPATIBLE_SCHEMA, "bi5_payload_invalid"
+        )
+    divisor = DUKASCOPY_BI5_PRICE_DIVISORS.get(native_symbol)
+    if divisor is None:
+        raise DukascopyTransportFailure(
+            ProviderFailureCategory.UNSUPPORTED, "symbol_unsupported"
+        )
+    hour = _hour_start(hour_start)
+    try:
+        decoder = lzma.LZMADecompressor(format=lzma.FORMAT_AUTO)
+        raw = decoder.decompress(payload, max_length=_BI5_MAX_DECOMPRESSED_HOUR_BYTES + 1)
+        if (
+            len(raw) > _BI5_MAX_DECOMPRESSED_HOUR_BYTES
+            or not decoder.eof
+            or decoder.unused_data
+        ):
+            raise ValueError
+    except (lzma.LZMAError, EOFError, ValueError):
+        raise DukascopyTransportFailure(
+            ProviderFailureCategory.INCOMPATIBLE_SCHEMA, "corrupt_bi5_lzma"
+        ) from None
+    if len(raw) % _BI5_RECORD.size:
+        raise DukascopyTransportFailure(
+            ProviderFailureCategory.INCOMPATIBLE_SCHEMA,
+            "malformed_bi5_record_length",
+        )
+
+    ticks: list[DukascopyBi5Tick] = []
+    previous_offset: int | None = None
+    for offset in range(0, len(raw), _BI5_RECORD.size):
+        milliseconds, ask_raw, bid_raw, ask_volume, bid_volume = _BI5_RECORD.unpack_from(
+            raw, offset
+        )
+        if milliseconds >= 3_600_000:
+            raise DukascopyTransportFailure(
+                ProviderFailureCategory.INVALID_DATA, "tick_offset_outside_hour"
+            )
+        if previous_offset is not None and milliseconds == previous_offset:
+            raise DukascopyTransportFailure(
+                ProviderFailureCategory.INVALID_DATA, "duplicate_tick_timestamp"
+            )
+        if previous_offset is not None and milliseconds < previous_offset:
+            raise DukascopyTransportFailure(
+                ProviderFailureCategory.INVALID_DATA, "ticks_out_of_order"
+            )
+        try:
+            tick = DukascopyBi5Tick(
+                hour + timedelta(milliseconds=milliseconds),
+                ask_raw / divisor,
+                bid_raw / divisor,
+                ask_volume,
+                bid_volume,
+            )
+        except (TypeError, ValueError, OverflowError):
+            raise DukascopyTransportFailure(
+                ProviderFailureCategory.INVALID_DATA, "tick_values_invalid"
+            ) from None
+        ticks.append(tick)
+        previous_offset = milliseconds
+    return tuple(ticks)
+
+
+@dataclass(frozen=True)
 class DukascopyHttpTransport:
     """One-attempt HTTP page transport for Dukascopy's historical JSON feed."""
 
@@ -213,7 +513,7 @@ class DukascopyHttpTransport:
             headers={"User-Agent": "fxlab-market-data/1", "Accept": "application/json"},
         )
         try:
-            with self.opener(request, timeout_seconds) as response:
+            with self.opener(request, timeout=timeout_seconds) as response:
                 status = int(getattr(response, "status", 200))
                 if status != 200:
                     raise _http_failure(status)
@@ -412,6 +712,139 @@ class DukascopyHistoricalBarsProvider:
             return _failure(ProviderFailureCategory.INTERNAL, "provider_invariant_failed")
 
 
+@dataclass(frozen=True)
+class DukascopyBi5HistoricalBarsProvider:
+    transport: DukascopyBi5Transport = field(repr=False)
+    settings: DukascopyBi5Settings = field(default_factory=DukascopyBi5Settings)
+    clock: Callable[[], datetime] = field(default=lambda: datetime.now(UTC), repr=False)
+    descriptor: ProviderDescriptor = field(init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.settings, DukascopyBi5Settings):
+            raise ValueError("settings must be DukascopyBi5Settings")
+        if not callable(getattr(self.transport, "fetch_hour", None)):
+            raise ValueError("transport must implement fetch_hour")
+        if not callable(self.clock):
+            raise ValueError("clock must be callable")
+        object.__setattr__(
+            self,
+            "descriptor",
+            ProviderDescriptor(
+                _PROVIDER_ID,
+                _BI5_IMPLEMENTATION_VERSION,
+                frozenset({ProviderCapability.HISTORICAL_BARS, ProviderCapability.POINT_IN_TIME}),
+                supported_symbols=frozenset(
+                    CanonicalInstrument(symbol) for symbol in DUKASCOPY_BI5_PRICE_DIVISORS
+                ),
+                supported_timeframes=frozenset({"D1"}),
+                deterministic=False,
+                normalization_version=_BI5_NORMALIZATION_VERSION,
+            ),
+        )
+
+    @property
+    def mapping_fingerprint(self) -> str:
+        return symbol_mapping_fingerprint(
+            {symbol: symbol for symbol in DUKASCOPY_BI5_PRICE_DIVISORS}
+        )
+
+    def fetch_bars(self, query: BarQuery) -> BarDataset | ProviderFailure:
+        if not isinstance(query, BarQuery):
+            return _failure(ProviderFailureCategory.CONFIGURATION, "query_invalid")
+        if query.instrument.symbol not in DUKASCOPY_BI5_PRICE_DIVISORS:
+            return _failure(ProviderFailureCategory.UNSUPPORTED, "symbol_unsupported")
+        if query.timeframe != "D1":
+            return _failure(ProviderFailureCategory.UNSUPPORTED, "timeframe_unsupported")
+        if not _valid_bi5_research_query(query):
+            return _failure(ProviderFailureCategory.CONFIGURATION, "research_window_violation")
+        hour_count = int((query.end - query.start).total_seconds() // 3600)
+        if hour_count > self.settings.max_hours:
+            return _failure(ProviderFailureCategory.CONFIGURATION, "hour_limit_exceeded")
+
+        ticks: list[DukascopyBi5Tick] = []
+        source_items: list[dict[str, object]] = []
+        for number in range(hour_count):
+            hour_start = query.start + timedelta(hours=number)
+            try:
+                source = self.transport.fetch_hour(
+                    native_symbol=query.instrument.symbol,
+                    hour_start=hour_start,
+                    timeout_seconds=self.settings.timeout_seconds,
+                    max_response_bytes=self.settings.max_response_bytes,
+                )
+            except DukascopyTransportFailure as exc:
+                return _failure(exc.category, exc.reason, retryable=exc.retryable)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                return _failure(ProviderFailureCategory.INTERNAL, "transport_invariant_failed")
+            if not isinstance(source, DukascopyBi5Hour) or source.hour_start != hour_start:
+                return _failure(
+                    ProviderFailureCategory.INCOMPATIBLE_SCHEMA, "hour_response_invalid"
+                )
+            source_items.append(
+                {
+                    "hour": hour_start.isoformat(),
+                    "absent": source.is_absent,
+                    "raw_sha256": None if source.is_absent else source.raw_sha256,
+                    "byte_count": len(source.body),
+                    "revision": source.revision,
+                }
+            )
+            if source.is_absent:
+                continue
+            try:
+                decoded = decode_dukascopy_bi5_hour(
+                    source.body, hour_start, query.instrument.symbol
+                )
+            except DukascopyTransportFailure as exc:
+                return _failure(exc.category, exc.reason, retryable=exc.retryable)
+            ticks.extend(decoded)
+        if not ticks:
+            return _failure(ProviderFailureCategory.NO_DATA, "no_ticks")
+
+        try:
+            frame = _bi5_daily_frame(ticks, query)
+            retrieved_at = _aware_utc(self.clock(), "retrieved_at")
+            content_hash = bar_content_hash(frame)
+            source_hash = hashlib.sha256(
+                json.dumps(source_items, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            provenance = DataProvenance(
+                provider_id=self.descriptor.provider_id,
+                provider_version=self.descriptor.implementation_version,
+                normalization_version=self.descriptor.normalization_version,
+                canonical_symbol=query.instrument.symbol,
+                provider_symbol=query.instrument.symbol,
+                timeframe=query.timeframe,
+                query_start=query.start,
+                query_end=query.end,
+                query_as_of=query.as_of,
+                retrieved_at=retrieved_at,
+                actual_first_observation=frame.index[0].to_pydatetime(),
+                actual_last_observation=frame.index[-1].to_pydatetime(),
+                row_count=len(frame),
+                content_hash=content_hash,
+                query_fingerprint=query.fingerprint,
+                dataset_id=dataset_identity(
+                    self.descriptor.provider_id,
+                    self.descriptor.implementation_version,
+                    query.fingerprint,
+                    content_hash,
+                ),
+                revision=f"bi5_hour_set_sha256:{source_hash}",
+                source_timezone="UTC",
+                volume_semantics="sum_bid_tick_volume_millions_base",
+                provenance_quality=ProvenanceQuality.VERIFIED,
+                sanitized_source_reference=_BI5_SOURCE_REFERENCE,
+            )
+            return BarDataset(query, frame, provenance)
+        except (TypeError, ValueError, OverflowError):
+            return _failure(ProviderFailureCategory.INVALID_DATA, "canonical_validation_failed")
+        except Exception:
+            return _failure(ProviderFailureCategory.INTERNAL, "provider_invariant_failed")
+
+
 def _validate_raw_row(raw: tuple[object, ...], query: BarQuery) -> ProviderFailure | None:
     if len(raw) != 6:
         return _failure(ProviderFailureCategory.INCOMPATIBLE_SCHEMA, "malformed_row")
@@ -503,6 +936,102 @@ def _safe_revision(value: object) -> str | None:
     ):
         raise ValueError("revision is unsafe")
     return revision
+
+
+def _response_url(response: object) -> str:
+    getter = getattr(response, "geturl", None)
+    value = getter() if callable(getter) else getattr(response, "url", None)
+    return value if isinstance(value, str) else ""
+
+
+def _header_value_unchecked(headers: object, key: str) -> str | None:
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    value = getter(key)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _bi5_http_failure(status: int) -> DukascopyTransportFailure:
+    if status == 401:
+        return DukascopyTransportFailure(
+            ProviderFailureCategory.AUTHENTICATION, "authentication_failed"
+        )
+    if status == 403:
+        return DukascopyTransportFailure(
+            ProviderFailureCategory.CONFIGURATION, "access_forbidden"
+        )
+    if status == 429:
+        return DukascopyTransportFailure(
+            ProviderFailureCategory.RATE_LIMIT, "rate_limited", retryable=True
+        )
+    if 500 <= status <= 599:
+        return DukascopyTransportFailure(
+            ProviderFailureCategory.TRANSIENT, "provider_unavailable", retryable=True
+        )
+    if 300 <= status <= 399:
+        return DukascopyTransportFailure(
+            ProviderFailureCategory.INCOMPATIBLE_SCHEMA, "redirect_not_allowed"
+        )
+    return DukascopyTransportFailure(
+        ProviderFailureCategory.INTERNAL, "unexpected_http_status"
+    )
+
+
+def _hour_start(value: datetime) -> datetime:
+    hour = _aware_utc(value, "hour_start")
+    if any((hour.minute, hour.second, hour.microsecond)):
+        raise ValueError("hour_start must be aligned to a UTC hour")
+    return hour
+
+
+def _valid_bi5_research_query(query: BarQuery) -> bool:
+    return (
+        query.start >= BI5_RESEARCH_START
+        and query.end <= BI5_RESEARCH_END
+        and query.as_of >= query.end
+        and query.start.hour == 0
+        and query.start.minute == 0
+        and query.start.second == 0
+        and query.start.microsecond == 0
+        and query.end.hour == 0
+        and query.end.minute == 0
+        and query.end.second == 0
+        and query.end.microsecond == 0
+    )
+
+
+def _bi5_daily_frame(ticks: list[DukascopyBi5Tick], query: BarQuery) -> pd.DataFrame:
+    by_day: dict[datetime, list[DukascopyBi5Tick]] = {}
+    previous: datetime | None = None
+    for tick in ticks:
+        if previous is not None and tick.timestamp <= previous:
+            raise ValueError("ticks must be globally strictly increasing")
+        previous = tick.timestamp
+        day = tick.timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+        by_day.setdefault(day, []).append(tick)
+    rows: list[list[float]] = []
+    index: list[datetime] = []
+    for day, day_ticks in by_day.items():
+        bids = [tick.bid for tick in day_ticks]
+        rows.append(
+            [
+                bids[0],
+                max(bids),
+                min(bids),
+                bids[-1],
+                sum(tick.bid_volume for tick in day_ticks),
+            ]
+        )
+        index.append(day)
+    frame = pd.DataFrame(
+        rows,
+        index=pd.DatetimeIndex(index, name="ts_open"),
+        columns=OHLCV,
+        dtype="float64",
+    )
+    frame.attrs = {"symbol": query.instrument.symbol, "timeframe": query.timeframe}
+    return frame
 
 
 def _failure(

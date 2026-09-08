@@ -17,6 +17,10 @@ import pandas as pd
 
 from .dukascopy_provider import (
     DUKASCOPY_MAPPING_FINGERPRINT,
+    DukascopyBi5HistoricalBarsProvider,
+    DukascopyBi5HttpTransport,
+    DukascopyBi5Settings,
+    DukascopyBi5Transport,
     DukascopyConnectorSettings,
     DukascopyHistoricalBarsProvider,
     DukascopyHttpTransport,
@@ -113,6 +117,40 @@ def fetch_dukascopy(
     return dataset.frame
 
 
+def fetch_dukascopy_bi5(
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: str,
+    offer_side: str = "bid",
+    *,
+    transport: DukascopyBi5Transport | None = None,
+    settings: DukascopyBi5Settings | None = None,
+) -> pd.DataFrame:
+    """Fetch research-bounded Dukascopy hourly BID ticks as closed UTC D1 bars."""
+    if offer_side.strip().lower() != "bid":
+        raise ValueError("Dukascopy .bi5 ingestion supports BID only")
+    if timeframe != "D1":
+        raise ValueError("Dukascopy .bi5 ingestion supports D1 only")
+    start_at, end_at = _explicit_utc(start, "start"), _explicit_utc(end, "end")
+    query = BarQuery(CanonicalInstrument(symbol), "D1", start_at, end_at, end_at)
+    provider = DukascopyBi5HistoricalBarsProvider(
+        transport or DukascopyBi5HttpTransport(),
+        settings=settings or DukascopyBi5Settings(),
+    )
+    registry = ProviderRegistry()
+    registry.register(provider)
+    registry.freeze()
+    route = ProviderRoute(
+        provider.descriptor.provider_id,
+        ProviderCapability.HISTORICAL_BARS,
+        mapping_identity=provider.mapping_fingerprint,
+        normalization_version=provider.descriptor.normalization_version,
+    )
+    dataset = ProviderGateway(registry).fetch_bars(route, query)
+    return dataset.frame
+
+
 def _explicit_utc(value: str, field_name: str) -> datetime:
     try:
         parsed = pd.Timestamp(value)
@@ -143,4 +181,10 @@ def ingest(
         if not (start and end):
             raise ValueError("dukascopy ingest requires --from and --to")
         return fetch_dukascopy(symbol, timeframe, start, end)
-    raise ValueError(f"unknown source {source!r} (expected 'synthetic' or 'dukascopy')")
+    if source == "dukascopy-bi5":
+        if not (start and end):
+            raise ValueError("dukascopy-bi5 ingest requires --from and --to")
+        return fetch_dukascopy_bi5(symbol, timeframe, start, end)
+    raise ValueError(
+        f"unknown source {source!r} (expected 'synthetic', 'dukascopy', or 'dukascopy-bi5')"
+    )

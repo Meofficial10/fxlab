@@ -370,10 +370,12 @@ class FakeResponse(BytesIO):
 
 
 def test_http_transport_uses_one_bounded_request_and_strict_jsonp() -> None:
-    calls: list[tuple[object, float]] = []
+    calls: list[tuple[object, bytes | None, float | None]] = []
 
-    def opener(request: object, timeout: float) -> FakeResponse:
-        calls.append((request, timeout))
+    def opener(
+        request: object, data: bytes | None = None, timeout: float | None = None, **_kwargs: object
+    ) -> FakeResponse:
+        calls.append((request, data, timeout))
         return FakeResponse(b"fxlab_callback([[1767225600000,1.1,1.2,1.0,1.1,12.0]]);")
 
     transport = DukascopyHttpTransport(opener=opener)
@@ -387,8 +389,40 @@ def test_http_transport_uses_one_bounded_request_and_strict_jsonp() -> None:
         max_response_bytes=1024,
     )
     assert len(calls) == 1
-    assert calls[0][1] == 2.5
+    assert calls[0][1] is None  # data must be None
+    assert calls[0][2] == 2.5   # timeout must be passed via keyword
     assert page.complete is False
+
+
+def test_http_transport_passes_timeout_as_keyword_matching_urlopen_signature() -> None:
+    """Regression test: calling urlopen(req, float) sets data=<float>, which raises TypeError."""
+    received: dict[str, object] = {}
+
+    def urlopen_like_opener(
+        url: object, data: bytes | None = None, timeout: float | None = None, **_kwargs: object
+    ) -> FakeResponse:
+        if data is not None:
+            raise TypeError(
+                f"message_body should be a bytes-like object or an iterable, got {type(data)}"
+            )
+        received["url"] = url
+        received["data"] = data
+        received["timeout"] = timeout
+        return FakeResponse(b"fxlab_callback([]);")
+
+    transport = DukascopyHttpTransport(opener=urlopen_like_opener)
+    page = transport.fetch_page(
+        native_symbol="EUR/USD",
+        native_timeframe="1DAY",
+        cursor_ms=1000,
+        end_ms=2000,
+        page_size=10,
+        timeout_seconds=7.5,
+        max_response_bytes=1024,
+    )
+    assert received["data"] is None
+    assert received["timeout"] == 7.5
+    assert page.complete is True
 
 
 @pytest.mark.parametrize(
@@ -421,7 +455,12 @@ def test_http_transport_uses_one_bounded_request_and_strict_jsonp() -> None:
 def test_http_transport_sanitizes_network_failures(
     error: Exception, category: ProviderFailureCategory, retryable: bool
 ) -> None:
-    def opener(_request: object, _timeout: float) -> FakeResponse:
+    def opener(
+        _request: object,
+        data: bytes | None = None,
+        timeout: float | None = None,
+        **_kwargs: object,
+    ) -> FakeResponse:
         raise error
 
     transport = DukascopyHttpTransport(opener=opener)
@@ -442,7 +481,7 @@ def test_http_transport_sanitizes_network_failures(
 
 
 def test_http_transport_rejects_oversized_and_malformed_bodies() -> None:
-    oversized = DukascopyHttpTransport(opener=lambda *_args: FakeResponse(b"x" * 20))
+    oversized = DukascopyHttpTransport(opener=lambda *_args, **_kwargs: FakeResponse(b"x" * 20))
     with pytest.raises(DukascopyTransportFailure) as size_error:
         oversized.fetch_page(
             native_symbol="EUR/USD",
@@ -455,7 +494,7 @@ def test_http_transport_rejects_oversized_and_malformed_bodies() -> None:
         )
     assert size_error.value.category is ProviderFailureCategory.INCOMPATIBLE_SCHEMA
 
-    malformed = DukascopyHttpTransport(opener=lambda *_args: FakeResponse(b"not-jsonp"))
+    malformed = DukascopyHttpTransport(opener=lambda *_args, **_kwargs: FakeResponse(b"not-jsonp"))
     with pytest.raises(DukascopyTransportFailure) as body_error:
         malformed.fetch_page(
             native_symbol="EUR/USD",
