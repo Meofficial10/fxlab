@@ -18,6 +18,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
 from urllib.error import HTTPError, URLError
@@ -377,6 +378,94 @@ class DukascopyBi5HttpTransport:
 
 
 @dataclass(frozen=True)
+class DukascopyBi5DirectoryTransport:
+    """Offline directory transport reading raw .bi5 archives from a local mirror."""
+
+    root: Path
+
+    def __post_init__(self) -> None:
+        if isinstance(self.root, str):
+            if not self.root.strip():
+                raise ValueError("root must be a non-empty path")
+            object.__setattr__(self, "root", Path(self.root))
+        elif not isinstance(self.root, Path):
+            raise ValueError("root must be a pathlib.Path or non-empty str")
+        resolved = self.root.resolve()
+        object.__setattr__(self, "root", resolved)
+
+    def fetch_hour(
+        self,
+        *,
+        native_symbol: str,
+        hour_start: datetime,
+        timeout_seconds: float,
+        max_response_bytes: int,
+    ) -> DukascopyBi5Hour:
+        del timeout_seconds
+        try:
+            rel_path = dukascopy_bi5_relative_path(native_symbol, hour_start)
+        except ValueError as exc:
+            reason = str(exc)
+            if reason == "symbol_unsupported":
+                raise DukascopyTransportFailure(
+                    ProviderFailureCategory.UNSUPPORTED, "symbol_unsupported"
+                ) from exc
+            if reason == "research_window_violation":
+                raise DukascopyTransportFailure(
+                    ProviderFailureCategory.CONFIGURATION, "research_window_violation"
+                ) from exc
+            raise DukascopyTransportFailure(
+                ProviderFailureCategory.CONFIGURATION, "hour_start_invalid"
+            ) from exc
+
+        target_path = (self.root / rel_path).resolve()
+        try:
+            target_path.relative_to(self.root)
+        except ValueError:
+            raise DukascopyTransportFailure(
+                ProviderFailureCategory.SECURITY, "path_traversal_prohibited"
+            ) from None
+
+        if not target_path.exists():
+            raise DukascopyTransportFailure(
+                ProviderFailureCategory.NO_DATA, "missing_local_bi5_file"
+            )
+
+        if not target_path.is_file():
+            raise DukascopyTransportFailure(
+                ProviderFailureCategory.INVALID_DATA, "bi5_target_not_a_file"
+            )
+
+        try:
+            stat_result = target_path.stat()
+            file_size = stat_result.st_size
+        except OSError:
+            raise DukascopyTransportFailure(
+                ProviderFailureCategory.INVALID_DATA, "bi5_file_unreadable"
+            ) from None
+
+        if file_size > max_response_bytes:
+            raise DukascopyTransportFailure(
+                ProviderFailureCategory.INCOMPATIBLE_SCHEMA, "response_too_large"
+            )
+
+        try:
+            body = target_path.read_bytes()
+        except OSError:
+            raise DukascopyTransportFailure(
+                ProviderFailureCategory.INVALID_DATA, "bi5_file_unreadable"
+            ) from None
+
+        if len(body) > max_response_bytes:
+            raise DukascopyTransportFailure(
+                ProviderFailureCategory.INCOMPATIBLE_SCHEMA, "response_too_large"
+            )
+
+        revision = f"mtime:{int(stat_result.st_mtime)}"
+        return DukascopyBi5Hour(hour_start, body, revision)
+
+
+@dataclass(frozen=True)
 class DukascopyBi5Settings:
     timeout_seconds: float = 30.0
     max_response_bytes: int = 8 * 1024 * 1024
@@ -400,16 +489,21 @@ class DukascopyBi5Settings:
         object.__setattr__(self, "timeout_seconds", timeout)
 
 
-def dukascopy_bi5_url(native_symbol: str, hour_start: datetime) -> str:
+def dukascopy_bi5_relative_path(native_symbol: str, hour_start: datetime) -> Path:
     if native_symbol not in DUKASCOPY_BI5_PRICE_DIVISORS:
         raise ValueError("symbol_unsupported")
     hour = _hour_start(hour_start)
     if hour < BI5_RESEARCH_START or hour >= BI5_RESEARCH_END:
         raise ValueError("research_window_violation")
-    return (
-        f"{_BI5_ENDPOINT}/{native_symbol}/{hour.year:04d}/{hour.month - 1:02d}/"
+    return Path(
+        f"{native_symbol}/{hour.year:04d}/{hour.month - 1:02d}/"
         f"{hour.day:02d}/{hour.hour:02d}h_ticks.bi5"
     )
+
+
+def dukascopy_bi5_url(native_symbol: str, hour_start: datetime) -> str:
+    rel = dukascopy_bi5_relative_path(native_symbol, hour_start)
+    return f"{_BI5_ENDPOINT}/{rel.as_posix()}"
 
 
 def decode_dukascopy_bi5_hour(
