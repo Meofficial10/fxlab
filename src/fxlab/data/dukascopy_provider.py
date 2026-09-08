@@ -419,14 +419,38 @@ class DukascopyBi5DirectoryTransport:
             ) from exc
 
         target_path = (self.root / rel_path).resolve()
+        absent_path = target_path.with_name(f"{hour_start.hour:02d}h_ticks.absent.json")
         try:
             target_path.relative_to(self.root)
+            absent_path.relative_to(self.root)
         except ValueError:
             raise DukascopyTransportFailure(
                 ProviderFailureCategory.SECURITY, "path_traversal_prohibited"
             ) from None
 
-        if not target_path.exists():
+        has_bi5 = target_path.exists()
+        has_absent = absent_path.exists()
+
+        if has_bi5 and has_absent:
+            raise DukascopyTransportFailure(
+                ProviderFailureCategory.INVALID_DATA, "conflicting_partition_evidence"
+            )
+
+        if has_absent:
+            if not absent_path.is_file():
+                raise DukascopyTransportFailure(
+                    ProviderFailureCategory.INVALID_DATA, "bi5_target_not_a_file"
+                )
+            try:
+                payload = absent_path.read_bytes()
+            except OSError:
+                raise DukascopyTransportFailure(
+                    ProviderFailureCategory.INVALID_DATA, "bi5_file_unreadable"
+                ) from None
+            _validate_absence_evidence_payload(payload, native_symbol, hour_start)
+            return DukascopyBi5Hour.absent(hour_start)
+
+        if not has_bi5:
             raise DukascopyTransportFailure(
                 ProviderFailureCategory.NO_DATA, "missing_local_bi5_file"
             )
@@ -1148,3 +1172,49 @@ def _aware_utc(value: datetime, field_name: str) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be timezone-aware")
     return value.astimezone(UTC)
+
+
+def _iso_utc(value: datetime) -> str:
+    iso = value.astimezone(UTC).isoformat()
+    if iso.endswith("+00:00"):
+        return iso[:-6] + "Z"
+    return iso
+
+
+def _validate_absence_evidence_payload(
+    payload: bytes, expected_symbol: str, expected_hour: datetime
+) -> None:
+    if not isinstance(payload, bytes) or not payload:
+        raise DukascopyTransportFailure(
+            ProviderFailureCategory.INVALID_DATA, "malformed_absence_record"
+        )
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise DukascopyTransportFailure(
+            ProviderFailureCategory.INVALID_DATA, "malformed_absence_record"
+        ) from None
+    if not isinstance(data, dict):
+        raise DukascopyTransportFailure(
+            ProviderFailureCategory.INVALID_DATA, "malformed_absence_record"
+        )
+    if (
+        data.get("schema_version") != 1
+        or data.get("record_type") != "dukascopy_bi5_upstream_absence"
+        or data.get("symbol") != expected_symbol
+        or data.get("sanitized_source_reference") != _BI5_SOURCE_REFERENCE
+        or data.get("http_status") != 404
+    ):
+        raise DukascopyTransportFailure(
+            ProviderFailureCategory.INVALID_DATA, "malformed_absence_record"
+        )
+    expected_iso = _iso_utc(_aware_utc(expected_hour, "expected_hour"))
+    if data.get("hour_utc") != expected_iso:
+        raise DukascopyTransportFailure(
+            ProviderFailureCategory.INVALID_DATA, "malformed_absence_record"
+        )
+    retrieved_at = data.get("retrieved_at_utc")
+    if not isinstance(retrieved_at, str) or not retrieved_at.strip():
+        raise DukascopyTransportFailure(
+            ProviderFailureCategory.INVALID_DATA, "malformed_absence_record"
+        )

@@ -1,5 +1,13 @@
 """Canonical data contracts, local providers, ingestion, and validation."""
 
+from .bi5_mirror import (
+    Bi5AbsenceRecord,
+    Bi5PartitionState,
+    Bi5SyncReport,
+    download_hour,
+    inspect_partition,
+    sync_range,
+)
 from .dukascopy_provider import (
     DUKASCOPY_MAPPING_FINGERPRINT,
     DUKASCOPY_SYMBOLS,
@@ -47,6 +55,9 @@ from .providers import (
 __all__ = [
     "BarDataset",
     "BarQuery",
+    "Bi5AbsenceRecord",
+    "Bi5PartitionState",
+    "Bi5SyncReport",
     "CanonicalInstrument",
     "DataProvenance",
     "DUKASCOPY_MAPPING_FINGERPRINT",
@@ -81,5 +92,8 @@ __all__ = [
     "SymbolAliasMap",
     "TickQuery",
     "TickSnapshot",
+    "download_hour",
+    "inspect_partition",
+    "sync_range",
     "symbol_mapping_fingerprint",
 ]

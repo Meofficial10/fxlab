@@ -13,6 +13,7 @@ import pytest
 
 from fxlab.data import (
     BarQuery,
+    Bi5AbsenceRecord,
     CanonicalInstrument,
     DukascopyBi5DirectoryTransport,
     DukascopyBi5HistoricalBarsProvider,
@@ -133,6 +134,78 @@ def test_directory_transport_missing_file_fails_closed_without_absent(tmp_path: 
     assert isinstance(result, ProviderFailure)
     assert result.category is ProviderFailureCategory.NO_DATA
     assert result.reason == "missing_local_bi5_file"
+
+
+def test_directory_transport_accepts_valid_absence_evidence(tmp_path: Path) -> None:
+    target_absent = tmp_path / "AUDUSD" / "2021" / "00" / "05" / "00h_ticks.absent.json"
+    target_absent.parent.mkdir(parents=True, exist_ok=True)
+    record = Bi5AbsenceRecord.create(
+        symbol="AUDUSD", hour=START, retrieved_at=datetime.now(UTC)
+    )
+    target_absent.write_bytes(record.to_bytes())
+
+    transport = DukascopyBi5DirectoryTransport(tmp_path)
+    hour = transport.fetch_hour(
+        native_symbol="AUDUSD",
+        hour_start=START,
+        timeout_seconds=30.0,
+        max_response_bytes=1024 * 1024,
+    )
+    assert hour.is_absent is True
+    assert hour.body == b""
+    assert hour.hour_start == START
+
+
+def test_directory_transport_rejects_conflicting_evidence(tmp_path: Path) -> None:
+    target_bi5 = tmp_path / "AUDUSD" / "2021" / "00" / "05" / "00h_ticks.bi5"
+    target_absent = tmp_path / "AUDUSD" / "2021" / "00" / "05" / "00h_ticks.absent.json"
+    target_bi5.parent.mkdir(parents=True, exist_ok=True)
+    target_bi5.write_bytes(b"data")
+    record = Bi5AbsenceRecord.create(
+        symbol="AUDUSD", hour=START, retrieved_at=datetime.now(UTC)
+    )
+    target_absent.write_bytes(record.to_bytes())
+
+    transport = DukascopyBi5DirectoryTransport(tmp_path)
+    with pytest.raises(DukascopyTransportFailure) as exc_info:
+        transport.fetch_hour(
+            native_symbol="AUDUSD",
+            hour_start=START,
+            timeout_seconds=30.0,
+            max_response_bytes=1024 * 1024,
+        )
+    assert exc_info.value.category is ProviderFailureCategory.INVALID_DATA
+    assert exc_info.value.reason == "conflicting_partition_evidence"
+
+
+@pytest.mark.parametrize(
+    "bad_payload",
+    [
+        b"",
+        b"not_json",
+        (
+            b'{"schema_version": 1, "record_type": "dukascopy_bi5_upstream_absence", '
+            b'"symbol": "EURUSD"}'
+        ),
+    ],
+)
+def test_directory_transport_rejects_malformed_absence_evidence(
+    tmp_path: Path, bad_payload: bytes
+) -> None:
+    target_absent = tmp_path / "AUDUSD" / "2021" / "00" / "05" / "00h_ticks.absent.json"
+    target_absent.parent.mkdir(parents=True, exist_ok=True)
+    target_absent.write_bytes(bad_payload)
+
+    transport = DukascopyBi5DirectoryTransport(tmp_path)
+    with pytest.raises(DukascopyTransportFailure) as exc_info:
+        transport.fetch_hour(
+            native_symbol="AUDUSD",
+            hour_start=START,
+            timeout_seconds=30.0,
+            max_response_bytes=1024 * 1024,
+        )
+    assert exc_info.value.category is ProviderFailureCategory.INVALID_DATA
+    assert exc_info.value.reason == "malformed_absence_record"
 
 
 def test_directory_transport_present_corrupt_file_fails_closed_in_provider(tmp_path: Path) -> None:
@@ -256,22 +329,35 @@ def test_directory_transport_and_http_transport_produce_identical_provenance_par
     )
     empty_hour_payload = compressed()
 
-    # 1. Setup all 24 hour files on disk for directory transport
+    # 1. Setup all 24 hour files on disk for directory transport:
+    # Hour 0: ticks, Hour 1: ticks, Hour 2: verified absence record, Hours 3..23: empty ticks
     payloads: dict[int, bytes] = {0: hour0_payload, 1: hour1_payload}
     for h in range(24):
-        p = payloads.get(h, empty_hour_payload)
-        f = tmp_path / "AUDUSD" / "2021" / "00" / "05" / f"{h:02d}h_ticks.bi5"
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_bytes(p)
+        if h == 2:
+            absent_f = tmp_path / "AUDUSD" / "2021" / "00" / "05" / f"{h:02d}h_ticks.absent.json"
+            absent_f.parent.mkdir(parents=True, exist_ok=True)
+            record = Bi5AbsenceRecord.create(
+                symbol="AUDUSD", hour=START.replace(hour=2), retrieved_at=datetime.now(UTC)
+            )
+            absent_f.write_bytes(record.to_bytes())
+        else:
+            p = payloads.get(h, empty_hour_payload)
+            f = tmp_path / "AUDUSD" / "2021" / "00" / "05" / f"{h:02d}h_ticks.bi5"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(p)
 
-    # 2. Setup mock opener for HTTP transport serving identical payloads
-    urls = {
-        bi5.dukascopy_bi5_url("AUDUSD", START.replace(hour=h)): payloads.get(h, empty_hour_payload)
-        for h in range(24)
-    }
+    # 2. Setup mock opener for HTTP transport serving identical payloads (with 404 on hour 2)
+    urls: dict[str, bytes] = {}
+    url_404 = bi5.dukascopy_bi5_url("AUDUSD", START.replace(hour=2))
+    for h in range(24):
+        u = bi5.dukascopy_bi5_url("AUDUSD", START.replace(hour=h))
+        if h != 2:
+            urls[u] = payloads.get(h, empty_hour_payload)
 
     def fake_opener(request: object, **_kwargs: object) -> FakeResponse:
         req_url = getattr(request, "full_url", getattr(request, "url", str(request)))
+        if req_url == url_404:
+            return FakeResponse(b"", status=404, url=url_404)
         if req_url in urls:
             return FakeResponse(urls[req_url], url=req_url)
         return FakeResponse(b"", status=404, url=req_url)

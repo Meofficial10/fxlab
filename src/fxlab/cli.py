@@ -176,6 +176,67 @@ def validate_data(
         raise typer.Exit(1)
 
 
+@app.command("mirror-bi5")
+def mirror_bi5(
+    pair: str = typer.Option(..., "--pair", help="Canonical FX pair symbol, e.g. AUDUSD"),
+    frm: str = typer.Option(..., "--from", help="Start ISO-8601 UTC timestamp"),
+    to: str = typer.Option(..., "--to", help="End ISO-8601 UTC timestamp"),
+    dest: str = typer.Option(..., "--dest", help="Destination mirror root directory"),
+    timeout: float = typer.Option(30.0, "--timeout", help="HTTP request timeout in seconds"),
+) -> None:
+    """Acquire and stage raw Dukascopy .bi5 hourly partitions into an offline mirror."""
+    from .data.bi5_mirror import sync_range
+
+    try:
+        start_dt = pd.Timestamp(frm).to_pydatetime()
+        end_dt = pd.Timestamp(to).to_pydatetime()
+        if start_dt.tzinfo is None or end_dt.tzinfo is None:
+            raise ValueError("timestamps must include an explicit timezone")
+    except (ValueError, TypeError) as exc:
+        console.print(f"[red]mirror-bi5 failed[/red] configuration:invalid_timestamp ({exc})")
+        raise typer.Exit(2) from None
+
+    dest_path = Path(dest)
+    try:
+        report = sync_range(
+            symbol=pair,
+            start=start_dt,
+            end=end_dt,
+            destination_root=dest_path,
+            timeout_seconds=timeout,
+        )
+    except ValueError as exc:
+        console.print(f"[red]mirror-bi5 failed[/red] configuration:{exc}")
+        raise typer.Exit(2) from None
+    except RuntimeError as exc:
+        console.print(f"[red]mirror-bi5 failed[/red] runtime:{exc}")
+        raise typer.Exit(1) from None
+
+    table = Table(title=f"Dukascopy BI5 Mirror Sync -- {pair}")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="bold")
+    table.add_row("Total Hours", str(report.total_hours))
+    table.add_row("Present Staged", str(report.present_staged))
+    table.add_row("Absent Evidenced", str(report.absent_evidenced))
+    table.add_row("Incomplete", str(report.incomplete))
+    table.add_row("Conflict", str(report.conflict))
+    table.add_row("Corrupt Local", str(report.corrupt_local))
+    if report.stopped_at_hour:
+        table.add_row("Stopped At Hour", report.stopped_at_hour.isoformat())
+    if report.stop_reason:
+        table.add_row("Stop Reason", report.stop_reason)
+    console.print(table)
+
+    if not report.ok:
+        console.print(f"[red]mirror-bi5 incomplete[/red] (stop reason: {report.stop_reason})")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[green]mirror-bi5 complete[/green] {report.present_staged} staged, "
+        f"{report.absent_evidenced} absent -> {dest_path}"
+    )
+
+
 @app.command()
 def label(
     pair: str = typer.Option(..., "--pair"),
@@ -184,7 +245,7 @@ def label(
 ) -> None:
     """P1 WIRING DEMO: label placeholder signals with the triple-barrier method.
 
-    The signals here are NOT a strategy and imply NO edge — they only exercise the
+    The signals here are NOT a strategy and imply NO edge -- they only exercise the
     labeling + cost pipeline. Real setups arrive in Phase 2.
     """
     cfg = load_config()
@@ -398,7 +459,7 @@ def backtest(
     """P2/P3 baseline: backtest an objective setup net of costs and log the experiment.
 
     Runs on TRAIN by default. Reports the full metric set GROSS and NET. No edge is
-    assumed or claimed — the numbers are whatever they honestly are.
+    assumed or claimed -- the numbers are whatever they honestly are.
     """
     cfg = load_config()
     if setup not in _SETUPS:
@@ -411,7 +472,7 @@ def backtest(
     df_full = load_bars(cfg.data_dir, pair, tf)
     bars = _select_split(df_full, cfg, split_name, allow_test)
     if len(bars) < cfg.label.atr_window + cfg.label.max_hold_bars + 5:
-        console.print("[yellow]not enough bars in this split — ingest more or widen it[/yellow]")
+        console.print("[yellow]not enough bars in this split -- ingest more or widen it[/yellow]")
         raise typer.Exit(1)
 
     strat, params = _build_setup(
