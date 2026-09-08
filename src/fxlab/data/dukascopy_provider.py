@@ -237,6 +237,7 @@ class DukascopyBi5Hour:
     body: bytes
     revision: str | None = None
     is_absent: bool = False
+    absence_evidence_type: str | None = None
 
     def __post_init__(self) -> None:
         hour_start = _hour_start(self.hour_start)
@@ -246,12 +247,21 @@ class DukascopyBi5Hour:
             raise ValueError("absent marker must be boolean")
         if self.is_absent and self.body:
             raise ValueError("absent hour cannot contain a body")
+        if self.is_absent:
+            evidence_type = self.absence_evidence_type or "http_404_absence"
+            if evidence_type not in ("http_404_absence", "http_200_empty_body"):
+                raise ValueError("absence evidence type is unsupported")
+            object.__setattr__(self, "absence_evidence_type", evidence_type)
+        elif self.absence_evidence_type is not None:
+            raise ValueError("present hour cannot contain absence evidence")
         object.__setattr__(self, "hour_start", hour_start)
         object.__setattr__(self, "revision", _safe_revision(self.revision))
 
     @classmethod
-    def absent(cls, hour_start: datetime) -> DukascopyBi5Hour:
-        return cls(hour_start, b"", None, True)
+    def absent(
+        cls, hour_start: datetime, *, evidence_type: str = "http_404_absence"
+    ) -> DukascopyBi5Hour:
+        return cls(hour_start, b"", None, True, evidence_type)
 
     @property
     def raw_sha256(self) -> str:
@@ -374,6 +384,10 @@ class DukascopyBi5HttpTransport:
                 "network_unavailable",
                 retryable=True,
             ) from None
+        if not body:
+            return DukascopyBi5Hour.absent(
+                hour_start, evidence_type="http_200_empty_body"
+            )
         return DukascopyBi5Hour(hour_start, body, revision)
 
 
@@ -447,8 +461,12 @@ class DukascopyBi5DirectoryTransport:
                 raise DukascopyTransportFailure(
                     ProviderFailureCategory.INVALID_DATA, "bi5_file_unreadable"
                 ) from None
-            _validate_absence_evidence_payload(payload, native_symbol, hour_start)
-            return DukascopyBi5Hour.absent(hour_start)
+            evidence_type = _validate_absence_evidence_payload(
+                payload, native_symbol, hour_start
+            )
+            return DukascopyBi5Hour.absent(
+                hour_start, evidence_type=evidence_type
+            )
 
         if not has_bi5:
             raise DukascopyTransportFailure(
@@ -900,15 +918,16 @@ class DukascopyBi5HistoricalBarsProvider:
                 return _failure(
                     ProviderFailureCategory.INCOMPATIBLE_SCHEMA, "hour_response_invalid"
                 )
-            source_items.append(
-                {
-                    "hour": hour_start.isoformat(),
-                    "absent": source.is_absent,
-                    "raw_sha256": None if source.is_absent else source.raw_sha256,
-                    "byte_count": len(source.body),
-                    "revision": source.revision,
-                }
-            )
+            source_item: dict[str, object] = {
+                "hour": hour_start.isoformat(),
+                "absent": source.is_absent,
+                "raw_sha256": None if source.is_absent else source.raw_sha256,
+                "byte_count": len(source.body),
+                "revision": source.revision,
+            }
+            if source.absence_evidence_type == "http_200_empty_body":
+                source_item["absence_evidence_type"] = source.absence_evidence_type
+            source_items.append(source_item)
             if source.is_absent:
                 continue
             try:
@@ -1183,7 +1202,7 @@ def _iso_utc(value: datetime) -> str:
 
 def _validate_absence_evidence_payload(
     payload: bytes, expected_symbol: str, expected_hour: datetime
-) -> None:
+) -> str:
     if not isinstance(payload, bytes) or not payload:
         raise DukascopyTransportFailure(
             ProviderFailureCategory.INVALID_DATA, "malformed_absence_record"
@@ -1199,11 +1218,9 @@ def _validate_absence_evidence_payload(
             ProviderFailureCategory.INVALID_DATA, "malformed_absence_record"
         )
     if (
-        data.get("schema_version") != 1
-        or data.get("record_type") != "dukascopy_bi5_upstream_absence"
+        data.get("record_type") != "dukascopy_bi5_upstream_absence"
         or data.get("symbol") != expected_symbol
         or data.get("sanitized_source_reference") != _BI5_SOURCE_REFERENCE
-        or data.get("http_status") != 404
     ):
         raise DukascopyTransportFailure(
             ProviderFailureCategory.INVALID_DATA, "malformed_absence_record"
@@ -1218,3 +1235,16 @@ def _validate_absence_evidence_payload(
         raise DukascopyTransportFailure(
             ProviderFailureCategory.INVALID_DATA, "malformed_absence_record"
         )
+    if data.get("schema_version") == 1 and data.get("http_status") == 404:
+        return "http_404_absence"
+    if (
+        data.get("schema_version") == 2
+        and data.get("http_status") == 200
+        and data.get("evidence_type") == "http_200_empty_body"
+        and data.get("body_byte_count") == 0
+        and data.get("body_sha256") == hashlib.sha256(b"").hexdigest()
+    ):
+        return "http_200_empty_body"
+    raise DukascopyTransportFailure(
+        ProviderFailureCategory.INVALID_DATA, "malformed_absence_record"
+    )

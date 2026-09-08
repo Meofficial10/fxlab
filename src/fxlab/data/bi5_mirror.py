@@ -1,12 +1,13 @@
 """Resumable, atomic raw Dukascopy .bi5 mirror acquisition utility.
 
 This module is strictly acquisition/staging infrastructure. It downloads and
-stages exact upstream bytes and positive HTTP 404 absence evidence without
-performing scientific bar decoding, aggregation, or provenance claims.
+stages exact upstream bytes and positive upstream empty-partition evidence
+without performing scientific bar decoding, aggregation, or provenance claims.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -36,7 +37,9 @@ from .dukascopy_provider import (
 )
 
 BI5_ABSENCE_SCHEMA_VERSION = 1
+BI5_EMPTY_RESPONSE_SCHEMA_VERSION = 2
 BI5_ABSENCE_RECORD_TYPE = "dukascopy_bi5_upstream_absence"
+BI5_EMPTY_RESPONSE_EVIDENCE_TYPE = "http_200_empty_body"
 BI5_MIRROR_RETRY_SLEEPS = (1.0, 2.0)
 
 
@@ -54,7 +57,7 @@ class PartitionConflictError(RuntimeError):
 
 @dataclass(frozen=True)
 class Bi5AbsenceRecord:
-    """Positive upstream HTTP 404 absence evidence for an hourly partition."""
+    """Positive upstream evidence that an hourly partition has no BI5 body."""
 
     schema_version: int
     record_type: str
@@ -63,6 +66,9 @@ class Bi5AbsenceRecord:
     sanitized_source_reference: str
     http_status: int
     retrieved_at_utc: str
+    evidence_type: str | None = None
+    body_byte_count: int | None = None
+    body_sha256: str | None = None
 
     @classmethod
     def create(
@@ -84,8 +90,32 @@ class Bi5AbsenceRecord:
             retrieved_at_utc=_iso_utc(retrieved_utc),
         )
 
+    @classmethod
+    def create_empty_response(
+        cls,
+        *,
+        symbol: str,
+        hour: datetime,
+        retrieved_at: datetime,
+    ) -> Bi5AbsenceRecord:
+        hour_utc = _aware_utc(hour, "hour")
+        retrieved_utc = _aware_utc(retrieved_at, "retrieved_at")
+        return cls(
+            schema_version=BI5_EMPTY_RESPONSE_SCHEMA_VERSION,
+            record_type=BI5_ABSENCE_RECORD_TYPE,
+            symbol=symbol,
+            hour_utc=_iso_utc(hour_utc),
+            sanitized_source_reference=_BI5_SOURCE_REFERENCE,
+            http_status=200,
+            retrieved_at_utc=_iso_utc(retrieved_utc),
+            evidence_type=BI5_EMPTY_RESPONSE_EVIDENCE_TYPE,
+            body_byte_count=0,
+            body_sha256=hashlib.sha256(b"").hexdigest(),
+        )
+
     def to_json(self) -> str:
-        return json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+        values = {key: value for key, value in asdict(self).items() if value is not None}
+        return json.dumps(values, sort_keys=True, separators=(",", ":"))
 
     def to_bytes(self) -> bytes:
         return self.to_json().encode("utf-8")
@@ -107,7 +137,11 @@ class Bi5AbsenceRecord:
         if not isinstance(data, dict):
             raise ValueError("absence record must be a JSON object")
 
-        if data.get("schema_version") != BI5_ABSENCE_SCHEMA_VERSION:
+        schema_version = data.get("schema_version")
+        if schema_version not in (
+            BI5_ABSENCE_SCHEMA_VERSION,
+            BI5_EMPTY_RESPONSE_SCHEMA_VERSION,
+        ):
             raise ValueError("unsupported absence schema version")
         if data.get("record_type") != BI5_ABSENCE_RECORD_TYPE:
             raise ValueError("unexpected absence record type")
@@ -118,20 +152,39 @@ class Bi5AbsenceRecord:
             raise ValueError("absence record hour mismatch")
         if data.get("sanitized_source_reference") != _BI5_SOURCE_REFERENCE:
             raise ValueError("absence record source reference mismatch")
-        if data.get("http_status") != 404:
-            raise ValueError("absence record http_status must be 404")
+        if schema_version == BI5_ABSENCE_SCHEMA_VERSION:
+            if data.get("http_status") != 404:
+                raise ValueError("absence record http_status must be 404")
+            evidence_type = None
+            body_byte_count = None
+            body_sha256 = None
+        else:
+            empty_hash = hashlib.sha256(b"").hexdigest()
+            if (
+                data.get("http_status") != 200
+                or data.get("evidence_type") != BI5_EMPTY_RESPONSE_EVIDENCE_TYPE
+                or data.get("body_byte_count") != 0
+                or data.get("body_sha256") != empty_hash
+            ):
+                raise ValueError("HTTP 200 empty evidence is malformed")
+            evidence_type = BI5_EMPTY_RESPONSE_EVIDENCE_TYPE
+            body_byte_count = 0
+            body_sha256 = empty_hash
         retrieved_at = data.get("retrieved_at_utc")
         if not isinstance(retrieved_at, str) or not retrieved_at.strip():
             raise ValueError("absence record retrieved_at_utc is malformed")
 
         return cls(
-            schema_version=BI5_ABSENCE_SCHEMA_VERSION,
+            schema_version=schema_version,
             record_type=BI5_ABSENCE_RECORD_TYPE,
             symbol=expected_symbol,
             hour_utc=expected_iso,
             sanitized_source_reference=_BI5_SOURCE_REFERENCE,
-            http_status=404,
+            http_status=int(data["http_status"]),
             retrieved_at_utc=retrieved_at,
+            evidence_type=evidence_type,
+            body_byte_count=body_byte_count,
+            body_sha256=body_sha256,
         )
 
 
@@ -358,8 +411,16 @@ def download_hour(
                     raise RuntimeError("unexpected_media_type")
 
                 body = response.read(_BI5_MAX_RESPONSE_BYTES + 1)
-                if len(body) > _BI5_MAX_RESPONSE_BYTES or len(body) == 0:
+                if len(body) > _BI5_MAX_RESPONSE_BYTES:
                     raise RuntimeError("bi5_body_size_invalid")
+                if not body:
+                    record = Bi5AbsenceRecord.create_empty_response(
+                        symbol=symbol,
+                        hour=hour_utc,
+                        retrieved_at=get_clock(),
+                    )
+                    _atomic_publish_bytes(absent_path, record.to_bytes())
+                    return Bi5PartitionState.ABSENT_EVIDENCED
 
             _atomic_publish_bytes(bi5_path, body)
             return Bi5PartitionState.PRESENT_STAGED

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -66,6 +67,72 @@ def test_200_publishes_exact_raw_bytes(tmp_path: Path) -> None:
     bi5_path, absent_path = bi5_partition_paths(tmp_path, "AUDUSD", START)
     assert bi5_path.exists()
     assert bi5_path.read_bytes() == raw_payload
+    assert not absent_path.exists()
+
+
+def test_200_empty_publishes_truthful_evidence_without_bi5(tmp_path: Path) -> None:
+    url = "https://datafeed.dukascopy.com/datafeed/AUDUSD/2021/00/05/00h_ticks.bi5"
+    retrieved_at = datetime(2026, 9, 8, 12, 0, tzinfo=UTC)
+
+    state = download_hour(
+        symbol="AUDUSD",
+        hour=START,
+        destination_root=tmp_path,
+        opener=lambda req, **_kwargs: FakeHttpResponse(b"", url=url),
+        clock=lambda: retrieved_at,
+    )
+
+    assert state == Bi5PartitionState.ABSENT_EVIDENCED
+    bi5_path, absent_path = bi5_partition_paths(tmp_path, "AUDUSD", START)
+    assert not bi5_path.exists()
+    record = Bi5AbsenceRecord.from_bytes(
+        absent_path.read_bytes(), expected_symbol="AUDUSD", expected_hour=START
+    )
+    assert record.schema_version == 2
+    assert record.http_status == 200
+    assert record.evidence_type == "http_200_empty_body"
+    assert record.body_byte_count == 0
+    assert record.body_sha256 == hashlib.sha256(b"").hexdigest()
+    assert record.retrieved_at_utc == "2026-09-08T12:00:00Z"
+
+
+def test_sync_range_continues_after_200_empty_partition(tmp_path: Path) -> None:
+    requested: list[str] = []
+
+    def opener(req: object, **_kwargs: object) -> FakeHttpResponse:
+        url = req.full_url  # type: ignore[attr-defined]
+        requested.append(url)
+        body = b"" if url.endswith("00h_ticks.bi5") else b"bi5_content"
+        return FakeHttpResponse(body, url=url)
+
+    report = sync_range(
+        symbol="AUDUSD",
+        start=START,
+        end=START.replace(hour=2),
+        destination_root=tmp_path,
+        opener=opener,
+    )
+
+    assert report.ok
+    assert report.absent_evidenced == 1
+    assert report.present_staged == 1
+    assert len(requested) == 2
+
+
+def test_200_response_larger_than_eight_mib_remains_rejected(tmp_path: Path) -> None:
+    url = "https://datafeed.dukascopy.com/datafeed/AUDUSD/2021/00/05/00h_ticks.bi5"
+    oversized = b"x" * (8 * 1024 * 1024 + 1)
+
+    with pytest.raises(RuntimeError, match="bi5_body_size_invalid"):
+        download_hour(
+            symbol="AUDUSD",
+            hour=START,
+            destination_root=tmp_path,
+            opener=lambda req, **_kwargs: FakeHttpResponse(oversized, url=url),
+        )
+
+    bi5_path, absent_path = bi5_partition_paths(tmp_path, "AUDUSD", START)
+    assert not bi5_path.exists()
     assert not absent_path.exists()
 
 

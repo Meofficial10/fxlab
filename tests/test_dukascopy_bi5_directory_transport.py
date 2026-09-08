@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import lzma
 import struct
 from datetime import UTC, datetime
@@ -154,6 +155,85 @@ def test_directory_transport_accepts_valid_absence_evidence(tmp_path: Path) -> N
     assert hour.is_absent is True
     assert hour.body == b""
     assert hour.hour_start == START
+
+
+def test_directory_transport_accepts_verified_http_200_empty_evidence(
+    tmp_path: Path,
+) -> None:
+    target_absent = tmp_path / "AUDUSD" / "2021" / "00" / "05" / "00h_ticks.absent.json"
+    target_absent.parent.mkdir(parents=True, exist_ok=True)
+    record = Bi5AbsenceRecord.create_empty_response(
+        symbol="AUDUSD", hour=START, retrieved_at=datetime.now(UTC)
+    )
+    target_absent.write_bytes(record.to_bytes())
+
+    hour = DukascopyBi5DirectoryTransport(tmp_path).fetch_hour(
+        native_symbol="AUDUSD",
+        hour_start=START,
+        timeout_seconds=30.0,
+        max_response_bytes=1024 * 1024,
+    )
+
+    assert hour.is_absent is True
+    assert hour.body == b""
+    assert hour.absence_evidence_type == "http_200_empty_body"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("symbol", "EURUSD"),
+        ("http_status", 404),
+        ("evidence_type", "unsupported_empty_kind"),
+        ("body_byte_count", 1),
+        ("body_sha256", "0" * 64),
+    ],
+)
+def test_directory_transport_rejects_malformed_or_mismatched_http_200_empty_evidence(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    target_absent = tmp_path / "AUDUSD" / "2021" / "00" / "05" / "00h_ticks.absent.json"
+    target_absent.parent.mkdir(parents=True, exist_ok=True)
+    record = Bi5AbsenceRecord.create_empty_response(
+        symbol="AUDUSD", hour=START, retrieved_at=datetime.now(UTC)
+    )
+    payload = json.loads(record.to_bytes())
+    payload[field] = value
+    target_absent.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(DukascopyTransportFailure) as exc_info:
+        DukascopyBi5DirectoryTransport(tmp_path).fetch_hour(
+            native_symbol="AUDUSD",
+            hour_start=START,
+            timeout_seconds=30.0,
+            max_response_bytes=1024 * 1024,
+        )
+    assert exc_info.value.category is ProviderFailureCategory.INVALID_DATA
+    assert exc_info.value.reason == "malformed_absence_record"
+
+
+def test_directory_transport_rejects_bi5_and_http_200_empty_evidence_conflict(
+    tmp_path: Path,
+) -> None:
+    target_bi5 = tmp_path / "AUDUSD" / "2021" / "00" / "05" / "00h_ticks.bi5"
+    target_absent = tmp_path / "AUDUSD" / "2021" / "00" / "05" / "00h_ticks.absent.json"
+    target_bi5.parent.mkdir(parents=True, exist_ok=True)
+    target_bi5.write_bytes(b"data")
+    target_absent.write_bytes(
+        Bi5AbsenceRecord.create_empty_response(
+            symbol="AUDUSD", hour=START, retrieved_at=datetime.now(UTC)
+        ).to_bytes()
+    )
+
+    with pytest.raises(DukascopyTransportFailure) as exc_info:
+        DukascopyBi5DirectoryTransport(tmp_path).fetch_hour(
+            native_symbol="AUDUSD",
+            hour_start=START,
+            timeout_seconds=30.0,
+            max_response_bytes=1024 * 1024,
+        )
+    assert exc_info.value.category is ProviderFailureCategory.INVALID_DATA
+    assert exc_info.value.reason == "conflicting_partition_evidence"
 
 
 def test_directory_transport_rejects_conflicting_evidence(tmp_path: Path) -> None:

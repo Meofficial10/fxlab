@@ -287,6 +287,25 @@ def test_bi5_http_404_is_an_explicit_absent_hour_and_body_is_bounded() -> None:
     assert response.read_sizes == []
 
 
+def test_bi5_http_200_empty_is_a_distinct_explicit_empty_partition() -> None:
+    url = bi5.dukascopy_bi5_url("AUDUSD", START)
+    response = FakeResponse(b"", status=200, url=url)
+
+    result = bi5.DukascopyBi5HttpTransport(
+        opener=lambda *_args, **_kwargs: response
+    ).fetch_hour(
+        native_symbol="AUDUSD",
+        hour_start=START,
+        timeout_seconds=2.0,
+        max_response_bytes=1024,
+    )
+
+    assert result.is_absent is True
+    assert result.body == b""
+    assert result.absence_evidence_type == "http_200_empty_body"
+    assert response.read_sizes == [1025]
+
+
 def test_bi5_http_success_is_exact_url_media_type_and_size_bounded() -> None:
     url = bi5.dukascopy_bi5_url("AUDUSD", START)
     body = compressed((1_000, 110_005, 110_000, 1.0, 1.0))
@@ -339,6 +358,38 @@ def test_bi5_content_and_source_hashes_are_deterministic() -> None:
     assert one.provenance.dataset_id == two.provenance.dataset_id
     assert one.provenance.revision == two.provenance.revision
     assert one.provenance.retrieved_at != two.provenance.retrieved_at
+
+
+def test_bi5_source_identity_distinguishes_404_from_http_200_empty_evidence() -> None:
+    payload = compressed((1_000, 110_005, 110_000, 1.0, 2.0))
+    legacy_hours = {
+        START.replace(hour=0): bi5.DukascopyBi5Hour(START, payload, "rev"),
+        **{
+            START.replace(hour=hour): bi5.DukascopyBi5Hour.absent(
+                START.replace(hour=hour)
+            )
+            for hour in range(1, 24)
+        },
+    }
+    empty_200_hours = dict(legacy_hours)
+    empty_200_hours[START.replace(hour=1)] = bi5.DukascopyBi5Hour.absent(
+        START.replace(hour=1), evidence_type="http_200_empty_body"
+    )
+    def fixed_clock() -> datetime:
+        return datetime(2021, 1, 7, tzinfo=UTC)
+
+    legacy = bi5.DukascopyBi5HistoricalBarsProvider(
+        FakeBi5Transport(legacy_hours), clock=fixed_clock
+    ).fetch_bars(query())
+    empty_200 = bi5.DukascopyBi5HistoricalBarsProvider(
+        FakeBi5Transport(empty_200_hours), clock=fixed_clock
+    ).fetch_bars(query())
+
+    assert not isinstance(legacy, ProviderFailure)
+    assert not isinstance(empty_200, ProviderFailure)
+    assert legacy.provenance.content_hash == empty_200.provenance.content_hash
+    assert legacy.provenance.dataset_id == empty_200.provenance.dataset_id
+    assert legacy.provenance.revision != empty_200.provenance.revision
 
 
 def test_bi5_ingest_entry_point_uses_explicit_d1_transport_without_network() -> None:
