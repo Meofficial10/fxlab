@@ -194,7 +194,44 @@ class OfficialPolicyArtifactSpec:
         )
 
 
-OFFICIAL_POLICY_ARTIFACT_SPECS: Mapping[str, OfficialPolicyArtifactSpec] = MappingProxyType({})
+OFFICIAL_POLICY_ARTIFACT_SPECS: Mapping[str, OfficialPolicyArtifactSpec] = MappingProxyType(
+    {
+        "chf-snb-20190613": OfficialPolicyArtifactSpec(
+            artifact_key="chf-snb-20190613",
+            currency="CHF",
+            authority="SNB",
+            source_kind=EvidenceClassification.OFFICIAL_ANNOUNCEMENT,
+            body_format=PolicyEventSourceBodyFormat.PDF,
+            event_date=date(2019, 6, 13),
+            approved_url=(
+                "https://www.snb.ch/public/asset/en/www-snb-ch/publications/communication/press-releases/2019/pre_20190613/publications0_en/pre_20190613.en.pdf"
+            ),
+            authority_host="www.snb.ch",
+            accept_media_type="application/pdf",
+            response_media_type="application/pdf",
+            approved_query=None,
+            approved_port=None,
+            approved_redirect_chain=(),
+        ),
+        "jpy-boj-20160921": OfficialPolicyArtifactSpec(
+            artifact_key="jpy-boj-20160921",
+            currency="JPY",
+            authority="BOJ",
+            source_kind=EvidenceClassification.OFFICIAL_ANNOUNCEMENT,
+            body_format=PolicyEventSourceBodyFormat.PDF,
+            event_date=date(2016, 9, 21),
+            approved_url=(
+                "https://www.boj.or.jp/en/mopo/mpmdeci/mpr_2016/k160921a.pdf"
+            ),
+            authority_host="www.boj.or.jp",
+            accept_media_type="application/pdf",
+            response_media_type="application/pdf",
+            approved_query=None,
+            approved_port=None,
+            approved_redirect_chain=(),
+        ),
+    }
+)
 
 
 def resolve_official_policy_artifact_spec(artifact_key: object) -> OfficialPolicyArtifactSpec:

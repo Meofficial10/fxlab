@@ -17,6 +17,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import MappingProxyType
+from urllib.parse import urlsplit
 
 import pytest
 import scripts.acquire_policy_event_source as acquire
@@ -159,12 +160,186 @@ def _transport(spec: OfficialPolicyArtifactSpec, raw: bytes) -> FakePolicyEventS
 # --------------------------------------------------------------------------- #
 # A. Frozen registry and OfficialPolicyArtifactSpec contract
 # --------------------------------------------------------------------------- #
-def test_official_policy_artifact_inventory_is_empty_until_discovery() -> None:
-    assert dict(OFFICIAL_POLICY_ARTIFACT_SPECS) == {}
+def test_official_policy_artifact_registry_contains_only_approved_chf_and_jpy() -> None:
+    assert set(OFFICIAL_POLICY_ARTIFACT_SPECS.keys()) == {
+        "chf-snb-20190613",
+        "jpy-boj-20160921",
+    }
+    for key, spec in OFFICIAL_POLICY_ARTIFACT_SPECS.items():
+        assert isinstance(spec, OfficialPolicyArtifactSpec)
+        assert spec.artifact_key == key
+        assert resolve_official_policy_artifact_spec(key) == spec
+
     with pytest.raises(
         PolicyRateQualificationError, match="unknown_policy_event_source_artifact"
     ):
         resolve_official_policy_artifact_spec("fed-fixture-a")
+    with pytest.raises(
+        PolicyRateQualificationError, match="unknown_policy_event_source_artifact"
+    ):
+        resolve_official_policy_artifact_spec("unknown-artifact-key")
+
+
+def test_approved_chf_spec_exact_contracts() -> None:
+    spec = resolve_official_policy_artifact_spec("chf-snb-20190613")
+    assert spec.artifact_key == "chf-snb-20190613"
+    assert spec.currency == "CHF"
+    assert spec.authority == "SNB"
+    assert spec.source_kind == EvidenceClassification.OFFICIAL_ANNOUNCEMENT
+    assert spec.body_format == PolicyEventSourceBodyFormat.PDF
+    assert spec.event_date == date(2019, 6, 13)
+    assert spec.approved_url == (
+        "https://www.snb.ch/public/asset/en/www-snb-ch/publications/communication/press-releases/2019/pre_20190613/publications0_en/pre_20190613.en.pdf"
+    )
+    assert spec.authority_host == "www.snb.ch"
+    assert spec.accept_media_type == "application/pdf"
+    assert spec.response_media_type == "application/pdf"
+    assert spec.approved_query is None
+    assert spec.approved_port is None
+    assert spec.approved_redirect_chain == ()
+
+    # Structural URL integrity: raw HTTPS URL, no Markdown wrappers or escapes
+    parsed = urlsplit(spec.approved_url)
+    assert parsed.scheme == "https"
+    assert parsed.hostname == spec.authority_host
+    assert parsed.username is None
+    assert parsed.password is None
+    assert parsed.fragment == ""
+    assert parsed.query == ""
+    assert parsed.port is None
+    assert not spec.approved_url.startswith("[")
+    assert not spec.approved_url.endswith(")")
+    assert "\\" not in spec.approved_url
+    assert "\\" not in spec.authority_host
+
+
+def test_approved_jpy_spec_exact_contracts() -> None:
+    spec = resolve_official_policy_artifact_spec("jpy-boj-20160921")
+    assert spec.artifact_key == "jpy-boj-20160921"
+    assert spec.currency == "JPY"
+    assert spec.authority == "BOJ"
+    assert spec.source_kind == EvidenceClassification.OFFICIAL_ANNOUNCEMENT
+    assert spec.body_format == PolicyEventSourceBodyFormat.PDF
+    assert spec.event_date == date(2016, 9, 21)
+    assert spec.approved_url == (
+        "https://www.boj.or.jp/en/mopo/mpmdeci/mpr_2016/k160921a.pdf"
+    )
+    assert spec.authority_host == "www.boj.or.jp"
+    assert spec.accept_media_type == "application/pdf"
+    assert spec.response_media_type == "application/pdf"
+    assert spec.approved_query is None
+    assert spec.approved_port is None
+    assert spec.approved_redirect_chain == ()
+
+    # Structural URL integrity: raw HTTPS URL, no Markdown wrappers or escapes
+    parsed = urlsplit(spec.approved_url)
+    assert parsed.scheme == "https"
+    assert parsed.hostname == spec.authority_host
+    assert parsed.username is None
+    assert parsed.password is None
+    assert parsed.fragment == ""
+    assert parsed.query == ""
+    assert parsed.port is None
+    assert not spec.approved_url.startswith("[")
+    assert not spec.approved_url.endswith(")")
+    assert "\\" not in spec.approved_url
+    assert "\\" not in spec.authority_host
+
+
+def test_approved_specs_reject_post_2023_sealed_window_modifications() -> None:
+    chf_spec = resolve_official_policy_artifact_spec("chf-snb-20190613")
+    jpy_spec = resolve_official_policy_artifact_spec("jpy-boj-20160921")
+    assert chf_spec.event_date <= MAX_OBSERVATION_DATE
+    assert jpy_spec.event_date <= MAX_OBSERVATION_DATE
+
+    for spec in (chf_spec, jpy_spec):
+        with pytest.raises(PolicyRateQualificationError, match="sealed_window_violation"):
+            pes.PolicyEventSourceManifest.from_parts(
+                replace(spec, event_date=date(2024, 1, 1)),
+                _response(spec, _PDF),
+                RETRIEVED,
+            )
+
+
+def test_approved_specs_cannot_weaken_verification_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(pes, "POLICY_EVENT_SOURCE_ROOT", tmp_path / "root")
+    for key in ("chf-snb-20190613", "jpy-boj-20160921"):
+        spec = resolve_official_policy_artifact_spec(key)
+        # Attempt to publish response with unapproved media type
+        with pytest.raises(PolicyRateQualificationError, match="media_type_not_approved"):
+            persist_policy_event_source_artifact(
+                spec, _response(spec, _PDF, media_type="text/html"), RETRIEVED
+            )
+
+        # Attempt to publish response with unapproved redirect chain on same authority host
+        unapproved_same_host = f"https://{spec.authority_host}/unapproved_redirect.pdf"
+        with pytest.raises(PolicyRateQualificationError, match="returned_url_not_bound"):
+            persist_policy_event_source_artifact(
+                spec,
+                _response(
+                    spec,
+                    _PDF,
+                    final_url=unapproved_same_host,
+                    redirect_chain=(unapproved_same_host,),
+                ),
+                RETRIEVED,
+            )
+
+        # Attempt to publish response redirected to foreign domain
+        unapproved_foreign_host = "https://www.foreign-authority.example/other.pdf"
+        with pytest.raises(PolicyRateQualificationError, match="returned_url_not_bound"):
+            persist_policy_event_source_artifact(
+                spec,
+                _response(
+                    spec,
+                    _PDF,
+                    final_url=unapproved_foreign_host,
+                    redirect_chain=(unapproved_foreign_host,),
+                ),
+                RETRIEVED,
+            )
+
+        # Attempt to publish malformed PDF body
+        with pytest.raises(PolicyRateQualificationError, match="response_body_format_invalid"):
+            persist_policy_event_source_artifact(
+                spec, _response(spec, _PDF_MALFORMED), RETRIEVED
+            )
+
+        # Successful publication must verify cleanly with approved spec
+        published = persist_policy_event_source_artifact(
+            spec, _response(spec, _PDF), RETRIEVED
+        )
+        verified = verify_policy_event_source_artifact(published.manifest_path)
+        assert verified.manifest.artifact_key == key
+        assert verified.manifest.currency == spec.currency
+        assert verified.manifest.authority == spec.authority
+        assert verified.manifest.requested_url == spec.approved_url
+
+
+def test_discovery_artifacts_remain_non_authoritative_even_with_matching_approved_spec_url(
+    tmp_path: Path,
+) -> None:
+    discovery_payload = {
+        "schema": "NON_AUTHORITATIVE_POLICY_EVENT_SOURCE_DISCOVERY",
+        "classification": "NON_AUTHORITATIVE_POLICY_EVENT_SOURCE_DISCOVERY",
+        "exact_url": resolve_official_policy_artifact_spec("chf-snb-20190613").approved_url,
+        "http_status": 200,
+        "content_type": "application/pdf",
+        "byte_count": 214777,
+        "raw_sha256": "af0d05358c74045acbfc9bbc67efa7daef7dcdbb5ac58adc54642164c113feb9",
+        "authoritative_qualification_eligible": False,
+        "final_run_identity_eligible": False,
+        "r4_evidence_eligible": False,
+        "request_identity": "a979808642072d8f898e44c3ee99fa98a8b4f53b30d636c9a2ea5ccc68f67bb9",
+        "retrieved_at": "2026-09-08T09:55:12.551046+00:00",
+    }
+    disc_file = tmp_path / "discovery.json"
+    disc_file.write_text(json.dumps(discovery_payload), encoding="utf-8")
+    with pytest.raises(PolicyRateQualificationError, match="not_a_policy_event_source_artifact"):
+        verify_policy_event_source_artifact(disc_file)
+
 
 
 def test_spec_enforces_https_and_forbids_userinfo_fragment_port_query() -> None:
