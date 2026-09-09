@@ -184,6 +184,11 @@ def mirror_bi5(
     dest: str = typer.Option(..., "--dest", help="Destination mirror root directory"),
     timeout: float = typer.Option(30.0, "--timeout", help="HTTP request timeout in seconds"),
     workers: int = typer.Option(1, "--workers", help="Bounded hourly download workers (1-4)"),
+    continue_on_transient: bool = typer.Option(
+        False,
+        "--continue-on-transient",
+        help="Continue bounded windows after transient retry exhaustion",
+    ),
 ) -> None:
     """Acquire and stage raw Dukascopy .bi5 hourly partitions into an offline mirror."""
     from .data.bi5_mirror import sync_range
@@ -209,6 +214,7 @@ def mirror_bi5(
             destination_root=dest_path,
             timeout_seconds=timeout,
             workers=workers,
+            continue_on_transient=continue_on_transient,
         )
     except ValueError as exc:
         console.print(f"[red]mirror-bi5 failed[/red] configuration:{exc}")

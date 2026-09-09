@@ -448,6 +448,7 @@ def sync_range(
     sleeper: Callable[[float], None] | None = None,
     clock: Callable[[], datetime] | None = None,
     workers: int = 1,
+    continue_on_transient: bool = False,
 ) -> Bi5SyncReport:
     """Synchronize a range in deterministic, worker-sized unresolved windows."""
     if symbol not in DUKASCOPY_BI5_PRICE_DIVISORS:
@@ -466,6 +467,8 @@ def sync_range(
         or not 1 <= workers <= BI5_MIRROR_MAX_WORKERS
     ):
         raise ValueError("workers must be an integer from 1 through 4")
+    if not isinstance(continue_on_transient, bool):
+        raise ValueError("continue_on_transient must be a boolean")
     if opener is not None and opener_factory is not None:
         raise ValueError("opener and opener_factory are mutually exclusive")
     if workers > 1 and opener is not None:
@@ -481,6 +484,7 @@ def sync_range(
     corrupt_local = 0
     stopped_at_hour: datetime | None = None
     stop_reason: str | None = None
+    halted = False
 
     def record_state(state: Bi5PartitionState, hour: datetime) -> bool:
         nonlocal present_staged
@@ -499,23 +503,20 @@ def sync_range(
             if stopped_at_hour is None:
                 stopped_at_hour = hour
                 stop_reason = "transient_retry_exhausted"
-            return False
+            return continue_on_transient
         elif state is Bi5PartitionState.CONFLICT:
             conflict += 1
-            if stopped_at_hour is None:
-                stopped_at_hour = hour
-                stop_reason = "conflicting_partition_evidence"
+            stopped_at_hour = hour
+            stop_reason = "conflicting_partition_evidence"
             return False
         elif state is Bi5PartitionState.CORRUPT_LOCAL:
             corrupt_local += 1
-            if stopped_at_hour is None:
-                stopped_at_hour = hour
-                stop_reason = "corrupt_local_file"
+            stopped_at_hour = hour
+            stop_reason = "corrupt_local_file"
             return False
         else:
-            if stopped_at_hour is None:
-                stopped_at_hour = hour
-                stop_reason = f"unexpected_state_{state}"
+            stopped_at_hour = hour
+            stop_reason = f"unexpected_state_{state}"
             return False
         return True
 
@@ -538,7 +539,7 @@ def sync_range(
         with ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="fxlab-bi5-mirror"
         ) as executor:
-            while cursor < hour_count and stop_reason is None:
+            while cursor < hour_count and not halted:
                 unresolved: list[datetime] = []
                 while cursor < hour_count and len(unresolved) < workers:
                     hour = start_utc + timedelta(hours=cursor)
@@ -547,8 +548,9 @@ def sync_range(
                     if state is Bi5PartitionState.INCOMPLETE:
                         unresolved.append(hour)
                     elif not record_state(state, hour):
+                        halted = True
                         break
-                if stop_reason is not None:
+                if halted:
                     break
                 futures = [
                     (
@@ -569,11 +571,12 @@ def sync_range(
                     for hour in unresolved
                 ]
                 states = [(hour, future.result()) for hour, future in futures]
-                window_failed = False
+                window_halted = False
                 for hour, state in states:
                     if not record_state(state, hour):
-                        window_failed = True
-                if window_failed:
+                        window_halted = True
+                if window_halted:
+                    halted = True
                     break
 
     # If stopped early, remaining hours are counted as incomplete

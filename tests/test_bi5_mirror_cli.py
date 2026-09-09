@@ -55,6 +55,54 @@ def test_mirror_bi5_cli_forwards_explicit_workers_without_network(
     assert result.exit_code == 0
     assert len(calls) == 1
     assert calls[0]["workers"] == 4
+    assert calls[0]["continue_on_transient"] is False
+
+
+def test_mirror_bi5_cli_forwards_continue_on_transient_and_remains_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_sync_range(**kwargs: object) -> Bi5SyncReport:
+        calls.append(dict(kwargs))
+        return Bi5SyncReport(
+            symbol="AUDUSD",
+            start=datetime(2021, 1, 5, tzinfo=UTC),
+            end=datetime(2021, 1, 5, 2, tzinfo=UTC),
+            total_hours=2,
+            present_staged=1,
+            absent_evidenced=0,
+            incomplete=1,
+            conflict=0,
+            corrupt_local=0,
+            stopped_at_hour=datetime(2021, 1, 5, tzinfo=UTC),
+            stop_reason="transient_retry_exhausted",
+        )
+
+    monkeypatch.setattr(mirror_module, "sync_range", fake_sync_range)
+    result = runner.invoke(
+        app,
+        [
+            "mirror-bi5",
+            "--pair",
+            "AUDUSD",
+            "--from",
+            "2021-01-05T00:00:00Z",
+            "--to",
+            "2021-01-05T02:00:00Z",
+            "--dest",
+            str(tmp_path),
+            "--workers",
+            "4",
+            "--continue-on-transient",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert len(calls) == 1
+    assert calls[0]["workers"] == 4
+    assert calls[0]["continue_on_transient"] is True
+    assert "mirror-bi5 incomplete" in result.output
 
 
 @pytest.mark.parametrize("workers", ["0", "-1", "5"])

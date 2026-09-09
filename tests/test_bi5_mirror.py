@@ -654,6 +654,123 @@ def test_concurrent_window_reports_earliest_of_multiple_failed_hours(
     assert report.stop_reason == "transient_retry_exhausted"
 
 
+def test_continue_on_transient_scans_later_bounded_windows_and_reports_hole(
+    tmp_path: Path,
+) -> None:
+    requested: list[str] = []
+    lock = threading.Lock()
+
+    def opener(req: object, **_kwargs: object) -> FakeHttpResponse:
+        url = req.full_url  # type: ignore[attr-defined]
+        name = url.rsplit("/", 1)[-1]
+        with lock:
+            requested.append(name)
+        if name == "00h_ticks.bi5":
+            raise HTTPError(url, 503, "Down", {}, BytesIO(b""))
+        return FakeHttpResponse(b"bi5_content", url=url)
+
+    report = sync_range(
+        symbol="AUDUSD",
+        start=START,
+        end=START.replace(hour=8),
+        destination_root=tmp_path,
+        opener_factory=lambda: opener,
+        sleeper=lambda _seconds: None,
+        workers=4,
+        continue_on_transient=True,
+    )
+
+    assert not report.ok
+    assert report.present_staged == 7
+    assert report.incomplete == 1
+    assert report.stopped_at_hour == START
+    assert report.stop_reason == "transient_retry_exhausted"
+    assert requested.count("00h_ticks.bi5") == 3
+    assert set(requested) == {f"{hour:02d}h_ticks.bi5" for hour in range(8)}
+    failed_bi5, failed_evidence = bi5_partition_paths(tmp_path, "AUDUSD", START)
+    assert not failed_bi5.exists()
+    assert not failed_evidence.exists()
+
+
+def test_continue_on_transient_rerun_requests_only_the_failed_partition(
+    tmp_path: Path,
+) -> None:
+    first_calls: list[str] = []
+
+    def first_opener(req: object, **_kwargs: object) -> FakeHttpResponse:
+        url = req.full_url  # type: ignore[attr-defined]
+        name = url.rsplit("/", 1)[-1]
+        first_calls.append(name)
+        if name == "00h_ticks.bi5":
+            raise HTTPError(url, 503, "Down", {}, BytesIO(b""))
+        return FakeHttpResponse(b"bi5_content", url=url)
+
+    first = sync_range(
+        symbol="AUDUSD",
+        start=START,
+        end=START.replace(hour=8),
+        destination_root=tmp_path,
+        opener_factory=lambda: first_opener,
+        sleeper=lambda _seconds: None,
+        workers=4,
+        continue_on_transient=True,
+    )
+    assert not first.ok
+
+    rerun_calls: list[str] = []
+
+    def rerun_opener(req: object, **_kwargs: object) -> FakeHttpResponse:
+        url = req.full_url  # type: ignore[attr-defined]
+        rerun_calls.append(url.rsplit("/", 1)[-1])
+        return FakeHttpResponse(b"bi5_content", url=url)
+
+    rerun = sync_range(
+        symbol="AUDUSD",
+        start=START,
+        end=START.replace(hour=8),
+        destination_root=tmp_path,
+        opener_factory=lambda: rerun_opener,
+        workers=4,
+        continue_on_transient=True,
+    )
+
+    assert rerun.ok
+    assert rerun.present_staged == 8
+    assert rerun.incomplete == 0
+    assert rerun_calls == ["00h_ticks.bi5"]
+
+
+def test_continue_on_transient_does_not_continue_after_permanent_failure(
+    tmp_path: Path,
+) -> None:
+    requested: list[str] = []
+    lock = threading.Lock()
+
+    def opener(req: object, **_kwargs: object) -> FakeHttpResponse:
+        url = req.full_url  # type: ignore[attr-defined]
+        name = url.rsplit("/", 1)[-1]
+        with lock:
+            requested.append(name)
+        if name == "00h_ticks.bi5":
+            raise HTTPError(url, 403, "Forbidden", {}, BytesIO(b""))
+        return FakeHttpResponse(b"bi5_content", url=url)
+
+    with pytest.raises(RuntimeError, match="permanent_http_error_403"):
+        sync_range(
+            symbol="AUDUSD",
+            start=START,
+            end=START.replace(hour=4),
+            destination_root=tmp_path,
+            opener_factory=lambda: opener,
+            workers=2,
+            continue_on_transient=True,
+        )
+
+    assert set(requested).issubset({"00h_ticks.bi5", "01h_ticks.bi5"})
+    assert "00h_ticks.bi5" in requested
+    assert not bi5_partition_paths(tmp_path, "AUDUSD", START.replace(hour=2))[0].exists()
+
+
 def test_concurrent_sync_skips_all_resolved_partition_kinds(tmp_path: Path) -> None:
     present, _ = bi5_partition_paths(tmp_path, "AUDUSD", START)
     present.parent.mkdir(parents=True, exist_ok=True)
