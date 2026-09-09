@@ -11,8 +11,10 @@ import hashlib
 import json
 import math
 import os
+import time
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -41,6 +43,7 @@ BI5_EMPTY_RESPONSE_SCHEMA_VERSION = 2
 BI5_ABSENCE_RECORD_TYPE = "dukascopy_bi5_upstream_absence"
 BI5_EMPTY_RESPONSE_EVIDENCE_TYPE = "http_200_empty_body"
 BI5_MIRROR_RETRY_SLEEPS = (1.0, 2.0)
+BI5_MIRROR_MAX_WORKERS = 4
 
 
 class Bi5PartitionState(StrEnum):
@@ -343,7 +346,7 @@ def download_hour(
     url = dukascopy_bi5_url(symbol, hour_utc)
     bi5_path, absent_path = bi5_partition_paths(root, symbol, hour_utc)
     net_opener = opener or _bi5_default_opener()
-    net_sleeper = sleeper or (lambda s: None)
+    net_sleeper = sleeper or time.sleep
     get_clock = clock or (lambda: datetime.now(UTC))
 
     request = Request(
@@ -441,10 +444,12 @@ def sync_range(
     *,
     timeout_seconds: float = 30.0,
     opener: Callable[..., Any] | None = None,
+    opener_factory: Callable[[], Callable[..., Any]] | None = None,
     sleeper: Callable[[float], None] | None = None,
     clock: Callable[[], datetime] | None = None,
+    workers: int = 1,
 ) -> Bi5SyncReport:
-    """Synchronize an hourly range for a single pair sequentially and fail-fast."""
+    """Synchronize a range in deterministic, worker-sized unresolved windows."""
     if symbol not in DUKASCOPY_BI5_PRICE_DIVISORS:
         raise ValueError("symbol_unsupported")
     start_utc = _hour_start(start)
@@ -455,6 +460,16 @@ def sync_range(
         raise ValueError("research_window_violation")
     if not isinstance(destination_root, Path):
         raise ValueError("destination_root must be a pathlib.Path")
+    if (
+        not isinstance(workers, int)
+        or isinstance(workers, bool)
+        or not 1 <= workers <= BI5_MIRROR_MAX_WORKERS
+    ):
+        raise ValueError("workers must be an integer from 1 through 4")
+    if opener is not None and opener_factory is not None:
+        raise ValueError("opener and opener_factory are mutually exclusive")
+    if workers > 1 and opener is not None:
+        raise ValueError("concurrent acquisition requires a request-local opener_factory")
 
     root = destination_root.resolve()
     hour_count = int((end_utc - start_utc).total_seconds() // 3600)
@@ -467,41 +482,99 @@ def sync_range(
     stopped_at_hour: datetime | None = None
     stop_reason: str | None = None
 
-    for number in range(hour_count):
-        hour = start_utc + timedelta(hours=number)
-        state = download_hour(
-            symbol=symbol,
-            hour=hour,
-            destination_root=root,
-            timeout_seconds=timeout_seconds,
-            opener=opener,
-            sleeper=sleeper,
-            clock=clock,
-        )
-
+    def record_state(state: Bi5PartitionState, hour: datetime) -> bool:
+        nonlocal present_staged
+        nonlocal absent_evidenced
+        nonlocal incomplete
+        nonlocal conflict
+        nonlocal corrupt_local
+        nonlocal stopped_at_hour
+        nonlocal stop_reason
         if state is Bi5PartitionState.PRESENT_STAGED:
             present_staged += 1
         elif state is Bi5PartitionState.ABSENT_EVIDENCED:
             absent_evidenced += 1
         elif state is Bi5PartitionState.INCOMPLETE:
             incomplete += 1
-            stopped_at_hour = hour
-            stop_reason = "transient_retry_exhausted"
-            break
+            if stopped_at_hour is None:
+                stopped_at_hour = hour
+                stop_reason = "transient_retry_exhausted"
+            return False
         elif state is Bi5PartitionState.CONFLICT:
             conflict += 1
-            stopped_at_hour = hour
-            stop_reason = "conflicting_partition_evidence"
-            break
+            if stopped_at_hour is None:
+                stopped_at_hour = hour
+                stop_reason = "conflicting_partition_evidence"
+            return False
         elif state is Bi5PartitionState.CORRUPT_LOCAL:
             corrupt_local += 1
-            stopped_at_hour = hour
-            stop_reason = "corrupt_local_file"
-            break
+            if stopped_at_hour is None:
+                stopped_at_hour = hour
+                stop_reason = "corrupt_local_file"
+            return False
         else:
-            stopped_at_hour = hour
-            stop_reason = f"unexpected_state_{state}"
-            break
+            if stopped_at_hour is None:
+                stopped_at_hour = hour
+                stop_reason = f"unexpected_state_{state}"
+            return False
+        return True
+
+    if workers == 1:
+        for number in range(hour_count):
+            hour = start_utc + timedelta(hours=number)
+            state = download_hour(
+                symbol=symbol,
+                hour=hour,
+                destination_root=root,
+                timeout_seconds=timeout_seconds,
+                opener=opener_factory() if opener_factory is not None else opener,
+                sleeper=sleeper,
+                clock=clock,
+            )
+            if not record_state(state, hour):
+                break
+    else:
+        cursor = 0
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="fxlab-bi5-mirror"
+        ) as executor:
+            while cursor < hour_count and stop_reason is None:
+                unresolved: list[datetime] = []
+                while cursor < hour_count and len(unresolved) < workers:
+                    hour = start_utc + timedelta(hours=cursor)
+                    cursor += 1
+                    state = inspect_partition(root, symbol, hour)
+                    if state is Bi5PartitionState.INCOMPLETE:
+                        unresolved.append(hour)
+                    elif not record_state(state, hour):
+                        break
+                if stop_reason is not None:
+                    break
+                futures = [
+                    (
+                        hour,
+                        executor.submit(
+                            download_hour,
+                            symbol=symbol,
+                            hour=hour,
+                            destination_root=root,
+                            timeout_seconds=timeout_seconds,
+                            opener=(
+                                opener_factory() if opener_factory is not None else None
+                            ),
+                            sleeper=sleeper,
+                            clock=clock,
+                        ),
+                    )
+                    for hour in unresolved
+                ]
+                states = [(hour, future.result()) for hour, future in futures]
+                window_failed = False
+                for hour, state in states:
+                    if not record_state(state, hour):
+                        window_failed = True
+                if window_failed:
+                    break
 
     # If stopped early, remaining hours are counted as incomplete
     processed = present_staged + absent_evidenced + conflict + corrupt_local + incomplete

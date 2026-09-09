@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -17,6 +18,7 @@ from fxlab.data import (
     inspect_partition,
     sync_range,
 )
+from fxlab.data import bi5_mirror as mirror_module
 from fxlab.data.bi5_mirror import (
     PartitionConflictError,
     _atomic_publish_bytes,
@@ -400,6 +402,33 @@ def test_three_transient_failures_exhaust_attempts(tmp_path: Path) -> None:
     assert sleeps == [1.0, 2.0]
 
 
+def test_default_retry_path_uses_the_frozen_one_then_two_second_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = "https://datafeed.dukascopy.com/datafeed/AUDUSD/2021/00/05/00h_ticks.bi5"
+    sleeps: list[float] = []
+    calls = 0
+
+    def opener(req: object, **_kwargs: object) -> FakeHttpResponse:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise HTTPError(url, 503, "Down", {}, BytesIO(b""))
+        return FakeHttpResponse(b"bi5_content", url=url)
+
+    monkeypatch.setattr(mirror_module.time, "sleep", sleeps.append)
+    state = download_hour(
+        symbol="AUDUSD",
+        hour=START,
+        destination_root=tmp_path,
+        opener=opener,
+    )
+
+    assert state is Bi5PartitionState.PRESENT_STAGED
+    assert calls == 3
+    assert sleeps == [1.0, 2.0]
+
+
 def test_permanent_403_performs_one_attempt_and_raises(tmp_path: Path) -> None:
     url = "https://datafeed.dukascopy.com/datafeed/AUDUSD/2021/00/05/00h_ticks.bi5"
     calls = 0
@@ -484,6 +513,302 @@ def test_range_sync_rerun_resumes_from_incomplete(tmp_path: Path) -> None:
     assert report2.total_hours == 4
     assert report2.present_staged == 4
     assert calls == 2  # exactly 2 requests made
+
+
+def test_workers_one_preserves_sequential_fail_fast_compatibility(tmp_path: Path) -> None:
+    requested: list[str] = []
+
+    def opener(req: object, **_kwargs: object) -> FakeHttpResponse:
+        url = req.full_url  # type: ignore[attr-defined]
+        requested.append(url)
+        if url.endswith("01h_ticks.bi5"):
+            raise HTTPError(url, 503, "Down", {}, BytesIO(b""))
+        return FakeHttpResponse(b"bi5_content", url=url)
+
+    report = sync_range(
+        symbol="AUDUSD",
+        start=START,
+        end=START.replace(hour=4),
+        destination_root=tmp_path,
+        opener=opener,
+        sleeper=lambda _seconds: None,
+        workers=1,
+    )
+
+    assert [url.rsplit("/", 1)[-1] for url in requested] == [
+        "00h_ticks.bi5",
+        "01h_ticks.bi5",
+        "01h_ticks.bi5",
+        "01h_ticks.bi5",
+    ]
+    assert report.present_staged == 1
+    assert report.incomplete == 3
+    assert report.stopped_at_hour == START.replace(hour=1)
+    assert report.stop_reason == "transient_retry_exhausted"
+
+
+def test_concurrent_window_finishes_inflight_hours_but_keeps_failure_incomplete(
+    tmp_path: Path,
+) -> None:
+    calls: dict[str, int] = {}
+    lock = threading.Lock()
+
+    def opener(req: object, **_kwargs: object) -> FakeHttpResponse:
+        url = req.full_url  # type: ignore[attr-defined]
+        name = url.rsplit("/", 1)[-1]
+        with lock:
+            calls[name] = calls.get(name, 0) + 1
+        if name == "00h_ticks.bi5":
+            raise HTTPError(url, 503, "Down", {}, BytesIO(b""))
+        if name == "02h_ticks.bi5":
+            raise HTTPError(url, 404, "Not Found", {}, BytesIO(b""))
+        return FakeHttpResponse(b"" if name == "03h_ticks.bi5" else b"bi5_content", url=url)
+
+    report = sync_range(
+        symbol="AUDUSD",
+        start=START,
+        end=START.replace(hour=4),
+        destination_root=tmp_path,
+        opener_factory=lambda: opener,
+        sleeper=lambda _seconds: None,
+        workers=4,
+    )
+
+    assert not report.ok
+    assert report.present_staged == 1
+    assert report.absent_evidenced == 2
+    assert report.incomplete == 1
+    assert report.stopped_at_hour == START
+    assert report.stop_reason == "transient_retry_exhausted"
+    assert calls == {
+        "00h_ticks.bi5": 3,
+        "01h_ticks.bi5": 1,
+        "02h_ticks.bi5": 1,
+        "03h_ticks.bi5": 1,
+    }
+    failed_bi5, failed_evidence = bi5_partition_paths(tmp_path, "AUDUSD", START)
+    assert not failed_bi5.exists()
+    assert not failed_evidence.exists()
+    assert bi5_partition_paths(tmp_path, "AUDUSD", START.replace(hour=1))[0].exists()
+    assert bi5_partition_paths(tmp_path, "AUDUSD", START.replace(hour=2))[1].exists()
+    empty_evidence = bi5_partition_paths(tmp_path, "AUDUSD", START.replace(hour=3))[1]
+    record = Bi5AbsenceRecord.from_bytes(
+        empty_evidence.read_bytes(),
+        expected_symbol="AUDUSD",
+        expected_hour=START.replace(hour=3),
+    )
+    assert record.http_status == 200
+    assert record.evidence_type == "http_200_empty_body"
+
+
+def test_concurrent_scheduler_never_queues_beyond_one_worker_sized_window(
+    tmp_path: Path,
+) -> None:
+    requested: list[str] = []
+    lock = threading.Lock()
+
+    def opener(req: object, **_kwargs: object) -> FakeHttpResponse:
+        url = req.full_url  # type: ignore[attr-defined]
+        name = url.rsplit("/", 1)[-1]
+        with lock:
+            requested.append(name)
+        if name == "00h_ticks.bi5":
+            raise HTTPError(url, 503, "Down", {}, BytesIO(b""))
+        return FakeHttpResponse(b"bi5_content", url=url)
+
+    report = sync_range(
+        symbol="AUDUSD",
+        start=START,
+        end=START.replace(hour=10),
+        destination_root=tmp_path,
+        opener_factory=lambda: opener,
+        sleeper=lambda _seconds: None,
+        workers=2,
+    )
+
+    assert set(requested) == {"00h_ticks.bi5", "01h_ticks.bi5"}
+    assert len(requested) == 4
+    assert report.present_staged == 1
+    assert report.incomplete == 9
+
+
+def test_concurrent_window_reports_earliest_of_multiple_failed_hours(
+    tmp_path: Path,
+) -> None:
+    def opener(req: object, **_kwargs: object) -> FakeHttpResponse:
+        url = req.full_url  # type: ignore[attr-defined]
+        raise HTTPError(url, 503, "Down", {}, BytesIO(b""))
+
+    report = sync_range(
+        symbol="AUDUSD",
+        start=START,
+        end=START.replace(hour=2),
+        destination_root=tmp_path,
+        opener_factory=lambda: opener,
+        sleeper=lambda _seconds: None,
+        workers=2,
+    )
+
+    assert report.incomplete == 2
+    assert report.stopped_at_hour == START
+    assert report.stop_reason == "transient_retry_exhausted"
+
+
+def test_concurrent_sync_skips_all_resolved_partition_kinds(tmp_path: Path) -> None:
+    present, _ = bi5_partition_paths(tmp_path, "AUDUSD", START)
+    present.parent.mkdir(parents=True, exist_ok=True)
+    present.write_bytes(b"existing")
+    _, absent_404 = bi5_partition_paths(tmp_path, "AUDUSD", START.replace(hour=1))
+    absent_404.write_bytes(
+        Bi5AbsenceRecord.create(
+            symbol="AUDUSD",
+            hour=START.replace(hour=1),
+            retrieved_at=datetime.now(UTC),
+        ).to_bytes()
+    )
+    _, absent_200 = bi5_partition_paths(tmp_path, "AUDUSD", START.replace(hour=2))
+    absent_200.write_bytes(
+        Bi5AbsenceRecord.create_empty_response(
+            symbol="AUDUSD",
+            hour=START.replace(hour=2),
+            retrieved_at=datetime.now(UTC),
+        ).to_bytes()
+    )
+    requested: list[str] = []
+
+    def opener(req: object, **_kwargs: object) -> FakeHttpResponse:
+        url = req.full_url  # type: ignore[attr-defined]
+        requested.append(url.rsplit("/", 1)[-1])
+        return FakeHttpResponse(b"new", url=url)
+
+    report = sync_range(
+        symbol="AUDUSD",
+        start=START,
+        end=START.replace(hour=4),
+        destination_root=tmp_path,
+        opener_factory=lambda: opener,
+        workers=4,
+    )
+
+    assert report.ok
+    assert report.present_staged == 2
+    assert report.absent_evidenced == 2
+    assert requested == ["03h_ticks.bi5"]
+
+
+def test_concurrent_sync_fails_closed_on_preexisting_conflict_before_network(
+    tmp_path: Path,
+) -> None:
+    bi5_path, absent_path = bi5_partition_paths(tmp_path, "AUDUSD", START)
+    bi5_path.parent.mkdir(parents=True, exist_ok=True)
+    bi5_path.write_bytes(b"existing")
+    absent_path.write_bytes(
+        Bi5AbsenceRecord.create(
+            symbol="AUDUSD", hour=START, retrieved_at=datetime.now(UTC)
+        ).to_bytes()
+    )
+    calls = 0
+
+    def opener() -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("conflict must stop before network scheduling")
+
+    report = sync_range(
+        symbol="AUDUSD",
+        start=START,
+        end=START.replace(hour=2),
+        destination_root=tmp_path,
+        opener_factory=lambda: opener,
+        workers=2,
+    )
+
+    assert calls == 0
+    assert not report.ok
+    assert report.conflict == 1
+    assert report.incomplete == 1
+    assert report.stopped_at_hour == START
+    assert report.stop_reason == "conflicting_partition_evidence"
+
+
+@pytest.mark.parametrize("workers", [0, -1, 5, True, 1.5])
+def test_worker_count_is_strictly_bounded_before_network(
+    tmp_path: Path, workers: object
+) -> None:
+    called = False
+
+    def opener() -> object:
+        nonlocal called
+        called = True
+        raise AssertionError("invalid workers must fail before network")
+
+    with pytest.raises(ValueError, match="workers must be an integer from 1 through 4"):
+        sync_range(
+            symbol="AUDUSD",
+            start=START,
+            end=START.replace(hour=1),
+            destination_root=tmp_path,
+            opener_factory=lambda: opener,
+            workers=workers,  # type: ignore[arg-type]
+        )
+    assert not called
+
+
+def test_concurrent_sync_shuts_down_workers_after_completion(tmp_path: Path) -> None:
+    report = sync_range(
+        symbol="AUDUSD",
+        start=START,
+        end=START.replace(hour=2),
+        destination_root=tmp_path,
+        opener_factory=lambda: (
+            lambda req, **_kwargs: FakeHttpResponse(
+                b"bi5_content", url=req.full_url  # type: ignore[attr-defined]
+            )
+        ),
+        workers=2,
+    )
+
+    assert report.ok
+    assert not any(
+        thread.name.startswith("fxlab-bi5-mirror")
+        for thread in threading.enumerate()
+    )
+
+
+def test_keyboard_interrupt_propagates_without_false_completion_or_partial_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    barrier = threading.Barrier(2)
+
+    def interrupted_download(*_args: object, **kwargs: object) -> Bi5PartitionState:
+        hour = kwargs["hour"]
+        assert isinstance(hour, datetime)
+        barrier.wait(timeout=2)
+        if hour == START:
+            raise KeyboardInterrupt
+        destination = kwargs["destination_root"]
+        assert isinstance(destination, Path)
+        target, _ = bi5_partition_paths(destination, "AUDUSD", hour)
+        _atomic_publish_bytes(target, b"complete")
+        return Bi5PartitionState.PRESENT_STAGED
+
+    monkeypatch.setattr(mirror_module, "download_hour", interrupted_download)
+    with pytest.raises(KeyboardInterrupt):
+        sync_range(
+            symbol="AUDUSD",
+            start=START,
+            end=START.replace(hour=2),
+            destination_root=tmp_path,
+            workers=2,
+        )
+
+    successful, _ = bi5_partition_paths(tmp_path, "AUDUSD", START.replace(hour=1))
+    assert successful.read_bytes() == b"complete"
+    assert list(successful.parent.glob(".tmp-*")) == []
+    assert not any(
+        thread.name.startswith("fxlab-bi5-mirror")
+        for thread in threading.enumerate()
+    )
 
 
 def test_research_boundary_and_unsupported_symbol_fail_before_network(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import lzma
+import os
 import struct
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,6 +23,7 @@ from fxlab.data import (
     DukascopyTransportFailure,
     ProviderFailure,
     ProviderFailureCategory,
+    sync_range,
 )
 from fxlab.data import (
     dukascopy_provider as bi5,
@@ -491,3 +493,70 @@ def test_fetch_dukascopy_bi5_with_directory_transport(tmp_path: Path) -> None:
     )
     assert len(frame) == 1
     assert list(frame.columns) == ["open", "high", "low", "close", "volume"]
+
+
+def test_worker_count_preserves_existing_mtime_based_scientific_identity(
+    tmp_path: Path,
+) -> None:
+    sequential_root = tmp_path / "sequential"
+    concurrent_root = tmp_path / "concurrent"
+    payload = compressed((1_000, 110_005, 110_000, 1.0, 2.0))
+
+    def opener(request: object, **_kwargs: object) -> FakeResponse:
+        url = request.full_url  # type: ignore[attr-defined]
+        return FakeResponse(payload, url=url)
+
+    sequential = sync_range(
+        "AUDUSD", START, END, sequential_root, opener=opener, workers=1
+    )
+    concurrent = sync_range(
+        "AUDUSD",
+        START,
+        END,
+        concurrent_root,
+        opener_factory=lambda: opener,
+        workers=4,
+    )
+    assert sequential.ok and concurrent.ok
+
+    fixed_mtime = 1_600_000_000
+    for hour in range(24):
+        sequential_file = (
+            sequential_root / "AUDUSD" / "2021" / "00" / "05" / f"{hour:02d}h_ticks.bi5"
+        )
+        concurrent_file = (
+            concurrent_root / "AUDUSD" / "2021" / "00" / "05" / f"{hour:02d}h_ticks.bi5"
+        )
+        os.utime(sequential_file, (fixed_mtime, fixed_mtime))
+        os.utime(concurrent_file, (fixed_mtime, fixed_mtime))
+
+    sequential_hour = DukascopyBi5DirectoryTransport(sequential_root).fetch_hour(
+        native_symbol="AUDUSD",
+        hour_start=START,
+        timeout_seconds=30.0,
+        max_response_bytes=8 * 1024 * 1024,
+    )
+    concurrent_hour = DukascopyBi5DirectoryTransport(concurrent_root).fetch_hour(
+        native_symbol="AUDUSD",
+        hour_start=START,
+        timeout_seconds=30.0,
+        max_response_bytes=8 * 1024 * 1024,
+    )
+    assert sequential_hour.revision == f"mtime:{fixed_mtime}"
+    assert concurrent_hour.revision == f"mtime:{fixed_mtime}"
+
+    def fixed_clock() -> datetime:
+        return datetime(2021, 1, 7, tzinfo=UTC)
+
+    sequential_result = DukascopyBi5HistoricalBarsProvider(
+        DukascopyBi5DirectoryTransport(sequential_root), clock=fixed_clock
+    ).fetch_bars(query())
+    concurrent_result = DukascopyBi5HistoricalBarsProvider(
+        DukascopyBi5DirectoryTransport(concurrent_root), clock=fixed_clock
+    ).fetch_bars(query())
+
+    assert not isinstance(sequential_result, ProviderFailure)
+    assert not isinstance(concurrent_result, ProviderFailure)
+    assert sequential_result.provenance.revision == concurrent_result.provenance.revision
+    assert sequential_result.provenance.content_hash == concurrent_result.provenance.content_hash
+    assert sequential_result.provenance.dataset_id == concurrent_result.provenance.dataset_id
