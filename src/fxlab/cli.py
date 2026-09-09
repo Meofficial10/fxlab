@@ -248,6 +248,41 @@ def mirror_bi5(
     )
 
 
+@app.command("mirror-direct-d1")
+def mirror_direct_d1(
+    pair: str = typer.Option(..., "--pair", help="Approved canonical FX pair"),
+    frm: str = typer.Option(..., "--from", help="Whole-year start in ISO-8601 UTC"),
+    to: str = typer.Option(..., "--to", help="Whole-year end in ISO-8601 UTC"),
+    dest: str = typer.Option(..., "--dest", help="Explicit direct-D1 mirror root"),
+    timeout: float = typer.Option(30.0, "--timeout", help="HTTP timeout in seconds"),
+) -> None:
+    """Acquire immutable Dukascopy direct BID D1 yearly artifacts."""
+    from .data import dukascopy_direct_d1_mirror as direct_mirror
+
+    try:
+        start_dt = pd.Timestamp(frm).to_pydatetime()
+        end_dt = pd.Timestamp(to).to_pydatetime()
+        if start_dt.tzinfo is None or end_dt.tzinfo is None:
+            raise ValueError("timestamps must include an explicit timezone")
+        publications = direct_mirror.mirror_direct_d1_range(
+            pair=pair,
+            start=start_dt,
+            end=end_dt,
+            destination_root=Path(dest),
+            timeout_seconds=timeout,
+        )
+    except ValueError as exc:
+        console.print(f"[red]mirror-direct-d1 failed[/red] configuration:{exc}")
+        raise typer.Exit(2) from None
+    except RuntimeError as exc:
+        console.print(f"[red]mirror-direct-d1 failed[/red] runtime:{exc}")
+        raise typer.Exit(1) from None
+    console.print(
+        f"[green]mirror-direct-d1 complete[/green] {len(publications)} yearly artifacts -> "
+        f"{Path(dest)}"
+    )
+
+
 @app.command()
 def label(
     pair: str = typer.Option(..., "--pair"),

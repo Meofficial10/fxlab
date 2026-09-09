@@ -8,6 +8,20 @@ from .bi5_mirror import (
     inspect_partition,
     sync_range,
 )
+from .dukascopy_direct_d1 import (
+    DIRECT_D1_DECODER_VERSION,
+    DIRECT_D1_NORMALIZATION_VERSION,
+    DIRECT_D1_PROVIDER_ID,
+    DIRECT_D1_PROVIDER_VERSION,
+    DIRECT_D1_SOURCE_REFERENCE,
+    DIRECT_D1_VOLUME_SEMANTICS,
+    DukascopyDirectD1DirectoryTransport,
+    DukascopyDirectD1HistoricalBarsProvider,
+    DukascopyDirectD1HttpTransport,
+    decode_dukascopy_direct_d1_year,
+    dukascopy_direct_d1_url,
+)
+from .dukascopy_direct_d1_mirror import mirror_direct_d1_range, mirror_direct_d1_year
 from .dukascopy_provider import (
     DUKASCOPY_MAPPING_FINGERPRINT,
     DUKASCOPY_SYMBOLS,
@@ -63,6 +77,15 @@ __all__ = [
     "DUKASCOPY_MAPPING_FINGERPRINT",
     "DUKASCOPY_SYMBOLS",
     "DUKASCOPY_TIMEFRAMES",
+    "DIRECT_D1_DECODER_VERSION",
+    "DIRECT_D1_NORMALIZATION_VERSION",
+    "DIRECT_D1_PROVIDER_ID",
+    "DIRECT_D1_PROVIDER_VERSION",
+    "DIRECT_D1_SOURCE_REFERENCE",
+    "DIRECT_D1_VOLUME_SEMANTICS",
+    "DukascopyDirectD1DirectoryTransport",
+    "DukascopyDirectD1HistoricalBarsProvider",
+    "DukascopyDirectD1HttpTransport",
     "DukascopyBi5DirectoryTransport",
     "DukascopyBi5HistoricalBarsProvider",
     "DukascopyBi5HttpTransport",
@@ -95,5 +118,9 @@ __all__ = [
     "download_hour",
     "inspect_partition",
     "sync_range",
+    "decode_dukascopy_direct_d1_year",
+    "dukascopy_direct_d1_url",
+    "mirror_direct_d1_range",
+    "mirror_direct_d1_year",
     "symbol_mapping_fingerprint",
 ]

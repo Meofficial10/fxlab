@@ -61,6 +61,14 @@ Parquet via pyarrow. `data/` is git-ignored.
   without a network. **Never** used for any performance claim.
 - **`dukascopy`** — real free tick/OHLC via the optional `dukascopy-python` extra
   (`python -m uv sync --extra data`). Classified **UNPROVEN** until exercised live.
+- **`dukascopy_direct_d1`** - a distinct prospective Dukascopy direct BID-D1
+  artifact family, normalized as `dukascopy_direct_bid_d1_v1`. It preserves every
+  structurally valid vendor daily record, including zero-volume flat-price records.
+  Volume is the vendor-supplied direct-D1 float32 value promoted to canonical float64;
+  it is not represented as summed tick volume. The provider is sealed to
+  `2014-01-01 <= data < 2024-01-01`, has no hourly-provider fallback, and makes no
+  identity/equivalence claim with `dukascopy_bi5_bid_d1_v1`. It remains **UNPROVEN**
+  until the separately defined cross-pair validation gate passes.
 
 ## Split policy
 
