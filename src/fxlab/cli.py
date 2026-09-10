@@ -296,9 +296,16 @@ def mirror_candidate_c_execution(
         False, "--continue-on-transient",
         help="Continue scheduled 00h partitions after exhausted transient retries",
     ),
+    workers: int = typer.Option(1, "--workers", help="Bounded workers (1-4)"),
 ) -> None:
     """Acquire only Candidate C's sealed 00h UTC execution partitions."""
     from .research import candidate_c_execution_evidence as execution
+
+    if not 1 <= workers <= 4:
+        console.print(
+            "[red]mirror-candidate-c-execution failed[/red] workers must be between 1 and 4"
+        )
+        raise typer.Exit(2)
 
     try:
         start_dt = pd.Timestamp(frm).to_pydatetime()
@@ -312,6 +319,7 @@ def mirror_candidate_c_execution(
             pair=pair,
             timeout_seconds=timeout,
             continue_on_transient=continue_on_transient,
+            workers=workers,
         )
     except ValueError as exc:
         console.print(

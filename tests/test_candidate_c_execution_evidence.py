@@ -7,6 +7,8 @@ import importlib
 import lzma
 import os
 import struct
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -527,6 +529,227 @@ def test_continue_on_transient_never_swallows_permanent_failure(tmp_path: Path) 
     assert calls == [START]
 
 
+@pytest.mark.parametrize("workers", [0, -1, 5, True, 1.5])
+def test_execution_worker_count_is_bounded_before_download(
+    tmp_path: Path, workers: object
+) -> None:
+    execution = _module()
+    calls: list[object] = []
+
+    def downloader(**kwargs: object) -> Bi5PartitionState:
+        calls.append(kwargs)
+        return Bi5PartitionState.PRESENT_STAGED
+
+    with pytest.raises(ValueError, match="workers must be an integer from 1 through 4"):
+        execution.mirror_candidate_c_execution_partitions(
+            start=START,
+            end=END,
+            destination_root=tmp_path,
+            pair="AUDUSD",
+            workers=workers,  # type: ignore[arg-type]
+            downloader=downloader,
+        )
+    assert calls == []
+
+
+def test_workers_four_run_concurrently_without_exceeding_bound(tmp_path: Path) -> None:
+    execution = _module()
+    lock = threading.Lock()
+    barrier = threading.Barrier(4, timeout=3)
+    active = 0
+    maximum_active = 0
+
+    def downloader(**_kwargs: object) -> Bi5PartitionState:
+        nonlocal active, maximum_active
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        barrier.wait()
+        with lock:
+            active -= 1
+        return Bi5PartitionState.PRESENT_STAGED
+
+    report = execution.mirror_candidate_c_execution_partitions(
+        start=START,
+        end=START + timedelta(days=4),
+        destination_root=tmp_path,
+        pair="AUDUSD",
+        workers=4,
+        downloader=downloader,
+    )
+
+    assert maximum_active == 4
+    assert report.scheduled_partitions == 4
+    assert report.ok is True
+
+
+def test_concurrent_scheduler_never_queues_more_than_one_worker_window(
+    tmp_path: Path,
+) -> None:
+    execution = _module()
+    lock = threading.Lock()
+    first_window_started = threading.Event()
+    release = threading.Event()
+    calls: list[datetime] = []
+    result: list[object] = []
+    errors: list[BaseException] = []
+
+    def downloader(**kwargs: object) -> Bi5PartitionState:
+        with lock:
+            calls.append(kwargs["hour"])  # type: ignore[arg-type]
+            if len(calls) == 2:
+                first_window_started.set()
+        assert release.wait(timeout=3)
+        return Bi5PartitionState.PRESENT_STAGED
+
+    def run() -> None:
+        try:
+            result.append(
+                execution.mirror_candidate_c_execution_partitions(
+                    start=START,
+                    end=START + timedelta(days=6),
+                    destination_root=tmp_path,
+                    pair="AUDUSD",
+                    workers=2,
+                    downloader=downloader,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+            first_window_started.set()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert first_window_started.wait(timeout=3)
+        time.sleep(0.05)
+        with lock:
+            assert set(calls) == {START, START + timedelta(days=1)}
+            assert len(calls) == 2
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    if errors:
+        pytest.fail(f"scheduler failed before opening its first bounded window: {errors[0]}")
+    assert len(result) == 1
+    assert result[0].scheduled_partitions == 6
+
+
+def test_workers_four_continue_after_transient_window_and_keep_hole(
+    tmp_path: Path,
+) -> None:
+    execution = _module()
+    lock = threading.Lock()
+    calls: list[datetime] = []
+
+    def downloader(**kwargs: object) -> Bi5PartitionState:
+        hour = kwargs["hour"]
+        with lock:
+            calls.append(hour)  # type: ignore[arg-type]
+        if hour == START:
+            return Bi5PartitionState.INCOMPLETE
+        return Bi5PartitionState.PRESENT_STAGED
+
+    report = execution.mirror_candidate_c_execution_partitions(
+        start=START,
+        end=START + timedelta(days=6),
+        destination_root=tmp_path,
+        pair="AUDUSD",
+        workers=4,
+        continue_on_transient=True,
+        downloader=downloader,
+    )
+
+    assert set(calls) == {START + timedelta(days=day) for day in range(6)}
+    assert all(hour.hour == 0 for hour in calls)
+    assert report.scheduled_partitions == 6
+    assert report.present_staged == 5
+    assert report.incomplete == 1
+    assert report.ok is False
+
+
+def test_workers_four_default_stops_after_current_window(tmp_path: Path) -> None:
+    execution = _module()
+    lock = threading.Lock()
+    calls: list[datetime] = []
+
+    def downloader(**kwargs: object) -> Bi5PartitionState:
+        hour = kwargs["hour"]
+        with lock:
+            calls.append(hour)  # type: ignore[arg-type]
+        if hour == START:
+            return Bi5PartitionState.INCOMPLETE
+        return Bi5PartitionState.PRESENT_STAGED
+
+    report = execution.mirror_candidate_c_execution_partitions(
+        start=START,
+        end=START + timedelta(days=6),
+        destination_root=tmp_path,
+        pair="AUDUSD",
+        workers=4,
+        downloader=downloader,
+    )
+
+    assert set(calls) == {START + timedelta(days=day) for day in range(4)}
+    assert report.scheduled_partitions == 4
+    assert report.incomplete == 1
+    assert report.ok is False
+
+
+def test_concurrent_scheduler_reuses_resolved_local_partitions(tmp_path: Path) -> None:
+    execution = _module()
+    _write_hour(tmp_path, "AUDUSD", START)
+    _write_absence(tmp_path, "AUDUSD", START + timedelta(days=1))
+    calls: list[object] = []
+
+    def downloader(**kwargs: object) -> Bi5PartitionState:
+        calls.append(kwargs)
+        raise AssertionError("resolved partitions must not be downloaded")
+
+    report = execution.mirror_candidate_c_execution_partitions(
+        start=START,
+        end=START + timedelta(days=2),
+        destination_root=tmp_path,
+        pair="AUDUSD",
+        workers=4,
+        downloader=downloader,
+    )
+
+    assert calls == []
+    assert report.scheduled_partitions == 2
+    assert report.present_staged == 1
+    assert report.absent_evidenced == 1
+    assert report.ok is True
+
+
+@pytest.mark.parametrize("state", [Bi5PartitionState.CONFLICT, Bi5PartitionState.CORRUPT_LOCAL])
+def test_concurrent_preflight_integrity_failure_stops_before_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: Bi5PartitionState
+) -> None:
+    execution = _module()
+    calls: list[object] = []
+    monkeypatch.setattr(execution, "inspect_partition", lambda *_args: state)
+
+    def downloader(**kwargs: object) -> Bi5PartitionState:
+        calls.append(kwargs)
+        return Bi5PartitionState.PRESENT_STAGED
+
+    report = execution.mirror_candidate_c_execution_partitions(
+        start=START,
+        end=START + timedelta(days=2),
+        destination_root=tmp_path,
+        pair="AUDUSD",
+        workers=2,
+        continue_on_transient=True,
+        downloader=downloader,
+    )
+
+    assert calls == []
+    assert report.scheduled_partitions == 1
+    assert report.ok is False
+
+
 def test_cli_routes_exact_schedule_without_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -563,6 +786,7 @@ def test_cli_routes_exact_schedule_without_network(
     assert calls[0]["pair"] is None
     assert calls[0]["start"] == START
     assert calls[0]["end"] == END
+    assert calls[0]["workers"] == 1
 
 
 def test_cli_continue_on_transient_routes_flag_and_remains_non_success(
@@ -594,12 +818,47 @@ def test_cli_continue_on_transient_routes_flag_and_remains_non_success(
             "--dest",
             str(tmp_path),
             "--continue-on-transient",
+            "--workers",
+            "4",
         ],
     )
 
     assert result.exit_code == 1
     assert len(calls) == 1
     assert calls[0]["continue_on_transient"] is True
+    assert calls[0]["workers"] == 4
+
+
+@pytest.mark.parametrize("workers", ["0", "-1", "5"])
+def test_cli_rejects_invalid_execution_worker_count_without_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, workers: str
+) -> None:
+    execution = _module()
+    calls: list[object] = []
+
+    def fake_mirror(**kwargs: object):
+        calls.append(kwargs)
+        raise AssertionError("invalid workers must fail before acquisition")
+
+    monkeypatch.setattr(execution, "mirror_candidate_c_execution_partitions", fake_mirror)
+    result = runner.invoke(
+        app,
+        [
+            "mirror-candidate-c-execution",
+            "--from",
+            "2021-01-05T00:00:00Z",
+            "--to",
+            "2021-01-06T00:00:00Z",
+            "--dest",
+            str(tmp_path),
+            "--workers",
+            workers,
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "workers must be between 1 and 4" in result.output
+    assert calls == []
 
 
 def test_module_has_no_candidate_c_measurement_surface() -> None:

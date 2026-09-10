@@ -9,12 +9,18 @@ import hashlib
 import json
 from collections import Counter
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 
-from fxlab.data.bi5_mirror import Bi5PartitionState, download_hour
+from fxlab.data.bi5_mirror import (
+    BI5_MIRROR_MAX_WORKERS,
+    Bi5PartitionState,
+    download_hour,
+    inspect_partition,
+)
 from fxlab.data.dukascopy_provider import (
     BI5_RESEARCH_END,
     BI5_RESEARCH_START,
@@ -407,17 +413,42 @@ def mirror_candidate_c_execution_partitions(
     pair: str | None = None,
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     continue_on_transient: bool = False,
+    workers: int = 1,
     downloader: Callable[..., Bi5PartitionState] = download_hour,
 ) -> CandidateCExecutionMirrorReport:
     """Acquire only the deterministic 00h schedule; never select ranked pairs."""
     if not isinstance(continue_on_transient, bool):
         raise ValueError("continue_on_transient must be a boolean")
+    if (
+        not isinstance(workers, int)
+        or isinstance(workers, bool)
+        or not 1 <= workers <= BI5_MIRROR_MAX_WORKERS
+    ):
+        raise ValueError("workers must be an integer from 1 through 4")
     pairs = CANDIDATE_C_EXECUTION_PAIRS if pair is None else (pair,)
     start_utc, end_utc, ordered_pairs = _validate_scope(start, end, pairs)
-    destination, counts, scheduled, stop = Path(destination_root), Counter(), 0, False
-    for requested_pair in ordered_pairs:
-        boundary = start_utc
-        while boundary < end_utc:
+    destination = Path(destination_root).resolve()
+    counts: Counter[Bi5PartitionState] = Counter()
+    scheduled = 0
+
+    def should_continue(state: Bi5PartitionState) -> bool:
+        counts[state] += 1
+        if state is Bi5PartitionState.INCOMPLETE:
+            return continue_on_transient
+        return state not in (
+            Bi5PartitionState.CONFLICT,
+            Bi5PartitionState.CORRUPT_LOCAL,
+        )
+
+    def schedule():
+        for requested_pair in ordered_pairs:
+            boundary = start_utc
+            while boundary < end_utc:
+                yield requested_pair, boundary
+                boundary += timedelta(days=1)
+
+    if workers == 1:
+        for requested_pair, boundary in schedule():
             state = downloader(
                 symbol=requested_pair,
                 hour=boundary,
@@ -425,20 +456,60 @@ def mirror_candidate_c_execution_partitions(
                 timeout_seconds=timeout_seconds,
             )
             scheduled += 1
-            counts[state] += 1
-            if state is Bi5PartitionState.INCOMPLETE:
-                if not continue_on_transient:
-                    stop = True
-                    break
-            elif state in (
-                Bi5PartitionState.CONFLICT,
-                Bi5PartitionState.CORRUPT_LOCAL,
-            ):
-                stop = True
+            if not should_continue(state):
                 break
-            boundary += timedelta(days=1)
-        if stop:
-            break
+    else:
+        pending = iter(schedule())
+        exhausted = False
+        halted = False
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="fxlab-candidate-c-execution"
+        ) as executor:
+            while not exhausted and not halted:
+                window: list[tuple[str, datetime]] = []
+                while len(window) < workers:
+                    try:
+                        requested_pair, boundary = next(pending)
+                    except StopIteration:
+                        exhausted = True
+                        break
+                    scheduled += 1
+                    state = inspect_partition(destination, requested_pair, boundary)
+                    if state is Bi5PartitionState.INCOMPLETE:
+                        window.append((requested_pair, boundary))
+                    elif not should_continue(state):
+                        halted = True
+                        break
+                if halted:
+                    break
+                futures = [
+                    (
+                        requested_pair,
+                        boundary,
+                        executor.submit(
+                            downloader,
+                            symbol=requested_pair,
+                            hour=boundary,
+                            destination_root=destination,
+                            timeout_seconds=timeout_seconds,
+                        ),
+                    )
+                    for requested_pair, boundary in window
+                ]
+                outcomes: list[tuple[str, datetime, Bi5PartitionState]] = []
+                failures: list[tuple[str, datetime, Exception]] = []
+                for requested_pair, boundary, future in futures:
+                    try:
+                        outcomes.append((requested_pair, boundary, future.result()))
+                    except Exception as exc:
+                        failures.append((requested_pair, boundary, exc))
+                if failures:
+                    raise failures[0][2]
+                for _requested_pair, _boundary, state in outcomes:
+                    if not should_continue(state):
+                        halted = True
+                if halted:
+                    break
     return CandidateCExecutionMirrorReport(
         scheduled_partitions=scheduled,
         present_staged=counts[Bi5PartitionState.PRESENT_STAGED],
