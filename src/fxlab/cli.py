@@ -283,6 +283,55 @@ def mirror_direct_d1(
     )
 
 
+@app.command("mirror-candidate-c-execution")
+def mirror_candidate_c_execution(
+    frm: str = typer.Option(..., "--from", help="UTC date boundary, inclusive"),
+    to: str = typer.Option(..., "--to", help="UTC date boundary, exclusive"),
+    dest: str = typer.Option(..., "--dest", help="Explicit hourly BI5 mirror root"),
+    pair: str | None = typer.Option(
+        None, "--pair", help="One approved pair; omit for the frozen seven-pair universe"
+    ),
+    timeout: float = typer.Option(30.0, "--timeout", help="HTTP timeout in seconds"),
+) -> None:
+    """Acquire only Candidate C's sealed 00h UTC execution partitions."""
+    from .research import candidate_c_execution_evidence as execution
+
+    try:
+        start_dt = pd.Timestamp(frm).to_pydatetime()
+        end_dt = pd.Timestamp(to).to_pydatetime()
+        if start_dt.tzinfo is None or end_dt.tzinfo is None:
+            raise ValueError("timestamps must include an explicit timezone")
+        report = execution.mirror_candidate_c_execution_partitions(
+            start=start_dt,
+            end=end_dt,
+            destination_root=Path(dest),
+            pair=pair,
+            timeout_seconds=timeout,
+        )
+    except ValueError as exc:
+        console.print(
+            f"[red]mirror-candidate-c-execution failed[/red] configuration:{exc}"
+        )
+        raise typer.Exit(2) from None
+    except RuntimeError as exc:
+        console.print(f"[red]mirror-candidate-c-execution failed[/red] runtime:{exc}")
+        raise typer.Exit(1) from None
+
+    table = Table(title="Candidate C 00h Execution-Evidence Mirror")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="bold")
+    table.add_row("Scheduled Partitions", str(report.scheduled_partitions))
+    table.add_row("Present Staged", str(report.present_staged))
+    table.add_row("Absent Evidenced", str(report.absent_evidenced))
+    table.add_row("Incomplete", str(report.incomplete))
+    table.add_row("Conflict", str(report.conflict))
+    table.add_row("Corrupt Local", str(report.corrupt_local))
+    console.print(table)
+    if not report.ok:
+        console.print("[red]mirror-candidate-c-execution incomplete[/red]")
+        raise typer.Exit(1)
+
+
 @app.command()
 def label(
     pair: str = typer.Option(..., "--pair"),
