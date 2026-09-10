@@ -8,6 +8,7 @@ import json
 import lzma
 import math
 import struct
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -43,6 +44,7 @@ DIRECT_D1_RESEARCH_END = datetime(2024, 1, 1, tzinfo=UTC)
 DIRECT_D1_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 DIRECT_D1_MAX_DECOMPRESSED_BYTES = 16 * 1024 * 1024
 DIRECT_D1_MAX_TIMEOUT_SECONDS = 30.0
+DIRECT_D1_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 2.0)
 DIRECT_D1_ENDPOINT = "https://datafeed.dukascopy.com/datafeed"
 DIRECT_D1_RECORD = struct.Struct(">IIIIIf")
 DIRECT_D1_PRICE_DIVISORS: Mapping[str, int] = MappingProxyType(
@@ -198,8 +200,31 @@ def decode_dukascopy_direct_d1_year(body: bytes, pair: str, year: int) -> pd.Dat
 @dataclass(frozen=True)
 class DukascopyDirectD1HttpTransport:
     opener: Callable[..., object] = field(default_factory=_default_opener, repr=False)
+    sleeper: Callable[[float], None] = field(default=time.sleep, repr=False)
 
     def fetch_year(
+        self,
+        *,
+        pair: str,
+        year: int,
+        timeout_seconds: float = DIRECT_D1_MAX_TIMEOUT_SECONDS,
+        max_response_bytes: int = DIRECT_D1_MAX_RESPONSE_BYTES,
+    ) -> DukascopyDirectD1Year:
+        for attempt in range(len(DIRECT_D1_RETRY_BACKOFF_SECONDS) + 1):
+            try:
+                return self._fetch_year_once(
+                    pair=pair,
+                    year=year,
+                    timeout_seconds=timeout_seconds,
+                    max_response_bytes=max_response_bytes,
+                )
+            except DukascopyDirectD1TransportError as exc:
+                if not exc.retryable or attempt == len(DIRECT_D1_RETRY_BACKOFF_SECONDS):
+                    raise
+                self.sleeper(DIRECT_D1_RETRY_BACKOFF_SECONDS[attempt])
+        raise AssertionError("unreachable")
+
+    def _fetch_year_once(
         self,
         *,
         pair: str,

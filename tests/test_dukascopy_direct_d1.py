@@ -241,21 +241,41 @@ def test_http_transport_rejects_redirect_media_type_and_oversize() -> None:
             )
 
 
+def test_http_transport_retries_transient_503_and_recovers() -> None:
+    body = _year_body(2021)
+    url = direct.dukascopy_direct_d1_url("AUDUSD", 2021)
+    calls = 0
+    sleeps: list[float] = []
+
+    def opener(_request: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise HTTPError(url, 503, "Service Unavailable", {}, None)
+        return FakeResponse(body, url=url)
+
+    result = direct.DukascopyDirectD1HttpTransport(
+        opener=opener, sleeper=sleeps.append
+    ).fetch_year(pair="AUDUSD", year=2021)
+
+    assert calls == 2
+    assert sleeps == [1.0]
+    assert result.body == body
+
+
 @pytest.mark.parametrize(
-    "status,reason,retryable",
+    "status,reason",
     [
-        (302, "redirect_not_allowed", False),
-        (403, "http_request_rejected", False),
-        (404, "year_not_found", False),
-        (429, "provider_rate_limited", True),
-        (503, "provider_unavailable", True),
+        (429, "provider_rate_limited"),
+        (503, "provider_unavailable"),
     ],
 )
-def test_http_transport_classifies_status_without_retry_or_fallback(
-    status: int, reason: str, retryable: bool
+def test_http_transport_retries_transient_status_until_exhausted(
+    status: int, reason: str
 ) -> None:
     url = direct.dukascopy_direct_d1_url("AUDUSD", 2021)
     calls = 0
+    sleeps: list[float] = []
 
     def opener(_request: object, **_kwargs: object) -> object:
         nonlocal calls
@@ -263,11 +283,72 @@ def test_http_transport_classifies_status_without_retry_or_fallback(
         raise HTTPError(url, status, "failure", {}, None)
 
     with pytest.raises(direct.DukascopyDirectD1TransportError, match=reason) as caught:
-        direct.DukascopyDirectD1HttpTransport(opener=opener).fetch_year(
-            pair="AUDUSD", year=2021
-        )
+        direct.DukascopyDirectD1HttpTransport(
+            opener=opener, sleeper=sleeps.append
+        ).fetch_year(pair="AUDUSD", year=2021)
+
+    assert calls == 3
+    assert sleeps == [1.0, 2.0]
+    assert caught.value.retryable is True
+
+
+@pytest.mark.parametrize(
+    "status,reason",
+    [
+        (302, "redirect_not_allowed"),
+        (403, "http_request_rejected"),
+        (404, "year_not_found"),
+    ],
+)
+def test_http_transport_does_not_retry_non_retryable_status(
+    status: int, reason: str
+) -> None:
+    url = direct.dukascopy_direct_d1_url("AUDUSD", 2021)
+    calls = 0
+    sleeps: list[float] = []
+
+    def opener(_request: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise HTTPError(url, status, "failure", {}, None)
+
+    with pytest.raises(direct.DukascopyDirectD1TransportError, match=reason) as caught:
+        direct.DukascopyDirectD1HttpTransport(
+            opener=opener, sleeper=sleeps.append
+        ).fetch_year(pair="AUDUSD", year=2021)
+
     assert calls == 1
-    assert caught.value.retryable is retryable
+    assert sleeps == []
+    assert caught.value.retryable is False
+
+
+def test_mirror_retries_transient_503_and_publishes_atomically(tmp_path: Path) -> None:
+    body = _year_body(2021)
+    url = direct.dukascopy_direct_d1_url("AUDUSD", 2021)
+    calls = 0
+    sleeps: list[float] = []
+
+    def opener(_request: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise HTTPError(url, 503, "Service Unavailable", {}, None)
+        return FakeResponse(body, url=url)
+
+    raw_path, sidecar_path = mirror.mirror_direct_d1_year(
+        pair="AUDUSD",
+        year=2021,
+        destination_root=tmp_path,
+        opener=opener,
+        sleeper=sleeps.append,
+        clock=lambda: datetime(2023, 12, 31, tzinfo=UTC),
+    )
+
+    assert calls == 2
+    assert sleeps == [1.0]
+    assert raw_path.read_bytes() == body
+    assert sidecar_path.exists()
+    assert not list((tmp_path / "AUDUSD").glob(".tmp-*"))
 
 
 def test_mirror_atomically_publishes_and_resumes_without_network(tmp_path: Path) -> None:

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -39,6 +40,7 @@ def mirror_direct_d1_year(
     destination_root: Path,
     timeout_seconds: float = DIRECT_D1_MAX_TIMEOUT_SECONDS,
     opener: Callable[..., Any] | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
     clock: Callable[[], datetime] | None = None,
 ) -> tuple[Path, Path]:
     """Publish one verified year through a temporary sibling directory."""
@@ -61,7 +63,8 @@ def mirror_direct_d1_year(
         return raw_path, sidecar_path
 
     transport = DukascopyDirectD1HttpTransport(
-        opener=opener if opener is not None else DukascopyDirectD1HttpTransport().opener
+        opener=opener if opener is not None else DukascopyDirectD1HttpTransport().opener,
+        sleeper=sleeper,
     )
     source = transport.fetch_year(
         pair=pair,
@@ -117,6 +120,7 @@ def mirror_direct_d1_range(
     destination_root: Path,
     timeout_seconds: float = DIRECT_D1_MAX_TIMEOUT_SECONDS,
     opener: Callable[..., Any] | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
     clock: Callable[[], datetime] | None = None,
 ) -> tuple[tuple[Path, Path], ...]:
     """Mirror an explicitly bounded sequence of complete calendar years."""
@@ -141,6 +145,7 @@ def mirror_direct_d1_range(
                 destination_root=destination_root,
                 timeout_seconds=timeout_seconds,
                 opener=opener,
+                sleeper=sleeper,
                 clock=clock,
             )
         )
