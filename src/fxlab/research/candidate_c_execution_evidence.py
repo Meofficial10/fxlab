@@ -406,9 +406,12 @@ def mirror_candidate_c_execution_partitions(
     destination_root: Path | str,
     pair: str | None = None,
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+    continue_on_transient: bool = False,
     downloader: Callable[..., Bi5PartitionState] = download_hour,
 ) -> CandidateCExecutionMirrorReport:
     """Acquire only the deterministic 00h schedule; never select ranked pairs."""
+    if not isinstance(continue_on_transient, bool):
+        raise ValueError("continue_on_transient must be a boolean")
     pairs = CANDIDATE_C_EXECUTION_PAIRS if pair is None else (pair,)
     start_utc, end_utc, ordered_pairs = _validate_scope(start, end, pairs)
     destination, counts, scheduled, stop = Path(destination_root), Counter(), 0, False
@@ -423,8 +426,11 @@ def mirror_candidate_c_execution_partitions(
             )
             scheduled += 1
             counts[state] += 1
-            if state in (
-                Bi5PartitionState.INCOMPLETE,
+            if state is Bi5PartitionState.INCOMPLETE:
+                if not continue_on_transient:
+                    stop = True
+                    break
+            elif state in (
                 Bi5PartitionState.CONFLICT,
                 Bi5PartitionState.CORRUPT_LOCAL,
             ):

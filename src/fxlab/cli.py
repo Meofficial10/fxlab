@@ -292,6 +292,10 @@ def mirror_candidate_c_execution(
         None, "--pair", help="One approved pair; omit for the frozen seven-pair universe"
     ),
     timeout: float = typer.Option(30.0, "--timeout", help="HTTP timeout in seconds"),
+    continue_on_transient: bool = typer.Option(
+        False, "--continue-on-transient",
+        help="Continue scheduled 00h partitions after exhausted transient retries",
+    ),
 ) -> None:
     """Acquire only Candidate C's sealed 00h UTC execution partitions."""
     from .research import candidate_c_execution_evidence as execution
@@ -307,6 +311,7 @@ def mirror_candidate_c_execution(
             destination_root=Path(dest),
             pair=pair,
             timeout_seconds=timeout,
+            continue_on_transient=continue_on_transient,
         )
     except ValueError as exc:
         console.print(

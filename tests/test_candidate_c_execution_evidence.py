@@ -418,6 +418,115 @@ def test_acquisition_failures_remain_incomplete_without_fabrication(tmp_path: Pa
     assert report.ok is False
 
 
+def test_default_acquisition_stops_after_first_transient_incomplete(
+    tmp_path: Path,
+) -> None:
+    execution = _module()
+    calls: list[tuple[str, datetime]] = []
+
+    def downloader(**kwargs: object) -> Bi5PartitionState:
+        call = (str(kwargs["symbol"]), kwargs["hour"])
+        calls.append(call)  # type: ignore[arg-type]
+        if call[1] == START:
+            return Bi5PartitionState.INCOMPLETE
+        return Bi5PartitionState.PRESENT_STAGED
+
+    report = execution.mirror_candidate_c_execution_partitions(
+        start=START,
+        end=START + timedelta(days=3),
+        destination_root=tmp_path,
+        pair="AUDUSD",
+        downloader=downloader,
+    )
+
+    assert calls == [("AUDUSD", START)]
+    assert report.scheduled_partitions == 1
+    assert report.incomplete == 1
+    assert report.ok is False
+
+
+def test_continue_on_transient_scans_later_scheduled_00h_partitions(
+    tmp_path: Path,
+) -> None:
+    execution = _module()
+    calls: list[tuple[str, datetime]] = []
+
+    def downloader(**kwargs: object) -> Bi5PartitionState:
+        call = (str(kwargs["symbol"]), kwargs["hour"])
+        calls.append(call)  # type: ignore[arg-type]
+        if call[1] == START:
+            return Bi5PartitionState.INCOMPLETE
+        return Bi5PartitionState.PRESENT_STAGED
+
+    report = execution.mirror_candidate_c_execution_partitions(
+        start=START,
+        end=START + timedelta(days=3),
+        destination_root=tmp_path,
+        pair="AUDUSD",
+        continue_on_transient=True,
+        downloader=downloader,
+    )
+
+    assert calls == [
+        ("AUDUSD", START),
+        ("AUDUSD", START + timedelta(days=1)),
+        ("AUDUSD", START + timedelta(days=2)),
+    ]
+    assert all(hour.hour == 0 for _, hour in calls)
+    assert report.scheduled_partitions == 3
+    assert report.present_staged == 2
+    assert report.incomplete == 1
+    assert report.absent_evidenced == 0
+    assert report.ok is False
+
+
+@pytest.mark.parametrize(
+    "failure", [Bi5PartitionState.CONFLICT, Bi5PartitionState.CORRUPT_LOCAL]
+)
+def test_continue_on_transient_still_stops_on_local_integrity_failure(
+    tmp_path: Path, failure: Bi5PartitionState
+) -> None:
+    execution = _module()
+    calls: list[datetime] = []
+
+    def downloader(**kwargs: object) -> Bi5PartitionState:
+        calls.append(kwargs["hour"])  # type: ignore[arg-type]
+        return failure
+
+    report = execution.mirror_candidate_c_execution_partitions(
+        start=START,
+        end=START + timedelta(days=2),
+        destination_root=tmp_path,
+        pair="AUDUSD",
+        continue_on_transient=True,
+        downloader=downloader,
+    )
+
+    assert calls == [START]
+    assert report.scheduled_partitions == 1
+    assert report.ok is False
+
+
+def test_continue_on_transient_never_swallows_permanent_failure(tmp_path: Path) -> None:
+    execution = _module()
+    calls: list[datetime] = []
+
+    def downloader(**kwargs: object) -> Bi5PartitionState:
+        calls.append(kwargs["hour"])  # type: ignore[arg-type]
+        raise RuntimeError("permanent_http_error_403")
+
+    with pytest.raises(RuntimeError, match="permanent_http_error_403"):
+        execution.mirror_candidate_c_execution_partitions(
+            start=START,
+            end=START + timedelta(days=2),
+            destination_root=tmp_path,
+            pair="AUDUSD",
+            continue_on_transient=True,
+            downloader=downloader,
+        )
+    assert calls == [START]
+
+
 def test_cli_routes_exact_schedule_without_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -454,6 +563,43 @@ def test_cli_routes_exact_schedule_without_network(
     assert calls[0]["pair"] is None
     assert calls[0]["start"] == START
     assert calls[0]["end"] == END
+
+
+def test_cli_continue_on_transient_routes_flag_and_remains_non_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    execution = _module()
+    calls: list[dict[str, object]] = []
+
+    def fake_mirror(**kwargs: object):
+        calls.append(dict(kwargs))
+        return execution.CandidateCExecutionMirrorReport(
+            scheduled_partitions=7,
+            present_staged=6,
+            absent_evidenced=0,
+            incomplete=1,
+            conflict=0,
+            corrupt_local=0,
+        )
+
+    monkeypatch.setattr(execution, "mirror_candidate_c_execution_partitions", fake_mirror)
+    result = runner.invoke(
+        app,
+        [
+            "mirror-candidate-c-execution",
+            "--from",
+            "2021-01-05T00:00:00Z",
+            "--to",
+            "2021-01-06T00:00:00Z",
+            "--dest",
+            str(tmp_path),
+            "--continue-on-transient",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert len(calls) == 1
+    assert calls[0]["continue_on_transient"] is True
 
 
 def test_module_has_no_candidate_c_measurement_surface() -> None:
