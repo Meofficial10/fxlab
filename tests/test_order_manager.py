@@ -18,6 +18,7 @@ from fxlab.execution import (
 from fxlab.execution.broker import (
     AccountInfo,
     BrokerOrderRejected,
+    BrokerPreSubmissionRejected,
     OrderRequest,
     OrderStatus,
     Tick,
@@ -786,3 +787,129 @@ def test_order_manager_has_no_out_of_scope_operations_or_sl_tp_generation():
     assert not hasattr(OrderManager, "calculate_stop_loss")
     assert not hasattr(OrderManager, "calculate_take_profit")
     assert not hasattr(OrderManager, "save")
+
+
+@pytest.mark.parametrize(
+    "error_reason",
+    [
+        "mt5_state_not_clean",
+        "mt5_smoke_quote_invalid",
+        "mt5_smoke_volume_invalid",
+        "mt5_smoke_sl_invalid",
+        "mt5_demo_account_required",
+        "mt5_mutation_not_permitted",
+        "mt5_account_incompatible",
+        "mt5_not_connected",
+        "unsupported_mt5_symbol",
+        "unsupported_order_type",
+        "invalid_order_side",
+    ],
+)
+def test_order_manager_handles_broker_pre_submission_rejected_explicit_type(
+    error_reason: str,
+) -> None:
+    order_manager, broker, risk = manager()
+
+    def fail_submit(request: OrderRequest) -> str:
+        raise BrokerPreSubmissionRejected(error_reason)
+
+    broker.submit_order = fail_submit
+    result = order_manager.submit(intent(), current_time=NOW)
+
+    assert result.kind is ExecutionResultKind.EXECUTION_REJECTED
+    assert result.reason == error_reason
+    assert result.record is not None
+    assert result.record.status is OrderStatus.REJECTED
+    assert result.record.reservation_released is True
+    assert risk.released == [result.record.client_order_id]
+    assert risk.kill_reasons == []
+
+
+@pytest.mark.parametrize(
+    "error_string",
+    [
+        "mt5_state_not_clean",
+        "mt5_smoke_quote_invalid",
+        "mt5_smoke_volume_invalid",
+        "mt5_smoke_sl_invalid",
+        "mt5_demo_account_required",
+        "mt5_mutation_not_permitted",
+        "mt5_account_incompatible",
+        "mt5_not_connected",
+        "unsupported_mt5_symbol",
+        "unsupported_order_type",
+        "invalid_order_side",
+    ],
+)
+def test_order_manager_proves_strings_do_not_establish_safety(
+    error_string: str,
+) -> None:
+    order_manager, broker, risk = manager()
+
+    def fail_with_generic_runtime_error(request: OrderRequest) -> str:
+        raise RuntimeError(error_string)
+
+    broker.submit_order = fail_with_generic_runtime_error
+    result = order_manager.submit(intent(), current_time=NOW)
+
+    # Must fail closed as INDETERMINATE with kill switch, proving string matching is removed
+    assert result.kind is ExecutionResultKind.INDETERMINATE
+    assert result.reason == "broker_submission_exception"
+    assert result.record is not None
+    assert result.record.status is OrderStatus.PENDING
+    assert result.record.reservation_released is False
+    assert risk.released == []
+    assert risk.kill_reasons == [KillSwitchReason.POSITION_RECONCILIATION_FAILED]
+
+
+def test_order_manager_indeterminate_post_submission_reconciliation_error() -> None:
+    order_manager, broker, risk = manager()
+
+    def fail_reconcile(request: OrderRequest) -> str:
+        raise RuntimeError("mt5_entry_reconciliation_required")
+
+    broker.submit_order = fail_reconcile
+    result = order_manager.submit(intent(), current_time=NOW)
+
+    assert result.kind is ExecutionResultKind.INDETERMINATE
+    assert result.reason == "broker_submission_exception"
+    assert result.record is not None
+    assert result.record.status is OrderStatus.PENDING
+    assert result.record.reservation_released is False
+    assert risk.released == []
+    assert risk.kill_reasons == [KillSwitchReason.POSITION_RECONCILIATION_FAILED]
+
+
+def test_order_manager_indeterminate_unknown_broker_exception() -> None:
+    from fxlab.execution.broker import BrokerMutationPhase
+    from fxlab.execution.event_ledger import EventLedger
+
+    ledger = EventLedger("test-session")
+    order_manager, broker, risk = manager(ledger=ledger)
+
+    broker.mutation_phase = BrokerMutationPhase.PRE_MUTATION  # type: ignore[attr-defined]
+
+    def fail_unknown(request: OrderRequest) -> str:
+        raise TypeError("unexpected_network_abort")
+
+    broker.submit_order = fail_unknown
+    result = order_manager.submit(intent(), current_time=NOW)
+
+    assert result.kind is ExecutionResultKind.INDETERMINATE
+    assert result.reason == "broker_submission_exception"
+    assert result.record is not None
+    assert result.record.status is OrderStatus.PENDING
+    assert result.record.reservation_released is False
+    assert risk.released == []
+    assert risk.kill_reasons == [KillSwitchReason.POSITION_RECONCILIATION_FAILED]
+
+    # Verify audit events preserve safe diagnostics
+    indeterminate_events = [
+        e for e in ledger.events() if e.event_type is AuditEventType.ORDER_SUBMISSION_INDETERMINATE
+    ]
+    assert len(indeterminate_events) == 1
+    payload = indeterminate_events[0].payload
+    assert payload["reason"] == "broker_submission_exception"
+    assert payload["exception_class"] == "TypeError"
+    assert payload["exception_message"] == "unexpected_network_abort"
+    assert payload["mutation_phase"] == "PRE_MUTATION"

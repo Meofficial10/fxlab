@@ -18,7 +18,11 @@ if TYPE_CHECKING:
         recover_snapshot,
         run_foreground_replay,
     )
-    from .broker import BrokerOrderRejected
+    from .broker import (
+        BrokerMutationPhase,
+        BrokerOrderRejected,
+        BrokerPreSubmissionRejected,
+    )
     from .broker_capabilities import (
         BrokerCapability,
         BrokerCapabilityProvider,
@@ -132,7 +136,9 @@ __all__ = [
     "recover_snapshot",
     "run_foreground_replay",
     "AuditComponent",
+    "BrokerMutationPhase",
     "BrokerOrderRejected",
+    "BrokerPreSubmissionRejected",
     "BrokerCapability",
     "BrokerCapabilityProvider",
     "BrokerCompatibility",
@@ -201,6 +207,9 @@ __all__ = [
     "RuntimeController",
     "RuntimeState",
     "RuntimeStatus",
+    "MT5_DEMO_EXECUTION_CONFIRMATION",
+    "Mt5DemoBroker",
+    "Mt5DemoExecutionRunner",
     "ConversionQuote",
     "FxInstrumentCatalog",
     "FxValuationEngine",
@@ -224,6 +233,8 @@ def __getattr__(name: str) -> Any:
             event_ledger,
             margin,
             monitoring,
+            mt5_demo_broker,
+            mt5_demo_runtime,
             oanda_demo_broker,
             order_manager,
             paper_broker,
@@ -242,6 +253,8 @@ def __getattr__(name: str) -> Any:
             event_ledger,
             monitoring,
             margin,
+            mt5_demo_broker,
+            mt5_demo_runtime,
             order_manager,
             oanda_demo_broker,
             paper_broker,

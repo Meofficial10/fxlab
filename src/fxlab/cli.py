@@ -41,6 +41,10 @@ from .execution.app import (
 from .execution.durable_event_store import SQLiteEventStore
 from .execution.event_ledger import AuditEventType, EventLedger
 from .execution.mt5_demo_preflight import Mt5DemoPreflight
+from .execution.mt5_demo_runtime import (
+    MT5_DEMO_EXECUTION_CONFIRMATION,
+    Mt5DemoExecutionRunner,
+)
 from .execution.mt5_demo_smoke import (
     MT5_DEMO_SMOKE_CONFIRMATION,
     Mt5DemoSmokeOrder,
@@ -147,6 +151,84 @@ def mt5_demo_smoke_order(
         else:
             message = "rejected before submission"
         console.print(f"[red]MT5 demo smoke failed[/red] {message}")
+        raise typer.Exit(1) from None
+    finally:
+        if store is not None:
+            store.close()
+
+    _json_or_human(
+        {
+            "status": result.status,
+            "environment": "demo",
+            "account": result.account,
+            "symbol": result.symbol,
+            "side": result.side,
+            "volume": result.volume,
+            "entry_order_id": result.entry_order_id,
+            "entry_deal_id": result.entry_deal_id,
+            "position_id": result.position_id,
+            "close_order_id": result.close_order_id,
+            "close_deal_id": result.close_deal_id,
+        },
+        json_output=False,
+    )
+
+
+@mt5_app.command("demo-execute")
+def mt5_demo_execute(
+    confirmation: Annotated[str, typer.Option("--confirm")],
+    audit_db: Annotated[Path, typer.Option("--audit-db")],
+    max_loss_usd: Annotated[
+        float,
+        typer.Option(
+            "--max-loss-usd",
+            help="Maximum modeled adverse price loss in USD used to derive the protective stop",
+        ),
+    ],
+    side: str = typer.Option("buy", "--side"),
+) -> None:
+    """Send and close one operator-authorized MT5 demo execution order through runtime."""
+    if confirmation != MT5_DEMO_EXECUTION_CONFIRMATION:
+        console.print("[red]MT5 demo execution rejected[/red] explicit confirmation required")
+        raise typer.Exit(2)
+
+    if max_loss_usd is None or max_loss_usd <= 0:
+        console.print(
+            "[red]MT5 demo execution rejected[/red] explicit positive --max-loss-usd required"
+        )
+        raise typer.Exit(2)
+
+    selected_side = side.strip().lower()
+    if selected_side not in ("buy", "sell"):
+        console.print("[red]MT5 demo execution rejected[/red] side must be buy or sell")
+        raise typer.Exit(2)
+
+    session_id = "mt5-demo-exec-" + uuid.uuid4().hex
+    store: SQLiteEventStore | None = None
+    try:
+        store = SQLiteEventStore(audit_db, session_id)
+        ledger = EventLedger(session_id, durable_store=store)
+        runner = Mt5DemoExecutionRunner()
+        result = runner.run(
+            confirmation=confirmation,
+            ledger=ledger,
+            side=selected_side,
+            max_loss_usd=max_loss_usd,
+        )
+    except (RuntimeError, ValueError) as exc:
+        reason = str(exc)
+        if reason == "mt5_entry_broker_rejected":
+            message = "entry rejected by demo broker"
+        elif reason == "mt5_entry_reconciliation_required":
+            message = "entry outcome ambiguous; reconciliation required"
+        elif reason in {
+            "mt5_close_broker_rejected",
+            "mt5_close_reconciliation_required",
+        }:
+            message = "close outcome ambiguous; reconciliation required"
+        else:
+            message = f"rejected before submission: {reason}"
+        console.print(f"[red]MT5 demo execution failed[/red] {message}")
         raise typer.Exit(1) from None
     finally:
         if store is not None:

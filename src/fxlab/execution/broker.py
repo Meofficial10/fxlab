@@ -36,6 +36,22 @@ class BrokerOrderRejected(RuntimeError):
         super().__init__(reason)
 
 
+class BrokerPreSubmissionRejected(RuntimeError):
+    """Guaranteed pre-mutation rejection: no broker mutation API was invoked."""
+
+    def __init__(self, reason: str) -> None:
+        if not isinstance(reason, str) or not _SAFE_BROKER_EVIDENCE.fullmatch(reason):
+            raise ValueError("broker pre-submission rejection reason must be a safe identifier")
+        self.reason = reason
+        super().__init__(reason)
+
+
+class BrokerMutationPhase(Enum):
+    PRE_MUTATION = "PRE_MUTATION"
+    MUTATION_ATTEMPTED = "MUTATION_ATTEMPTED"
+    POST_MUTATION_RECONCILIATION = "POST_MUTATION_RECONCILIATION"
+
+
 class OrderStatus(Enum):
     PENDING = "pending"
     FILLED = "filled"

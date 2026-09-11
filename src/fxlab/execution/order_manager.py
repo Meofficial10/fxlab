@@ -10,9 +10,20 @@ from enum import StrEnum
 from threading import Lock
 
 from ..risk.engine import KillSwitchReason, RiskDecision, RiskEngine, RiskRejection
-from .broker import AccountInfo, BrokerAdapter, BrokerOrderRejected, OrderRequest, OrderStatus, Tick
+from .broker import (
+    _SAFE_BROKER_EVIDENCE,
+    AccountInfo,
+    BrokerAdapter,
+    BrokerMutationPhase,
+    BrokerOrderRejected,
+    BrokerPreSubmissionRejected,
+    OrderRequest,
+    OrderStatus,
+    Tick,
+)
 from .broker_capabilities import (
     CURRENT_ORDER_MANAGER_REQUIREMENTS,
+    BrokerCapability,
     BrokerEnvironment,
     inspect_broker_capabilities,
 )
@@ -85,6 +96,7 @@ class OrderManager:
     broker: BrokerAdapter
     risk_engine: RiskEngine
     event_ledger: EventLedger | None = None
+    required_capabilities: frozenset[BrokerCapability] = CURRENT_ORDER_MANAGER_REQUIREMENTS
 
     _records: dict[str, OrderRecord] = field(default_factory=dict, init=False)
     _audit_failed: bool = field(default=False, init=False)
@@ -116,7 +128,7 @@ class OrderManager:
 
         capability_check = inspect_broker_capabilities(
             self.broker,
-            CURRENT_ORDER_MANAGER_REQUIREMENTS,
+            self.required_capabilities,
             require_hedging=True,
         )
         if not capability_check.compatible:
@@ -328,6 +340,37 @@ class OrderManager:
 
         try:
             broker_order_id = self.broker.submit_order(request)
+        except BrokerPreSubmissionRejected as exc:
+            rejected = replace(provisional, status=OrderStatus.REJECTED)
+            with self._lock:
+                self._records[risk_result.order_id] = rejected
+            if not self._audit(
+                AuditEventType.ORDER_REJECTED,
+                occurred_at=current_utc,
+                component=AuditComponent.BROKER_ADAPTER,
+                correlation=correlation,
+                payload={"reason": exc.reason},
+            ):
+                return ExecutionResult(
+                    kind=ExecutionResultKind.EXECUTION_REJECTED,
+                    reason="audit_failure_after_rejection",
+                    message="authoritative rejection could not be audited",
+                    record=rejected,
+                    risk_decision=risk_result,
+                )
+            released = self.risk_engine.release_approval(risk_result.order_id)
+            if released:
+                rejected = replace(rejected, reservation_released=True)
+                with self._lock:
+                    self._records[risk_result.order_id] = rejected
+                self._audit_release(risk_result.order_id, current_utc, correlation)
+            return ExecutionResult(
+                kind=ExecutionResultKind.EXECUTION_REJECTED,
+                reason=exc.reason,
+                message="order rejected before broker submission",
+                record=rejected,
+                risk_decision=risk_result,
+            )
         except BrokerOrderRejected as exc:
             rejected = replace(provisional, status=OrderStatus.REJECTED)
             with self._lock:
@@ -362,9 +405,25 @@ class OrderManager:
                 record=rejected,
                 risk_decision=risk_result,
             )
-        except Exception:
+        except Exception as exc:
+            phase = getattr(self.broker, "mutation_phase", None)
+            phase_val = (
+                phase.value
+                if isinstance(phase, BrokerMutationPhase)
+                else (str(phase) if phase is not None else "PRE_MUTATION")
+            )
+            exc_class = exc.__class__.__name__
+            raw_msg = str(exc).strip()
+            exc_msg = raw_msg if _SAFE_BROKER_EVIDENCE.fullmatch(raw_msg) else exc_class
             self._submission_indeterminate(
-                current_utc, correlation, "broker_submission_exception"
+                current_utc,
+                correlation,
+                "broker_submission_exception",
+                diagnostic={
+                    "exception_class": exc_class,
+                    "exception_message": exc_msg,
+                    "mutation_phase": phase_val,
+                },
             )
             return ExecutionResult(
                 kind=ExecutionResultKind.INDETERMINATE,
@@ -719,24 +778,32 @@ class OrderManager:
         return valuation
 
     def _submission_indeterminate(
-        self, occurred_at: datetime, correlation: EventCorrelation, reason: str
+        self,
+        occurred_at: datetime,
+        correlation: EventCorrelation,
+        reason: str,
+        *,
+        diagnostic: dict[str, object] | None = None,
     ) -> None:
         activated = self.risk_engine.trigger_kill_switch(
             KillSwitchReason.POSITION_RECONCILIATION_FAILED
         )
+        payload: dict[str, object] = {"reason": reason}
+        if diagnostic:
+            payload.update(diagnostic)
         self._audit(
             AuditEventType.ORDER_SUBMISSION_INDETERMINATE,
             occurred_at=occurred_at,
             component=AuditComponent.ORDER_MANAGER,
             correlation=correlation,
-            payload={"reason": reason},
+            payload=payload,
         )
         self._audit(
             AuditEventType.RECONCILIATION_FAILED,
             occurred_at=occurred_at,
             component=AuditComponent.ORDER_MANAGER,
             correlation=correlation,
-            payload={"reason": reason},
+            payload=payload,
         )
         if activated:
             self._audit(
