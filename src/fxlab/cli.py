@@ -38,8 +38,13 @@ from .execution.app import (
     recover_snapshot,
     run_foreground_replay,
 )
-from .execution.event_ledger import AuditEventType
+from .execution.durable_event_store import SQLiteEventStore
+from .execution.event_ledger import AuditEventType, EventLedger
 from .execution.mt5_demo_preflight import Mt5DemoPreflight
+from .execution.mt5_demo_smoke import (
+    MT5_DEMO_SMOKE_CONFIRMATION,
+    Mt5DemoSmokeOrder,
+)
 from .execution.oanda_demo_broker import (
     OANDA_SYMBOLS,
     OandaDemoBroker,
@@ -110,6 +115,59 @@ console = Console()
 
 def _redacted_account_id(account_id: str) -> str:
     return f"****{account_id[-4:]}"
+
+
+@mt5_app.command("demo-smoke-order")
+def mt5_demo_smoke_order(
+    confirmation: Annotated[str, typer.Option("--confirm")],
+    audit_db: Annotated[Path, typer.Option("--audit-db")],
+) -> None:
+    """Send and close one fixed, minimum-volume MT5 demo smoke order."""
+    if confirmation != MT5_DEMO_SMOKE_CONFIRMATION:
+        console.print("[red]MT5 demo smoke rejected[/red] explicit confirmation required")
+        raise typer.Exit(2)
+
+    session_id = "mt5-demo-smoke-" + uuid.uuid4().hex
+    store: SQLiteEventStore | None = None
+    try:
+        store = SQLiteEventStore(audit_db, session_id)
+        ledger = EventLedger(session_id, durable_store=store)
+        result = Mt5DemoSmokeOrder().run(confirmation=confirmation, ledger=ledger)
+    except (RuntimeError, ValueError) as exc:
+        reason = str(exc)
+        if reason == "mt5_entry_broker_rejected":
+            message = "entry rejected by demo broker"
+        elif reason == "mt5_entry_reconciliation_required":
+            message = "entry outcome ambiguous; reconciliation required"
+        elif reason in {
+            "mt5_close_broker_rejected",
+            "mt5_close_reconciliation_required",
+        }:
+            message = "close outcome ambiguous; reconciliation required"
+        else:
+            message = "rejected before submission"
+        console.print(f"[red]MT5 demo smoke failed[/red] {message}")
+        raise typer.Exit(1) from None
+    finally:
+        if store is not None:
+            store.close()
+
+    _json_or_human(
+        {
+            "status": result.status,
+            "environment": "demo",
+            "account": result.account,
+            "symbol": result.symbol,
+            "side": result.side,
+            "volume": result.volume,
+            "entry_order_id": result.entry_order_id,
+            "entry_deal_id": result.entry_deal_id,
+            "position_id": result.position_id,
+            "close_order_id": result.close_order_id,
+            "close_deal_id": result.close_deal_id,
+        },
+        json_output=False,
+    )
 
 
 @mt5_app.command("preflight")
