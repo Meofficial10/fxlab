@@ -39,6 +39,12 @@ from .execution.app import (
     run_foreground_replay,
 )
 from .execution.event_ledger import AuditEventType
+from .execution.mt5_demo_preflight import Mt5DemoPreflight
+from .execution.oanda_demo_broker import (
+    OANDA_SYMBOLS,
+    OandaDemoBroker,
+    OandaPracticeConfig,
+)
 from .execution.recovery import RecoveryState
 from .experiment.log import hash_bars, log_experiment
 from .labeling.triple_barrier import apply_triple_barrier
@@ -87,9 +93,134 @@ service_app = typer.Typer(
     add_completion=False,
     help="Local authenticated observation-only service operations.",
 )
+oanda_app = typer.Typer(
+    add_completion=False,
+    help="Read-only OANDA Practice connectivity checks.",
+)
+mt5_app = typer.Typer(
+    add_completion=False,
+    help="Read-only local MetaTrader 5 demo connectivity checks.",
+)
 app.add_typer(paper_app, name="paper")
 app.add_typer(service_app, name="service")
+app.add_typer(oanda_app, name="oanda")
+app.add_typer(mt5_app, name="mt5")
 console = Console()
+
+
+def _redacted_account_id(account_id: str) -> str:
+    return f"****{account_id[-4:]}"
+
+
+@mt5_app.command("preflight")
+def mt5_preflight(
+    quote: str | None = typer.Option(None, "--quote"),
+) -> None:
+    """Validate the active local MT5 demo session and optionally read one quote."""
+    try:
+        result = Mt5DemoPreflight().run(quote=quote)
+    except (RuntimeError, ValueError):
+        console.print("[red]MT5 preflight failed[/red] demo validation unavailable")
+        raise typer.Exit(1) from None
+    payload: dict[str, object] = {
+        "environment": result.environment,
+        "broker": result.broker,
+        "terminal_version": result.terminal_version,
+        "account": result.account,
+        "server": result.server,
+        "company": result.company,
+        "currency": result.currency,
+        "hedging_enabled": result.hedging_enabled,
+        "account_trading_enabled": result.account_trading_enabled,
+        "expert_trading_enabled": result.expert_trading_enabled,
+        "terminal_trading_enabled": result.terminal_trading_enabled,
+    }
+    if result.quote is not None:
+        payload.update(
+            {
+                "quote_symbol": result.quote.symbol,
+                "quote_timestamp": result.quote.timestamp.isoformat(),
+                "bid": result.quote.bid,
+                "ask": result.quote.ask,
+                "symbol_trade_mode": result.quote.symbol_trade_mode,
+            }
+        )
+    _json_or_human(payload, json_output=False)
+
+
+@oanda_app.command("preflight")
+def oanda_preflight(
+    quote: str | None = typer.Option(None, "--quote"),
+) -> None:
+    """Validate one Practice account and optionally read one quote; never trade."""
+    selected_quote: str | None = None
+    if quote is not None:
+        selected_quote = quote.strip().upper()
+        if selected_quote not in OANDA_SYMBOLS:
+            console.print("[red]OANDA preflight failed[/red] unsupported OANDA quote symbol")
+            raise typer.Exit(2)
+    try:
+        settings = OandaPracticeConfig.from_environment()
+    except ValueError as exc:
+        reason = (
+            "practice credentials unavailable"
+            if str(exc) == "practice_credentials_unavailable"
+            else "practice settings invalid"
+        )
+        console.print(f"[red]OANDA preflight failed[/red] {reason}")
+        raise typer.Exit(2) from None
+
+    broker = OandaDemoBroker(
+        settings.account_id,
+        settings.token,
+        timeout_seconds=settings.timeout_seconds,
+        max_quote_age=settings.max_quote_age,
+    )
+    account = None
+    tick = None
+    failed = False
+    try:
+        broker.connect()
+        account = broker.get_account_info()
+        if selected_quote is not None:
+            broker.subscribe_market_data([selected_quote])
+            tick = broker.get_latest_tick(selected_quote)
+    except Exception:
+        failed = True
+    finally:
+        try:
+            broker.disconnect()
+        except Exception:
+            failed = True
+    if failed or account is None:
+        console.print("[red]OANDA preflight failed[/red] practice validation unavailable")
+        raise typer.Exit(1)
+
+    descriptor = broker.broker_descriptor
+    payload: dict[str, object] = {
+        "environment": descriptor.environment.value,
+        "broker_id": descriptor.broker_id,
+        "implementation_version": descriptor.implementation_version,
+        "account": _redacted_account_id(settings.account_id),
+        "currency": account.currency,
+        "hedging_enabled": True,
+        "trading_enabled": True,
+        "non_mt4": True,
+        "capabilities": ",".join(sorted(item.value for item in descriptor.capabilities)),
+        "supported_symbols": ",".join(sorted(OANDA_SYMBOLS)),
+        "open_position_count": len(account.open_positions),
+    }
+    if tick is not None:
+        payload.update(
+            {
+                "quote_symbol": tick.symbol,
+                "quote_timestamp": tick.timestamp.isoformat(),
+                "tradeable": True,
+                "bid": tick.bid,
+                "ask": tick.ask,
+            }
+        )
+    _json_or_human(payload, json_output=False)
 
 
 def _tf_list(tf: str) -> list[str]:

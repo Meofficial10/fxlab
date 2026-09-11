@@ -23,6 +23,7 @@ dependencies = [
 # and the test suite never depend on network or optional native wheels.
 [project.optional-dependencies]
 data = ["dukascopy-python>=4.0"]
+mt5 = ["MetaTrader5>=5.0"]
 
 [project.scripts]
 fxlab = "fxlab.cli:app"

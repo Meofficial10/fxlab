@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -12,7 +13,8 @@ from threading import Lock
 from types import MappingProxyType
 from typing import Protocol
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import pandas as pd
 
@@ -25,6 +27,10 @@ from .broker_capabilities import (
 from .valuation import FxInstrumentCatalog, FxValuationEngine, InstrumentSpec, PipValuation
 
 OANDA_PRACTICE_AUTHORITY = "https://api-fxpractice.oanda.com"
+OANDA_PRACTICE_ACCOUNT_ID_ENV = "FXLAB_OANDA_PRACTICE_ACCOUNT_ID"
+OANDA_PRACTICE_TOKEN_ENV = "FXLAB_OANDA_PRACTICE_TOKEN"
+OANDA_TIMEOUT_SECONDS_ENV = "FXLAB_OANDA_TIMEOUT_SECONDS"
+OANDA_MAX_QUOTE_AGE_SECONDS_ENV = "FXLAB_OANDA_MAX_QUOTE_AGE_SECONDS"
 OANDA_SYMBOLS: Mapping[str, str] = MappingProxyType(
     {
         "EURUSD": "EUR_USD",
@@ -63,6 +69,76 @@ _OANDA_DESCRIPTOR = BrokerDescriptor(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class OandaPracticeConfig:
+    """Environment-only Practice credentials and bounded preflight settings."""
+
+    account_id: str = field(repr=False)
+    token: str = field(repr=False)
+    timeout_seconds: float = 10.0
+    max_quote_age: timedelta = timedelta(seconds=5)
+
+    @classmethod
+    def from_environment(
+        cls, environment: Mapping[str, str] | None = None
+    ) -> OandaPracticeConfig:
+        source = os.environ if environment is None else environment
+        account_id = source.get(OANDA_PRACTICE_ACCOUNT_ID_ENV)
+        token = source.get(OANDA_PRACTICE_TOKEN_ENV)
+        if (
+            not isinstance(account_id, str)
+            or not account_id.strip()
+            or not isinstance(token, str)
+            or not token.strip()
+        ):
+            raise ValueError("practice_credentials_unavailable")
+        timeout = _positive_setting(source.get(OANDA_TIMEOUT_SECONDS_ENV), 10.0)
+        quote_age = _positive_setting(source.get(OANDA_MAX_QUOTE_AGE_SECONDS_ENV), 5.0)
+        return cls(
+            account_id.strip(),
+            token.strip(),
+            timeout,
+            timedelta(seconds=quote_age),
+        )
+
+
+def _positive_setting(value: str | None, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("practice_settings_invalid") from None
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError("practice_settings_invalid")
+    return parsed
+
+
+def _practice_authority_url(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    parsed = urlsplit(value)
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc == "api-fxpractice.oanda.com"
+        and parsed.username is None
+        and parsed.password is None
+    )
+
+
+class _OandaPracticeRedirectHandler(HTTPRedirectHandler):
+    """Permit urllib redirects only within the exact Practice authority."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _practice_authority_url(newurl):
+            raise RuntimeError("oanda_redirect_authority_not_permitted")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _oanda_default_opener() -> Callable[..., object]:
+    return build_opener(_OandaPracticeRedirectHandler()).open
+
+
 class OandaTransport(Protocol):
     authority: str
 
@@ -75,7 +151,7 @@ class OandaHttpTransport:
 
     token: str = field(repr=False)
     authority: str = field(default=OANDA_PRACTICE_AUTHORITY, init=False)
-    opener: Callable[..., object] = field(default=urlopen, repr=False)
+    opener: Callable[..., object] = field(default_factory=_oanda_default_opener, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.token, str) or not self.token.strip():
@@ -114,9 +190,11 @@ class OandaHttpTransport:
         )
         try:
             response = self.opener(request, timeout=float(timeout))
+            _validate_final_response_url(response)
             status = int(response.status)
             raw = response.read(max_bytes + 1)
         except HTTPError as exc:
+            _validate_final_response_url(exc)
             status = exc.code
             raw = exc.read(max_bytes + 1)
         except (TimeoutError, URLError, OSError):
@@ -130,6 +208,18 @@ class OandaHttpTransport:
         if not isinstance(payload, Mapping):
             raise RuntimeError("oanda_response_invalid")
         return OandaResponse(status, payload)
+
+
+def _validate_final_response_url(response: object) -> None:
+    geturl = getattr(response, "geturl", None)
+    if not callable(geturl):
+        raise RuntimeError("oanda_final_url_unavailable")
+    try:
+        final_url = geturl()
+    except Exception:
+        raise RuntimeError("oanda_final_url_unavailable") from None
+    if not _practice_authority_url(final_url):
+        raise RuntimeError("oanda_redirect_authority_not_permitted")
 
 
 @dataclass(frozen=True, slots=True)

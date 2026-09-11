@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from io import BytesIO
 from urllib.error import HTTPError
+from urllib.request import Request
 
 import pytest
 
@@ -689,12 +690,21 @@ def test_secret_material_is_not_in_repr_descriptor_or_public_object_dictionary()
 
 
 class HttpReply:
-    def __init__(self, body: bytes, status: int = 200) -> None:
+    def __init__(
+        self,
+        body: bytes,
+        status: int = 200,
+        final_url: str = f"{OANDA_PRACTICE_AUTHORITY}/v3/test",
+    ) -> None:
         self.body = body
         self.status = status
+        self.final_url = final_url
 
     def read(self, amount: int) -> bytes:
         return self.body[:amount]
+
+    def geturl(self) -> str:
+        return self.final_url
 
 
 def test_http_transport_is_practice_only_bounded_and_one_attempt() -> None:
@@ -711,6 +721,36 @@ def test_http_transport_is_practice_only_bounded_and_one_attempt() -> None:
     assert transport.authority == OANDA_PRACTICE_AUTHORITY
     assert len(calls) == 1
     assert "private-token" not in repr(transport)
+
+
+def test_http_transport_rejects_cross_authority_final_url_without_secret_exposure() -> None:
+    def opener(request: object, *, timeout: float) -> HttpReply:
+        return HttpReply(b'{"ok":true}', final_url="https://api-fxtrade.oanda.com/v3/test")
+
+    transport = OandaHttpTransport("private-token", opener=opener)
+    with pytest.raises(RuntimeError, match="oanda_redirect_authority_not_permitted") as caught:
+        transport.request("GET", "/v3/test", timeout_seconds=1)
+    assert "private-token" not in str(caught.value)
+
+
+def test_default_redirect_policy_rejects_live_authority_before_following() -> None:
+    module = importlib.import_module("fxlab.execution.oanda_demo_broker")
+    handler_type = getattr(module, "_OandaPracticeRedirectHandler", None)
+    assert handler_type is not None
+    def opener(request: Request, *, timeout: float) -> object:
+        return handler_type().redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://api-fxtrade.oanda.com/v3/test",
+        )
+
+    transport = OandaHttpTransport("private-token", opener=opener)
+    with pytest.raises(RuntimeError, match="oanda_redirect_authority_not_permitted") as caught:
+        transport.request("GET", "/v3/test", timeout_seconds=1)
+    assert "private-token" not in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -749,7 +789,13 @@ def test_http_transport_preserves_status_without_exposing_error_body(status: int
     def opener(request: object, *, timeout: float) -> object:
         nonlocal calls
         calls += 1
-        raise HTTPError("https://secret.invalid", status, "secret-token", {}, BytesIO(body))
+        raise HTTPError(
+            f"{OANDA_PRACTICE_AUTHORITY}/v3/test",
+            status,
+            "secret-token",
+            {},
+            BytesIO(body),
+        )
 
     result = OandaHttpTransport("secret-token", opener=opener).request(
         "GET", "/v3/test", timeout_seconds=1, max_response_bytes=100
