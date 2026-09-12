@@ -736,6 +736,9 @@ class Mt5DemoBroker:
             record = self._orders.get(order_id)
             if record is not None:
                 return dict(record)
+            for rec in self._orders.values():
+                if rec.get("broker_order_id") == order_id:
+                    return dict(rec)
         return {"status": OrderStatus.PENDING}
 
     def cancel_order(self, order_id: str) -> bool:
