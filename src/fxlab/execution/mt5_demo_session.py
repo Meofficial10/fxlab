@@ -45,31 +45,51 @@ from .runtime_control import (
 )
 from .signal_engine import SignalEvent
 
-_EXECUTION_PERMIT_TOKEN = object()
+_PHASE_2A_TEST_PERMIT_TOKEN = object()
+_SOAK_PERMIT_TOKEN = object()
 
 
 @dataclass(frozen=True, slots=True)
 class _Mt5DemoExecutionPermit:
-    """Unforgeable in-process capability for the deterministic Phase 2A harness."""
+    """Unforgeable in-process capability for the deterministic Phase 2A test harness."""
+
+    _token: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _Mt5DemoSoakExecutionPermit:
+    """Unforgeable in-process capability strictly for the Phase 2B soak harness."""
 
     _token: object = field(repr=False, compare=False)
 
 
 def _phase_2a_test_execution_permit() -> _Mt5DemoExecutionPermit:
     """Create the private structural permit used only by the Phase 2A test harness."""
-    return _Mt5DemoExecutionPermit(_EXECUTION_PERMIT_TOKEN)
+    return _Mt5DemoExecutionPermit(_PHASE_2A_TEST_PERMIT_TOKEN)
+
+
+def _issue_soak_execution_permit_internal() -> _Mt5DemoSoakExecutionPermit:
+    """Private factory creating the unforgeable Phase 2B soak capability."""
+    return _Mt5DemoSoakExecutionPermit(_SOAK_PERMIT_TOKEN)
 
 
 def _validate_strategy_gate(
-    signal: SignalEvent, execution_permit: _Mt5DemoExecutionPermit | None
+    signal: SignalEvent,
+    execution_permit: _Mt5DemoExecutionPermit | _Mt5DemoSoakExecutionPermit | None,
 ) -> None:
     """Reject every signal unless a separately injected structural capability is valid."""
     del signal
     if (
-        not isinstance(execution_permit, _Mt5DemoExecutionPermit)
-        or execution_permit._token is not _EXECUTION_PERMIT_TOKEN
+        isinstance(execution_permit, _Mt5DemoExecutionPermit)
+        and execution_permit._token is _PHASE_2A_TEST_PERMIT_TOKEN
     ):
-        raise RuntimeError("unvalidated_strategy_execution_prohibited")
+        return
+    if (
+        isinstance(execution_permit, _Mt5DemoSoakExecutionPermit)
+        and execution_permit._token is _SOAK_PERMIT_TOKEN
+    ):
+        return
+    raise RuntimeError("unvalidated_strategy_execution_prohibited")
 
 
 class Mt5SessionCycleKind(StrEnum):
@@ -108,7 +128,9 @@ class Mt5DemoSession:
     event_ledger: EventLedger
     max_loss_usd: float
     max_quote_age: timedelta
-    execution_permit: _Mt5DemoExecutionPermit | None = field(default=None, repr=False)
+    execution_permit: _Mt5DemoExecutionPermit | _Mt5DemoSoakExecutionPermit | None = field(
+        default=None, repr=False
+    )
     risk_limits: RiskLimits | None = None
     clock: object = field(default=None)
 
@@ -177,6 +199,16 @@ class Mt5DemoSession:
     def active_position_id(self) -> str | None:
         with self._lock:
             return self._active_position_id
+
+    @property
+    def reconciliation_required(self) -> bool:
+        with self._lock:
+            return self._reconciliation_required
+
+    @property
+    def failed_reason(self) -> RuntimeControlReason | None:
+        with self._lock:
+            return self._failed_reason
 
     def start(self) -> RuntimeControlResult:
         """Connect to MT5, run startup reconciliation, and start session."""

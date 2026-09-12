@@ -277,6 +277,56 @@ def test_strategy_gate_strictly_prohibits_unvalidated_strategies() -> None:
     _validate_strategy_gate(spoofed_signal, _phase_2a_test_execution_permit())
 
 
+def test_strategy_gate_rejects_candidate_c_and_forged_permits() -> None:
+    for name in ("Candidate_C", "candidate_c", "SMC_ICT", "arbitrary_setup"):
+        signal = SignalEvent(
+            setup_name=name,
+            symbol="EURUSD",
+            timeframe="M1",
+            side=1,
+            signal_time=NOW,
+            signal_bar_index=0,
+        )
+        # Missing permit
+        with pytest.raises(RuntimeError, match="unvalidated_strategy_execution_prohibited"):
+            _validate_strategy_gate(signal, None)
+        # Forged permit object
+        with pytest.raises(RuntimeError, match="unvalidated_strategy_execution_prohibited"):
+            _validate_strategy_gate(signal, "forged_permit")  # type: ignore[arg-type]
+
+
+def test_direct_session_construction_defaults_to_no_execution(tmp_path) -> None:
+    api = SessionFakeMt5Api()
+    store = SQLiteEventStore(tmp_path / "default_permit.sqlite", "default_permit")
+    ledger = EventLedger(store.session_id, time_provider=lambda: NOW, durable_store=store)
+    broker = Mt5DemoBroker(api=api, clock=lambda: NOW)
+    try:
+        # Construct ordinary session with default execution_permit
+        session = Mt5DemoSession(
+            broker=broker,
+            event_ledger=ledger,
+            max_loss_usd=1.0,
+            max_quote_age=timedelta(seconds=5.0),
+            clock=lambda: NOW,
+        )
+        assert session.execution_permit is None
+        session.start()
+        with pytest.raises(RuntimeError, match="unvalidated_strategy_execution_prohibited"):
+            session.poll_cycle(
+                SignalEvent(
+                    setup_name="Candidate_C",
+                    symbol="EURUSD",
+                    timeframe="M1",
+                    side=1,
+                    signal_time=NOW,
+                    signal_bar_index=0,
+                )
+            )
+        assert api.order_send_count == 0
+    finally:
+        store.close()
+
+
 def test_spoofed_setup_name_cannot_execute_without_structural_permit(tmp_path) -> None:
     session, api, store = _session_fixture(tmp_path, execution_permit=None)
     try:

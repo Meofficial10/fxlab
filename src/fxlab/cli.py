@@ -7,6 +7,7 @@ Everything runs offline with ``--synthetic``; real data uses the ``dukascopy`` s
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,6 +49,11 @@ from .execution.mt5_demo_runtime import (
 from .execution.mt5_demo_smoke import (
     MT5_DEMO_SMOKE_CONFIRMATION,
     Mt5DemoSmokeOrder,
+)
+from .execution.mt5_demo_soak import (
+    MT5_DEMO_SOAK_CONFIRMATION,
+    Mt5DemoSoakConfig,
+    Mt5DemoSoakRunner,
 )
 from .execution.oanda_demo_broker import (
     OANDA_SYMBOLS,
@@ -247,6 +253,114 @@ def mt5_demo_execute(
             "position_id": result.position_id,
             "close_order_id": result.close_order_id,
             "close_deal_id": result.close_deal_id,
+        },
+        json_output=False,
+    )
+
+
+@mt5_app.command("demo-soak")
+def mt5_demo_soak(
+    confirmation: Annotated[str, typer.Option("--confirm")],
+    audit_db: Annotated[Path, typer.Option("--audit-db")],
+    max_loss_usd: Annotated[
+        float,
+        typer.Option(
+            "--max-loss-usd",
+            help="Maximum modeled adverse price loss in USD used to derive the protective stop",
+        ),
+    ],
+    max_entries: Annotated[
+        int,
+        typer.Option(
+            "--max-entries",
+            help="Maximum number of sequential trades to execute before stopping",
+        ),
+    ],
+    max_duration_seconds: Annotated[
+        float,
+        typer.Option(
+            "--max-duration-seconds",
+            help="Maximum operational runtime in seconds before stopping new entries",
+        ),
+    ],
+    drain_timeout_seconds: Annotated[
+        float,
+        typer.Option(
+            "--drain-timeout-seconds",
+            help=(
+                "Maximum duration in seconds to monitor an open position "
+                "after main duration expires"
+            ),
+        ),
+    ],
+    max_quote_age_seconds: Annotated[
+        float,
+        typer.Option(
+            "--max-quote-age-seconds",
+            help="Maximum acceptable age of market quotes in seconds",
+        ),
+    ],
+    poll_interval_seconds: Annotated[
+        float,
+        typer.Option(
+            "--poll-interval-seconds",
+            help="Polling cycle interval in seconds",
+        ),
+    ] = 1.0,
+    cooldown_seconds: Annotated[
+        float,
+        typer.Option(
+            "--cooldown-seconds",
+            help="Cooldown in seconds after a position closes before next stimulus",
+        ),
+    ] = 30.0,
+) -> None:
+    """Run a bounded, unattended MT5 demo soak test session."""
+    if confirmation != MT5_DEMO_SOAK_CONFIRMATION:
+        console.print("[red]MT5 demo soak rejected[/red] explicit confirmation required")
+        raise typer.Exit(2)
+
+    try:
+        config = Mt5DemoSoakConfig(
+            confirmation=confirmation,
+            max_loss_usd=max_loss_usd,
+            max_entries=max_entries,
+            max_duration_seconds=max_duration_seconds,
+            drain_timeout_seconds=drain_timeout_seconds,
+            max_quote_age_seconds=max_quote_age_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            cooldown_seconds=cooldown_seconds,
+            sleeper=time.sleep,
+        )
+    except ValueError as exc:
+        console.print(f"[red]MT5 demo soak rejected[/red] invalid configuration: {exc}")
+        raise typer.Exit(2) from None
+
+    session_id = "mt5-demo-soak-" + uuid.uuid4().hex
+    store: SQLiteEventStore | None = None
+    try:
+        from .execution.mt5_demo_broker import Mt5DemoBroker
+
+        store = SQLiteEventStore(audit_db, session_id)
+        ledger = EventLedger(session_id, durable_store=store)
+        broker = Mt5DemoBroker()
+        runner = Mt5DemoSoakRunner()
+        result = runner.run(config, broker=broker, ledger=ledger)
+    except (RuntimeError, ValueError) as exc:
+        console.print(f"[red]MT5 demo soak failed[/red] {exc}")
+        raise typer.Exit(1) from None
+    finally:
+        if store is not None:
+            store.close()
+
+    _json_or_human(
+        {
+            "status": result.status,
+            "stop_reason": result.stop_reason,
+            "entries_completed": result.entries_completed,
+            "duration_seconds": result.duration_seconds,
+            "active_position_id": result.active_position_id,
+            "error_message": result.error_message,
         },
         json_output=False,
     )
