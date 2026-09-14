@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from .broker import Tick
 from .event_ledger import EventLedger
 from .mt5_demo_broker import MT5_DEMO_SYMBOL, Mt5DemoBroker
 from .mt5_demo_session import (
@@ -124,13 +125,15 @@ class SyntheticSoakSignalGenerator:
         self._bar_index = 0
         self._side = 1
 
-    def next_signal(self, current_time: datetime) -> SignalEvent:
+    def next_signal(self, observation: Tick) -> SignalEvent:
+        if not isinstance(observation, Tick) or observation.symbol != MT5_DEMO_SYMBOL:
+            raise ValueError("accepted_mt5_market_observation_required")
         signal = SignalEvent(
             setup_name=self._setup_name,
             symbol=MT5_DEMO_SYMBOL,
             timeframe="M1",
             side=self._side,
-            signal_time=current_time,
+            signal_time=observation.timestamp,
             signal_bar_index=self._bar_index,
         )
         self._side = -self._side
@@ -323,9 +326,11 @@ class Mt5DemoSoakRunner:
                         # Monitor market tick / maintain pause-resume health during cooldown
                         session.poll_cycle(signal=None, current_time=now)
                     else:
-                        # Eligible for next synthetic stimulus
-                        signal = self._signal_generator.next_signal(now)
-                        cycle_res = session.poll_cycle(signal=signal, current_time=now)
+                        # Session owns observation acceptance and stimulus anchoring.
+                        cycle_res = session.poll_cycle(
+                            synthetic_signal_factory=self._signal_generator.next_signal,
+                            current_time=now,
+                        )
                         if cycle_res.kind == Mt5SessionCycleKind.PROCESSED:
                             entries_count += 1
                         elif cycle_res.kind == Mt5SessionCycleKind.POSITION_CLOSED:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -494,10 +495,19 @@ class Mt5DemoSession:
         self,
         signal: SignalEvent | None = None,
         *,
+        synthetic_signal_factory: Callable[[Tick], SignalEvent] | None = None,
         force_close: bool = False,
         current_time: datetime | None = None,
     ) -> Mt5SessionCycleResult:
         """Run one atomic polling cycle."""
+        if signal is not None and synthetic_signal_factory is not None:
+            raise ValueError("signal_and_synthetic_factory_are_mutually_exclusive")
+        if synthetic_signal_factory is not None and not (
+            isinstance(self.execution_permit, _Mt5DemoSoakExecutionPermit)
+            and self.execution_permit._token is _SOAK_PERMIT_TOKEN
+        ):
+            raise RuntimeError("synthetic_soak_execution_permit_required")
+
         now = current_time or self._now()
 
         # Check runtime controller status
@@ -781,6 +791,15 @@ class Mt5DemoSession:
                 )
 
         # No active position — Signal Ingestion & Execution Path
+        if synthetic_signal_factory is not None:
+            signal = synthetic_signal_factory(tick)
+            if not isinstance(signal, SignalEvent):
+                raise RuntimeError("synthetic_signal_factory_result_invalid")
+            if signal.signal_time != tick.timestamp:
+                raise RuntimeError("synthetic_signal_timestamp_mismatch")
+            if signal.symbol != tick.symbol or signal.symbol != MT5_DEMO_SYMBOL:
+                raise RuntimeError("synthetic_signal_symbol_mismatch")
+
         if signal is None:
             return Mt5SessionCycleResult(
                 kind=Mt5SessionCycleKind.NO_SIGNAL,

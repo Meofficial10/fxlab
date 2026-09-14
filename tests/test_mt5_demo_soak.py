@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from fxlab.execution.broker import Tick
 from fxlab.execution.durable_event_store import SQLiteEventStore
 from fxlab.execution.event_ledger import (
     AuditComponent,
@@ -291,18 +292,306 @@ def _create_session(
 # Test 1: Deterministic alternating BUY then SELL stimulus
 def test_deterministic_alternating_buy_then_sell() -> None:
     generator = SyntheticSoakSignalGenerator("synthetic_soak_test")
-    s1 = generator.next_signal(NOW)
-    assert s1.side == 1  # BUY
+    first_observation = Tick("EURUSD", NOW, 1.1, 1.1002, 1.1001)
+    second_observation = Tick(
+        "EURUSD", NOW + timedelta(seconds=1), 1.1, 1.1002, 1.1001
+    )
+    third_observation = Tick(
+        "EURUSD", NOW + timedelta(seconds=2), 1.1, 1.1002, 1.1001
+    )
+    s1 = generator.next_signal(first_observation)
+    assert s1.side == 1
     assert s1.signal_bar_index == 0
     assert s1.setup_name == "synthetic_soak_test"
+    assert s1.signal_time == first_observation.timestamp
 
-    s2 = generator.next_signal(NOW + timedelta(seconds=1))
-    assert s2.side == -1  # SELL
+    s2 = generator.next_signal(second_observation)
+    assert s2.side == -1
     assert s2.signal_bar_index == 1
+    assert s2.signal_time == second_observation.timestamp
 
-    s3 = generator.next_signal(NOW + timedelta(seconds=2))
-    assert s3.side == 1  # BUY
+    s3 = generator.next_signal(third_observation)
+    assert s3.side == 1
     assert s3.signal_bar_index == 2
+    assert s3.signal_time == third_observation.timestamp
+
+
+def test_runner_delegates_synthetic_observation_acquisition_to_session() -> None:
+    source = inspect.getsource(Mt5DemoSoakRunner.run)
+    assert "session.broker" not in source
+    assert "synthetic_signal_factory=" in source
+
+
+def test_soak_anchors_signal_to_fresh_cached_market_observation(
+    tmp_path, monkeypatch
+) -> None:
+    sim_time = [NOW + timedelta(milliseconds=5)]
+    broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path, time_ref=sim_time)
+    accepted_tick = Tick("EURUSD", NOW, 1.1, 1.1002, 1.1001)
+    observed_signal_times: list[datetime] = []
+
+    class CapturingGenerator(SyntheticSoakSignalGenerator):
+        def next_signal(self, observation: Tick) -> SignalEvent:
+            assert isinstance(observation, Tick)
+            signal = super().next_signal(observation)
+            observed_signal_times.append(signal.signal_time)
+            return signal
+
+    def close_and_advance(seconds: float) -> None:
+        if api.positions:
+            pos = api.positions.pop(0)
+            api.history_deals.append(
+                SimpleNamespace(
+                    ticket=8099,
+                    order=7099,
+                    position_id=pos.ticket,
+                    entry=api.DEAL_ENTRY_OUT,
+                    symbol="EURUSD",
+                    magic=1180191810,
+                    volume=0.01,
+                    profit=0.0,
+                    reason=api.DEAL_REASON_SL,
+                )
+            )
+        sim_time[0] += timedelta(seconds=seconds)
+
+    monkeypatch.setattr(
+        Mt5DemoBroker, "get_latest_tick", lambda self, symbol: accepted_tick
+    )
+    config = Mt5DemoSoakConfig(
+        confirmation=MT5_DEMO_SOAK_CONFIRMATION,
+        max_loss_usd=1.0,
+        max_entries=1,
+        max_duration_seconds=30.0,
+        drain_timeout_seconds=10.0,
+        max_quote_age_seconds=5.0,
+        poll_interval_seconds=0.1,
+        cooldown_seconds=0.0,
+        clock=clock_fn,
+        sleeper=close_and_advance,
+    )
+    try:
+        result = Mt5DemoSoakRunner(CapturingGenerator()).run(
+            config, broker=broker, ledger=ledger
+        )
+        assert result.status == "completed"
+        assert result.stop_reason == "max_entries_reached"
+        assert result.entries_completed == 1
+        assert observed_signal_times == [accepted_tick.timestamp]
+        assert api.order_send_count == 1
+    finally:
+        store.close()
+
+
+def test_session_anchors_factory_to_accepted_cached_tick(tmp_path, monkeypatch) -> None:
+    sim_time = [NOW + timedelta(milliseconds=5)]
+    broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path, time_ref=sim_time)
+    accepted_tick = Tick("EURUSD", NOW, 1.1, 1.1002, 1.1001)
+    later_execution_tick = Tick(
+        "EURUSD", NOW + timedelta(milliseconds=1), 1.1, 1.1002, 1.1001
+    )
+    reads = 0
+    observed: list[Tick] = []
+
+    def get_tick(self, symbol: str) -> Tick:
+        nonlocal reads
+        reads += 1
+        return accepted_tick if reads == 1 else later_execution_tick
+
+    def build_signal(observation: Tick) -> SignalEvent:
+        observed.append(observation)
+        return SyntheticSoakSignalGenerator().next_signal(observation)
+
+    monkeypatch.setattr(Mt5DemoBroker, "get_latest_tick", get_tick)
+    session = _create_session(broker, ledger, clock=clock_fn)
+    try:
+        session.start()
+        result = session.poll_cycle(
+            synthetic_signal_factory=build_signal,
+            current_time=sim_time[0],
+        )
+        assert result.kind == Mt5SessionCycleKind.PROCESSED
+        assert result.signal is not None
+        assert result.signal.signal_time == accepted_tick.timestamp
+        assert observed == [accepted_tick]
+        assert api.order_send_count == 1
+    finally:
+        store.close()
+
+
+def test_session_quote_failure_uses_controlled_pause_path(tmp_path, monkeypatch) -> None:
+    broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path)
+    factory_called = False
+
+    def unavailable(self, symbol: str) -> Tick:
+        raise RuntimeError("synthetic quote failure")
+
+    def build_signal(observation: Tick) -> SignalEvent:
+        nonlocal factory_called
+        factory_called = True
+        return SyntheticSoakSignalGenerator().next_signal(observation)
+
+    monkeypatch.setattr(Mt5DemoBroker, "get_latest_tick", unavailable)
+    session = _create_session(broker, ledger, clock=clock_fn)
+    try:
+        session.start()
+        result = session.poll_cycle(
+            synthetic_signal_factory=build_signal,
+            current_time=NOW,
+        )
+        assert result.kind == Mt5SessionCycleKind.PAUSED
+        assert result.reason == "broker_unavailable"
+        assert not factory_called
+        assert api.order_send_count == 0
+    finally:
+        store.close()
+
+
+def test_session_factory_keeps_older_execution_tick_rejection(tmp_path, monkeypatch) -> None:
+    broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path)
+    accepted_tick = Tick("EURUSD", NOW, 1.1, 1.1002, 1.1001)
+    older_tick = Tick(
+        "EURUSD", NOW - timedelta(milliseconds=1), 1.1, 1.1002, 1.1001
+    )
+    ticks = iter((accepted_tick, older_tick))
+    monkeypatch.setattr(Mt5DemoBroker, "get_latest_tick", lambda self, symbol: next(ticks))
+    session = _create_session(broker, ledger, clock=clock_fn)
+    try:
+        session.start()
+        result = session.poll_cycle(
+            synthetic_signal_factory=SyntheticSoakSignalGenerator().next_signal,
+            current_time=NOW,
+        )
+        assert result.kind == Mt5SessionCycleKind.FAILED
+        assert result.reason == "stale_quote"
+        assert api.order_send_count == 0
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "observed_at",
+    (NOW + timedelta(milliseconds=1), NOW - timedelta(seconds=5, milliseconds=1)),
+)
+def test_session_factory_preserves_future_and_age_validation(
+    tmp_path, monkeypatch, observed_at: datetime
+) -> None:
+    broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path)
+    factory_called = False
+    tick = Tick("EURUSD", observed_at, 1.1, 1.1002, 1.1001)
+
+    def build_signal(observation: Tick) -> SignalEvent:
+        nonlocal factory_called
+        factory_called = True
+        return SyntheticSoakSignalGenerator().next_signal(observation)
+
+    monkeypatch.setattr(Mt5DemoBroker, "get_latest_tick", lambda self, symbol: tick)
+    session = _create_session(broker, ledger, clock=clock_fn)
+    try:
+        session.start()
+        result = session.poll_cycle(
+            synthetic_signal_factory=build_signal,
+            current_time=NOW,
+        )
+        assert result.kind == Mt5SessionCycleKind.PAUSED
+        assert result.reason == "data_stale"
+        assert not factory_called
+        assert api.order_send_count == 0
+    finally:
+        store.close()
+
+
+
+
+@pytest.mark.parametrize("offset_ms", (-1, 1))
+def test_session_factory_rejects_nonanchored_signal_time(
+    tmp_path, monkeypatch, offset_ms: int
+) -> None:
+    broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path)
+    accepted_tick = Tick("EURUSD", NOW, 1.1, 1.1002, 1.1001)
+
+    def nonanchored_signal(observation: Tick) -> SignalEvent:
+        return SignalEvent(
+            setup_name="synthetic_soak_test",
+            symbol=observation.symbol,
+            timeframe="M1",
+            side=1,
+            signal_time=observation.timestamp + timedelta(milliseconds=offset_ms),
+            signal_bar_index=0,
+        )
+
+    monkeypatch.setattr(
+        Mt5DemoBroker, "get_latest_tick", lambda self, symbol: accepted_tick
+    )
+    session = _create_session(broker, ledger, clock=clock_fn)
+    try:
+        session.start()
+        with pytest.raises(RuntimeError, match="synthetic_signal_timestamp_mismatch"):
+            session.poll_cycle(
+                synthetic_signal_factory=nonanchored_signal,
+                current_time=NOW,
+            )
+        assert api.order_send_count == 0
+    finally:
+        store.close()
+
+
+def test_session_factory_rejects_wrong_symbol_before_submission(
+    tmp_path, monkeypatch
+) -> None:
+    broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path)
+    accepted_tick = Tick("EURUSD", NOW, 1.1, 1.1002, 1.1001)
+
+    def wrong_symbol_signal(observation: Tick) -> SignalEvent:
+        return SignalEvent(
+            setup_name="synthetic_soak_test",
+            symbol="GBPUSD",
+            timeframe="M1",
+            side=1,
+            signal_time=observation.timestamp,
+            signal_bar_index=0,
+        )
+
+    monkeypatch.setattr(
+        Mt5DemoBroker, "get_latest_tick", lambda self, symbol: accepted_tick
+    )
+    session = _create_session(broker, ledger, clock=clock_fn)
+    try:
+        session.start()
+        with pytest.raises(RuntimeError, match="synthetic_signal_symbol_mismatch"):
+            session.poll_cycle(
+                synthetic_signal_factory=wrong_symbol_signal,
+                current_time=NOW,
+            )
+        assert api.order_send_count == 0
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("invalid_result", (None, object()))
+def test_session_factory_requires_signal_event(
+    tmp_path, monkeypatch, invalid_result: object
+) -> None:
+    broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path)
+    accepted_tick = Tick("EURUSD", NOW, 1.1, 1.1002, 1.1001)
+
+    def invalid_factory(observation: Tick) -> object:
+        return invalid_result
+
+    monkeypatch.setattr(
+        Mt5DemoBroker, "get_latest_tick", lambda self, symbol: accepted_tick
+    )
+    session = _create_session(broker, ledger, clock=clock_fn)
+    try:
+        session.start()
+        with pytest.raises(RuntimeError, match="synthetic_signal_factory_result_invalid"):
+            session.poll_cycle(
+                synthetic_signal_factory=invalid_factory,  # type: ignore[arg-type]
+                current_time=NOW,
+            )
+        assert api.order_send_count == 0
+    finally:
+        store.close()
 
 
 # Test 2: max_entries stops loop exactly
@@ -1011,7 +1300,7 @@ def test_risk_rejection_creates_no_order(tmp_path) -> None:
 
 
 # Test 20: KeyboardInterrupt results in safe clean shutdown when flat
-def test_keyboard_interrupt_safe_clean_shutdown(tmp_path) -> None:
+def test_keyboard_interrupt_safe_clean_shutdown(tmp_path, monkeypatch) -> None:
     broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path)
     try:
         config = Mt5DemoSoakConfig(
@@ -1025,11 +1314,11 @@ def test_keyboard_interrupt_safe_clean_shutdown(tmp_path) -> None:
             sleeper=lambda _: (_ for _ in ()).throw(KeyboardInterrupt()),
         )
 
-        class _NoSignalGenerator(SyntheticSoakSignalGenerator):
-            def next_signal(self, current_time: datetime) -> None:
-                return None
+        def no_signal_cycle(self, *args, **kwargs):
+            return SimpleNamespace(kind=Mt5SessionCycleKind.NO_SIGNAL)
 
-        runner = Mt5DemoSoakRunner(signal_generator=_NoSignalGenerator())
+        monkeypatch.setattr(Mt5DemoSession, "poll_cycle", no_signal_cycle)
+        runner = Mt5DemoSoakRunner()
         res = runner.run(config, broker=broker, ledger=ledger)
         assert res.status == "stopped"
         assert res.stop_reason == "operator_interrupted"
