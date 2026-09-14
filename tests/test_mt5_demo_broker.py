@@ -2230,3 +2230,89 @@ def test_normal_explicit_close_causes_exactly_one_close_order_send() -> None:
     assert close_deal_id == "8002"
     # Exactly one additional order_send was performed (total 2)
     assert api.order_send_count == 2
+def _pending_controlled_close_broker() -> tuple[Mt5DemoBroker, FakeMt5Api]:
+    api = FakeMt5Api()
+    broker = _broker(api)
+    broker.connect()
+    broker.subscribe_market_data(["EURUSD"])
+    broker.submit_order(
+        OrderRequest(
+            symbol="EURUSD",
+            side=1,
+            size=0.01,
+            order_type="market",
+            order_id="test-pending-close",
+            sl_price=1.09500,
+        )
+    )
+    original_order_send = api.order_send
+
+    def keep_position_open(request: dict[str, object]) -> object:
+        if "position" not in request:
+            return original_order_send(request)
+        api.calls.append(("order_send", dict(request)))
+        api.order_send_count += 1
+        return api.close_result
+
+    api.order_send = keep_position_open  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="mt5_close_position_remaining"):
+        broker.close_position("9001")
+    api.positions.clear()
+    return broker, api
+
+
+def _pending_close_deal(api: FakeMt5Api, **overrides: object) -> object:
+    values: dict[str, object] = {
+        "ticket": 8002,
+        "order": 7002,
+        "position_id": 9001,
+        "entry": api.DEAL_ENTRY_OUT,
+        "symbol": "EURUSD",
+        "magic": 0x46584C42,
+        "volume": 0.01,
+        "profit": -0.25,
+        "reason": api.DEAL_REASON_EXPERT,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_pending_controlled_close_accepts_exact_expert_origin_ids() -> None:
+    broker, api = _pending_controlled_close_broker()
+    api.history_deals = [_pending_close_deal(api)]
+
+    assert broker.close_position("9001") == ("7002", "8002")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"order": 7999}, "mt5_close_history_pending_identity_mismatch"),
+        ({"ticket": 8999}, "mt5_close_history_missing"),
+        ({"position_id": 9999}, "mt5_close_history_missing"),
+        ({"symbol": "GBPUSD"}, "mt5_close_history_missing"),
+        ({"magic": 123}, "mt5_close_history_missing"),
+        ({"volume": 0.02}, "mt5_close_history_volume_mismatch"),
+    ],
+)
+def test_pending_controlled_close_rejects_identity_mismatch(
+    overrides: dict[str, object], reason: str
+) -> None:
+    broker, api = _pending_controlled_close_broker()
+    api.history_deals = [_pending_close_deal(api, **overrides)]
+
+    with pytest.raises(RuntimeError, match=reason):
+        broker.close_position("9001")
+
+
+@pytest.mark.parametrize("deal_reason", [4, 5, 0])
+def test_unrelated_close_reason_cannot_masquerade_without_exact_ids(
+    deal_reason: int,
+) -> None:
+    broker, api = _pending_controlled_close_broker()
+    api.history_deals = [
+        _pending_close_deal(api, ticket=8999, order=7999, reason=deal_reason)
+    ]
+
+    with pytest.raises(RuntimeError, match="mt5_close_history_missing"):
+        broker.close_position("9001")

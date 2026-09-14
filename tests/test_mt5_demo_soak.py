@@ -54,6 +54,7 @@ class SoakFakeMt5Api:
     DEAL_ENTRY_IN = 0
     DEAL_ENTRY_OUT = 1
     DEAL_REASON_CLIENT = 0
+    DEAL_REASON_EXPERT = 3
     DEAL_REASON_SL = 4
     DEAL_REASON_TP = 5
     TRADE_RETCODE_DONE = 10009
@@ -289,16 +290,25 @@ def _create_session(
     )
 
 
+def _accept_close_without_removing_position(api: SoakFakeMt5Api) -> None:
+    original_order_send = api.order_send
+
+    def order_send(request: dict[str, object]) -> object:
+        if "position" not in request:
+            return original_order_send(request)
+        api.calls.append(("order_send", dict(request)))
+        api.order_send_count += 1
+        return api.close_result
+
+    api.order_send = order_send  # type: ignore[method-assign]
+
+
 # Test 1: Deterministic alternating BUY then SELL stimulus
 def test_deterministic_alternating_buy_then_sell() -> None:
     generator = SyntheticSoakSignalGenerator("synthetic_soak_test")
     first_observation = Tick("EURUSD", NOW, 1.1, 1.1002, 1.1001)
-    second_observation = Tick(
-        "EURUSD", NOW + timedelta(seconds=1), 1.1, 1.1002, 1.1001
-    )
-    third_observation = Tick(
-        "EURUSD", NOW + timedelta(seconds=2), 1.1, 1.1002, 1.1001
-    )
+    second_observation = Tick("EURUSD", NOW + timedelta(seconds=1), 1.1, 1.1002, 1.1001)
+    third_observation = Tick("EURUSD", NOW + timedelta(seconds=2), 1.1, 1.1002, 1.1001)
     s1 = generator.next_signal(first_observation)
     assert s1.side == 1
     assert s1.signal_bar_index == 0
@@ -322,9 +332,7 @@ def test_runner_delegates_synthetic_observation_acquisition_to_session() -> None
     assert "synthetic_signal_factory=" in source
 
 
-def test_soak_anchors_signal_to_fresh_cached_market_observation(
-    tmp_path, monkeypatch
-) -> None:
+def test_soak_anchors_signal_to_fresh_cached_market_observation(tmp_path, monkeypatch) -> None:
     sim_time = [NOW + timedelta(milliseconds=5)]
     broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path, time_ref=sim_time)
     accepted_tick = Tick("EURUSD", NOW, 1.1, 1.1002, 1.1001)
@@ -355,9 +363,7 @@ def test_soak_anchors_signal_to_fresh_cached_market_observation(
             )
         sim_time[0] += timedelta(seconds=seconds)
 
-    monkeypatch.setattr(
-        Mt5DemoBroker, "get_latest_tick", lambda self, symbol: accepted_tick
-    )
+    monkeypatch.setattr(Mt5DemoBroker, "get_latest_tick", lambda self, symbol: accepted_tick)
     config = Mt5DemoSoakConfig(
         confirmation=MT5_DEMO_SOAK_CONFIRMATION,
         max_loss_usd=1.0,
@@ -371,9 +377,7 @@ def test_soak_anchors_signal_to_fresh_cached_market_observation(
         sleeper=close_and_advance,
     )
     try:
-        result = Mt5DemoSoakRunner(CapturingGenerator()).run(
-            config, broker=broker, ledger=ledger
-        )
+        result = Mt5DemoSoakRunner(CapturingGenerator()).run(config, broker=broker, ledger=ledger)
         assert result.status == "completed"
         assert result.stop_reason == "max_entries_reached"
         assert result.entries_completed == 1
@@ -387,9 +391,7 @@ def test_session_anchors_factory_to_accepted_cached_tick(tmp_path, monkeypatch) 
     sim_time = [NOW + timedelta(milliseconds=5)]
     broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path, time_ref=sim_time)
     accepted_tick = Tick("EURUSD", NOW, 1.1, 1.1002, 1.1001)
-    later_execution_tick = Tick(
-        "EURUSD", NOW + timedelta(milliseconds=1), 1.1, 1.1002, 1.1001
-    )
+    later_execution_tick = Tick("EURUSD", NOW + timedelta(milliseconds=1), 1.1, 1.1002, 1.1001)
     reads = 0
     observed: list[Tick] = []
 
@@ -450,9 +452,7 @@ def test_session_quote_failure_uses_controlled_pause_path(tmp_path, monkeypatch)
 def test_session_factory_keeps_older_execution_tick_rejection(tmp_path, monkeypatch) -> None:
     broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path)
     accepted_tick = Tick("EURUSD", NOW, 1.1, 1.1002, 1.1001)
-    older_tick = Tick(
-        "EURUSD", NOW - timedelta(milliseconds=1), 1.1, 1.1002, 1.1001
-    )
+    older_tick = Tick("EURUSD", NOW - timedelta(milliseconds=1), 1.1, 1.1002, 1.1001)
     ticks = iter((accepted_tick, older_tick))
     monkeypatch.setattr(Mt5DemoBroker, "get_latest_tick", lambda self, symbol: next(ticks))
     session = _create_session(broker, ledger, clock=clock_fn)
@@ -501,8 +501,6 @@ def test_session_factory_preserves_future_and_age_validation(
         store.close()
 
 
-
-
 @pytest.mark.parametrize("offset_ms", (-1, 1))
 def test_session_factory_rejects_nonanchored_signal_time(
     tmp_path, monkeypatch, offset_ms: int
@@ -520,9 +518,7 @@ def test_session_factory_rejects_nonanchored_signal_time(
             signal_bar_index=0,
         )
 
-    monkeypatch.setattr(
-        Mt5DemoBroker, "get_latest_tick", lambda self, symbol: accepted_tick
-    )
+    monkeypatch.setattr(Mt5DemoBroker, "get_latest_tick", lambda self, symbol: accepted_tick)
     session = _create_session(broker, ledger, clock=clock_fn)
     try:
         session.start()
@@ -536,9 +532,7 @@ def test_session_factory_rejects_nonanchored_signal_time(
         store.close()
 
 
-def test_session_factory_rejects_wrong_symbol_before_submission(
-    tmp_path, monkeypatch
-) -> None:
+def test_session_factory_rejects_wrong_symbol_before_submission(tmp_path, monkeypatch) -> None:
     broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path)
     accepted_tick = Tick("EURUSD", NOW, 1.1, 1.1002, 1.1001)
 
@@ -552,9 +546,7 @@ def test_session_factory_rejects_wrong_symbol_before_submission(
             signal_bar_index=0,
         )
 
-    monkeypatch.setattr(
-        Mt5DemoBroker, "get_latest_tick", lambda self, symbol: accepted_tick
-    )
+    monkeypatch.setattr(Mt5DemoBroker, "get_latest_tick", lambda self, symbol: accepted_tick)
     session = _create_session(broker, ledger, clock=clock_fn)
     try:
         session.start()
@@ -578,9 +570,7 @@ def test_session_factory_requires_signal_event(
     def invalid_factory(observation: Tick) -> object:
         return invalid_result
 
-    monkeypatch.setattr(
-        Mt5DemoBroker, "get_latest_tick", lambda self, symbol: accepted_tick
-    )
+    monkeypatch.setattr(Mt5DemoBroker, "get_latest_tick", lambda self, symbol: accepted_tick)
     session = _create_session(broker, ledger, clock=clock_fn)
     try:
         session.start()
@@ -599,6 +589,7 @@ def test_max_entries_stops_loop_exactly(tmp_path) -> None:
     sim_time = [NOW]
     broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path, time_ref=sim_time)
     try:
+
         def custom_sleeper(dt: float) -> None:
             if api.positions:
                 pos = api.positions.pop(0)
@@ -644,6 +635,7 @@ def test_max_duration_stops_loop(tmp_path) -> None:
     sim_time = [NOW]
     broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path, time_ref=sim_time)
     try:
+
         def custom_sleeper(dt: float) -> None:
             if api.positions:
                 pos = api.positions.pop(0)
@@ -688,6 +680,7 @@ def test_cooldown_prevents_early_next_entry(tmp_path) -> None:
     sim_time = [NOW]
     broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path, time_ref=sim_time)
     try:
+
         def custom_sleeper(dt: float) -> None:
             if api.positions:
                 pos = api.positions.pop(0)
@@ -1479,6 +1472,7 @@ def test_final_flat_state_after_successful_complete_soak(tmp_path) -> None:
     sim_time = [NOW]
     broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path, time_ref=sim_time)
     try:
+
         def custom_sleeper(dt: float) -> None:
             if api.positions:
                 pos = api.positions.pop(0)
@@ -1599,13 +1593,20 @@ def test_duration_expires_while_holding_prevents_second_entry(tmp_path) -> None:
         )
         runner = Mt5DemoSoakRunner()
         res = runner.run(config, broker=broker, ledger=ledger)
-        # Position was never closed, so drain timeout expired
-        assert res.status == "stopped"
-        assert res.stop_reason == "drain_timeout_with_open_position"
+        assert res.status == "completed"
+        assert res.stop_reason == "max_duration_reached"
         assert res.entries_completed == 1
-        # Exactly 1 order was sent, zero new entries attempted after duration expired
-        assert api.order_send_count == 1
-        assert res.active_position_id is not None
+        assert api.order_send_count == 2
+        assert res.active_position_id is None
+        events = store.load_events()
+        close_attempts = [
+            event
+            for event in events
+            if event.event_type is AuditEventType.ORDER_SUBMISSION_ATTEMPTED
+            and event.payload.get("operation") == "close"
+        ]
+        assert len(close_attempts) == 1
+        assert AuditEventType.POSITION_CLOSED in [event.event_type for event in events]
     finally:
         store.close()
 
@@ -1661,6 +1662,7 @@ def test_held_position_closes_during_drain_final_flat(tmp_path) -> None:
 def test_held_position_does_not_close_before_drain_deadline_preserves_position(tmp_path) -> None:
     sim_time = [NOW]
     broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path, time_ref=sim_time)
+    _accept_close_without_removing_position(api)
     try:
         config = Mt5DemoSoakConfig(
             confirmation=MT5_DEMO_SOAK_CONFIRMATION,
@@ -1687,6 +1689,7 @@ def test_held_position_does_not_close_before_drain_deadline_preserves_position(t
 def test_no_duplicate_close_or_order_mutation_during_drain(tmp_path) -> None:
     sim_time = [NOW]
     broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path, time_ref=sim_time)
+    _accept_close_without_removing_position(api)
     try:
         config = Mt5DemoSoakConfig(
             confirmation=MT5_DEMO_SOAK_CONFIRMATION,
@@ -1701,8 +1704,8 @@ def test_no_duplicate_close_or_order_mutation_during_drain(tmp_path) -> None:
         )
         runner = Mt5DemoSoakRunner()
         res = runner.run(config, broker=broker, ledger=ledger)
-        # Exactly 1 order was sent for entry, zero mutations during drain
-        assert api.order_send_count == 1
+        # Exactly one entry and one controlled close request were sent.
+        assert api.order_send_count == 2
         assert res.active_position_id is not None
     finally:
         store.close()
@@ -1734,6 +1737,203 @@ def test_keyboard_interrupt_while_holding_preserves_exposure(tmp_path) -> None:
         assert res.stop_reason == "operator_interrupted_with_open_position"
         assert res.active_position_id is not None
         assert "operator interrupted while position" in (res.error_message or "")
+    finally:
+        store.close()
+
+
+def test_drain_pending_close_is_observed_without_resubmission(tmp_path) -> None:
+    sim_time = [NOW]
+    broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path, time_ref=sim_time)
+    _accept_close_without_removing_position(api)
+    removed_positions: list[object] = []
+
+    def close_later(dt: float) -> None:
+        sim_time[0] += timedelta(seconds=dt)
+        if (sim_time[0] - NOW).total_seconds() >= 5.0 and api.positions:
+            removed_positions.append(api.positions.pop(0))
+        if (
+            (sim_time[0] - NOW).total_seconds() >= 6.0
+            and removed_positions
+            and not api.history_deals
+        ):
+            position = removed_positions[0]
+            api.history_deals.append(
+                SimpleNamespace(
+                    ticket=8002,
+                    order=7002,
+                    position_id=position.ticket,
+                    entry=api.DEAL_ENTRY_OUT,
+                    symbol="EURUSD",
+                    magic=1180191810,
+                    volume=0.01,
+                    profit=-0.25,
+                    reason=api.DEAL_REASON_EXPERT,
+                )
+            )
+
+    config = Mt5DemoSoakConfig(
+        confirmation=MT5_DEMO_SOAK_CONFIRMATION,
+        max_loss_usd=1.0,
+        max_entries=5,
+        max_duration_seconds=3.0,
+        drain_timeout_seconds=5.0,
+        max_quote_age_seconds=5.0,
+        poll_interval_seconds=1.0,
+        clock=clock_fn,
+        sleeper=close_later,
+    )
+    try:
+        result = Mt5DemoSoakRunner().run(config, broker=broker, ledger=ledger)
+        assert result.status == "completed"
+        assert result.stop_reason == "max_duration_reached"
+        assert result.active_position_id is None
+        assert api.order_send_count == 2
+        closed_events = [
+            event
+            for event in store.load_events()
+            if event.event_type is AuditEventType.POSITION_CLOSED
+        ]
+        assert len(closed_events) == 1
+        assert closed_events[0].payload["realized_pnl"] == -0.25
+    finally:
+        store.close()
+
+
+def test_drain_immediate_flat_waits_for_delayed_close_history(tmp_path) -> None:
+    sim_time = [NOW]
+    broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path, time_ref=sim_time)
+    original_order_send = api.order_send
+    closed_position: list[object] = []
+
+    def order_send(request: dict[str, object]) -> object:
+        if "position" not in request:
+            return original_order_send(request)
+        api.calls.append(("order_send", dict(request)))
+        api.order_send_count += 1
+        closed_position.extend(api.positions)
+        api.positions.clear()
+        return api.close_result
+
+    def publish_history_later(dt: float) -> None:
+        sim_time[0] += timedelta(seconds=dt)
+        if (
+            (sim_time[0] - NOW).total_seconds() >= 5.0
+            and closed_position
+            and not api.history_deals
+        ):
+            position = closed_position[0]
+            api.history_deals.append(
+                SimpleNamespace(
+                    ticket=8002,
+                    order=7002,
+                    position_id=position.ticket,
+                    entry=api.DEAL_ENTRY_OUT,
+                    symbol="EURUSD",
+                    magic=1180191810,
+                    volume=0.01,
+                    profit=0.0,
+                    reason=api.DEAL_REASON_CLIENT,
+                )
+            )
+
+    api.order_send = order_send  # type: ignore[method-assign]
+    config = Mt5DemoSoakConfig(
+        confirmation=MT5_DEMO_SOAK_CONFIRMATION,
+        max_loss_usd=1.0,
+        max_entries=5,
+        max_duration_seconds=3.0,
+        drain_timeout_seconds=5.0,
+        max_quote_age_seconds=5.0,
+        poll_interval_seconds=1.0,
+        clock=clock_fn,
+        sleeper=publish_history_later,
+    )
+    try:
+        result = Mt5DemoSoakRunner().run(config, broker=broker, ledger=ledger)
+        assert result.status == "completed"
+        assert result.stop_reason == "max_duration_reached"
+        assert result.active_position_id is None
+        assert api.order_send_count == 2
+    finally:
+        store.close()
+
+def test_drain_pending_close_timeout_preserves_exact_residual(tmp_path) -> None:
+    sim_time = [NOW]
+    broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path, time_ref=sim_time)
+    _accept_close_without_removing_position(api)
+    config = Mt5DemoSoakConfig(
+        confirmation=MT5_DEMO_SOAK_CONFIRMATION,
+        max_loss_usd=1.0,
+        max_entries=5,
+        max_duration_seconds=2.0,
+        drain_timeout_seconds=3.0,
+        max_quote_age_seconds=5.0,
+        poll_interval_seconds=1.0,
+        clock=clock_fn,
+        sleeper=lambda dt: sim_time.__setitem__(0, sim_time[0] + timedelta(seconds=dt)),
+    )
+    try:
+        result = Mt5DemoSoakRunner().run(config, broker=broker, ledger=ledger)
+        assert result.status == "stopped"
+        assert result.stop_reason == "drain_timeout_with_open_position"
+        assert result.active_position_id == "9001"
+        assert api.order_send_count == 2
+    finally:
+        store.close()
+
+
+def test_drain_close_rejection_is_surfaced_without_retry(tmp_path) -> None:
+    sim_time = [NOW]
+    broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path, time_ref=sim_time)
+    api.close_result = SimpleNamespace(retcode=api.TRADE_RETCODE_REJECT, order=0, deal=0)
+    config = Mt5DemoSoakConfig(
+        confirmation=MT5_DEMO_SOAK_CONFIRMATION,
+        max_loss_usd=1.0,
+        max_entries=5,
+        max_duration_seconds=2.0,
+        drain_timeout_seconds=3.0,
+        max_quote_age_seconds=5.0,
+        poll_interval_seconds=1.0,
+        clock=clock_fn,
+        sleeper=lambda dt: sim_time.__setitem__(0, sim_time[0] + timedelta(seconds=dt)),
+    )
+    try:
+        result = Mt5DemoSoakRunner().run(config, broker=broker, ledger=ledger)
+        assert result.status == "failed"
+        assert result.stop_reason == "mt5_close_broker_rejected"
+        assert result.active_position_id == "9001"
+        assert api.order_send_count == 2
+        assert AuditEventType.ORDER_REJECTED in [event.event_type for event in store.load_events()]
+    finally:
+        store.close()
+
+
+def test_drain_refuses_foreign_position_without_close_submission(tmp_path) -> None:
+    sim_time = [NOW]
+    broker, ledger, api, store, clock_fn = _soak_fixture(tmp_path, time_ref=sim_time)
+
+    def make_position_foreign(dt: float) -> None:
+        sim_time[0] += timedelta(seconds=dt)
+        if api.positions:
+            api.positions[0].magic = 999
+
+    config = Mt5DemoSoakConfig(
+        confirmation=MT5_DEMO_SOAK_CONFIRMATION,
+        max_loss_usd=1.0,
+        max_entries=5,
+        max_duration_seconds=2.0,
+        drain_timeout_seconds=3.0,
+        max_quote_age_seconds=5.0,
+        poll_interval_seconds=1.0,
+        clock=clock_fn,
+        sleeper=make_position_foreign,
+    )
+    try:
+        result = Mt5DemoSoakRunner().run(config, broker=broker, ledger=ledger)
+        assert result.status == "failed"
+        assert result.stop_reason == "close_pre_submission_failed"
+        assert result.active_position_id == "9001"
+        assert api.order_send_count == 1
     finally:
         store.close()
 

@@ -10,7 +10,7 @@ from enum import StrEnum
 from threading import Lock
 
 from ..risk.engine import KillSwitchReason, RiskEngine, RiskLimits
-from .broker import Tick
+from .broker import BrokerMutationPhase, BrokerOrderRejected, Tick
 from .broker_capabilities import BrokerCapability
 from .event_ledger import (
     AuditComponent,
@@ -141,6 +141,8 @@ class Mt5DemoSession:
     _active_position_id: str | None = field(default=None, init=False)
     _active_client_order_id: str | None = field(default=None, init=False)
     _active_broker_order_id: str | None = field(default=None, init=False)
+    _pending_close_order_id: str | None = field(default=None, init=False)
+    _pending_close_deal_id: str | None = field(default=None, init=False)
     _reconciliation_required: bool = field(default=False, init=False)
     _failed_reason: RuntimeControlReason | None = field(default=None, init=False)
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
@@ -402,6 +404,8 @@ class Mt5DemoSession:
             self._active_position_id = None
             self._active_client_order_id = None
             self._active_broker_order_id = None
+            self._pending_close_order_id = None
+            self._pending_close_deal_id = None
 
     def _record_realized_close(self, realized_pnl: object, now: datetime) -> bool:
         if (
@@ -668,7 +672,97 @@ class Mt5DemoSession:
             if len(positions_active) == 1:
                 # Position is still active on broker
                 if force_close:
-                    close_order_id, close_deal_id = self.broker.close_position(active_pos_id)
+                    close_request_correlation = EventCorrelation(
+                        client_order_id=self._active_client_order_id,
+                        broker_order_id=self._active_broker_order_id,
+                        position_id=active_pos_id,
+                    )
+                    self.event_ledger.append(
+                        AuditEventType.ORDER_SUBMISSION_ATTEMPTED,
+                        occurred_at=now,
+                        component=AuditComponent.BROKER_ADAPTER,
+                        correlation=close_request_correlation,
+                        payload={
+                            "operation": "close",
+                            "symbol": MT5_DEMO_SYMBOL,
+                            "position_id": active_pos_id,
+                        },
+                    )
+                    try:
+                        close_order_id, close_deal_id = self.broker.close_position(active_pos_id)
+                    except BrokerOrderRejected as exc:
+                        self.event_ledger.append(
+                            AuditEventType.ORDER_REJECTED,
+                            occurred_at=now,
+                            component=AuditComponent.BROKER_ADAPTER,
+                            correlation=close_request_correlation,
+                            payload={"operation": "close", "reason": exc.reason},
+                        )
+                        return Mt5SessionCycleResult(
+                            kind=Mt5SessionCycleKind.FAILED,
+                            current_time=now,
+                            tick=tick,
+                            position_id=active_pos_id,
+                            reason=exc.reason,
+                            message="broker rejected the controlled close",
+                        )
+                    except Exception:
+                        mutation_phase = self.broker.mutation_phase
+                        if mutation_phase is BrokerMutationPhase.POST_MUTATION_RECONCILIATION:
+                            self.event_ledger.append(
+                                AuditEventType.ORDER_SUBMISSION_INDETERMINATE,
+                                occurred_at=now,
+                                component=AuditComponent.BROKER_ADAPTER,
+                                correlation=close_request_correlation,
+                                payload={
+                                    "operation": "close",
+                                    "phase": mutation_phase.value,
+                                },
+                            )
+                            return Mt5SessionCycleResult(
+                                kind=Mt5SessionCycleKind.POSITION_HELD,
+                                current_time=now,
+                                tick=tick,
+                                position_id=active_pos_id,
+                                reason="close_submission_pending",
+                                message="controlled close requires observation",
+                            )
+                        if mutation_phase is BrokerMutationPhase.MUTATION_ATTEMPTED:
+                            self.event_ledger.append(
+                                AuditEventType.ORDER_SUBMISSION_INDETERMINATE,
+                                occurred_at=now,
+                                component=AuditComponent.BROKER_ADAPTER,
+                                correlation=close_request_correlation,
+                                payload={
+                                    "operation": "close",
+                                    "phase": mutation_phase.value,
+                                },
+                            )
+                            self._reconciliation_required = True
+                            return Mt5SessionCycleResult(
+                                kind=Mt5SessionCycleKind.RECONCILIATION_REQUIRED,
+                                current_time=now,
+                                tick=tick,
+                                position_id=active_pos_id,
+                                reason="close_outcome_reconciliation_required",
+                                message="controlled close outcome is ambiguous",
+                            )
+                        self.event_ledger.append(
+                            AuditEventType.EXECUTION_FAILED,
+                            occurred_at=now,
+                            component=AuditComponent.BROKER_ADAPTER,
+                            correlation=close_request_correlation,
+                            payload={"operation": "close", "reason": "pre_submission"},
+                        )
+                        return Mt5SessionCycleResult(
+                            kind=Mt5SessionCycleKind.FAILED,
+                            current_time=now,
+                            tick=tick,
+                            position_id=active_pos_id,
+                            reason="close_pre_submission_failed",
+                            message="controlled close failed before submission",
+                        )
+
                     realized_pnl = self._reconcile_close_deal(
                         position_id=active_pos_id,
                         close_order_id=close_order_id,
@@ -676,13 +770,16 @@ class Mt5DemoSession:
                         now=now,
                     )
                     if realized_pnl is None:
-                        self._reconciliation_required = True
+                        with self._lock:
+                            self._pending_close_order_id = close_order_id
+                            self._pending_close_deal_id = close_deal_id
                         return Mt5SessionCycleResult(
-                            kind=Mt5SessionCycleKind.RECONCILIATION_REQUIRED,
+                            kind=Mt5SessionCycleKind.POSITION_HELD,
                             current_time=now,
+                            tick=tick,
                             position_id=active_pos_id,
-                            reason="close_outcome_reconciliation_required",
-                            message="close deal outcome could not be reconciled",
+                            reason="close_submission_pending",
+                            message="controlled close history is not yet authoritative",
                         )
                     correlation = EventCorrelation(
                         client_order_id=self._active_client_order_id,
@@ -732,8 +829,95 @@ class Mt5DemoSession:
                 )
 
             if len(positions_active) == 0:
+                with self._lock:
+                    pending_close_order_id = self._pending_close_order_id
+                    pending_close_deal_id = self._pending_close_deal_id
+
+                if (pending_close_order_id is None) != (pending_close_deal_id is None):
+                    self._reconciliation_required = True
+                    return Mt5SessionCycleResult(
+                        kind=Mt5SessionCycleKind.RECONCILIATION_REQUIRED,
+                        current_time=now,
+                        tick=tick,
+                        position_id=active_pos_id,
+                        reason="close_outcome_reconciliation_required",
+                        message="pending close identity is incomplete",
+                    )
+
+                if pending_close_order_id is not None:
+                    realized_pnl = self._reconcile_close_deal(
+                        position_id=active_pos_id,
+                        close_order_id=pending_close_order_id,
+                        close_deal_id=pending_close_deal_id,
+                        now=now,
+                    )
+                    if realized_pnl is None:
+                        return Mt5SessionCycleResult(
+                            kind=Mt5SessionCycleKind.POSITION_HELD,
+                            current_time=now,
+                            tick=tick,
+                            position_id=active_pos_id,
+                            reason="close_reconciliation_pending",
+                            message="close history is not yet authoritative",
+                        )
+                    correlation = EventCorrelation(
+                        client_order_id=self._active_client_order_id,
+                        broker_order_id=self._active_broker_order_id,
+                        position_id=active_pos_id,
+                        close_order_id=pending_close_order_id,
+                    )
+                    self.event_ledger.append(
+                        AuditEventType.POSITION_CLOSED,
+                        occurred_at=now,
+                        component=AuditComponent.BROKER_ADAPTER,
+                        correlation=correlation,
+                        payload={
+                            "symbol": MT5_DEMO_SYMBOL,
+                            "position_id": active_pos_id,
+                            "close_order_id": pending_close_order_id,
+                            "close_deal_id": pending_close_deal_id,
+                            "exit_reason": "MANUAL",
+                            "realized_pnl": realized_pnl,
+                            "reconciliation": "CONTROLLED_CLOSE_HISTORY_MATCH",
+                        },
+                    )
+                    self._clear_active_position()
+                    return Mt5SessionCycleResult(
+                        kind=Mt5SessionCycleKind.POSITION_CLOSED,
+                        current_time=now,
+                        tick=tick,
+                        position_id=active_pos_id,
+                        close_order_id=pending_close_order_id,
+                        close_deal_id=pending_close_deal_id,
+                        exit_reason="MANUAL",
+                        reason="position_closed",
+                        message="controlled close confirmed from broker history",
+                    )
                 # Native SL/TP exit occurred while holding!
-                close_order_id, close_deal_id = self.broker.close_position(active_pos_id)
+                try:
+                    close_order_id, close_deal_id = self.broker.close_position(active_pos_id)
+                except Exception:
+                    if (
+                        self.broker.mutation_phase
+                        is BrokerMutationPhase.POST_MUTATION_RECONCILIATION
+                    ):
+                        return Mt5SessionCycleResult(
+                            kind=Mt5SessionCycleKind.POSITION_HELD,
+                            current_time=now,
+                            tick=tick,
+                            position_id=active_pos_id,
+                            reason="close_reconciliation_pending",
+                            message="close history is not yet authoritative",
+                        )
+                    self._reconciliation_required = True
+                    return Mt5SessionCycleResult(
+                        kind=Mt5SessionCycleKind.RECONCILIATION_REQUIRED,
+                        current_time=now,
+                        tick=tick,
+                        position_id=active_pos_id,
+                        reason="close_outcome_reconciliation_required",
+                        message="close history could not be reconciled",
+                    )
                 order_status = self.broker.get_order_status(self._active_client_order_id or "")
                 exit_reason = str(order_status.get("exit_reason", "SL"))
                 realized_pnl = self._reconcile_close_deal(

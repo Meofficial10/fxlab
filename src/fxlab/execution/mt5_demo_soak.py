@@ -194,6 +194,7 @@ class Mt5DemoSoakRunner:
         error_msg: str | None = None
         draining = False
         drain_start_time: datetime | None = None
+        drain_close_pending = False
 
         # 2. Start session and run startup reconciliation
         session.start()
@@ -291,8 +292,14 @@ class Mt5DemoSoakRunner:
 
                 # State-dependent cycle polling
                 if session.active_position_id is not None:
-                    # Active position is open -> Monitor position only (no new orders)
-                    cycle_res = session.poll_cycle(signal=None, current_time=now)
+                    request_close = draining and not drain_close_pending
+                    cycle_res = session.poll_cycle(
+                        signal=None,
+                        force_close=request_close,
+                        current_time=now,
+                    )
+                    if cycle_res.reason == "close_submission_pending":
+                        drain_close_pending = True
                     if cycle_res.kind == Mt5SessionCycleKind.POSITION_CLOSED:
                         last_close_time = now
                         if draining:

@@ -238,9 +238,7 @@ class Mt5DemoBroker:
             open_positions=open_positions,
         )
 
-    def pip_valuation(
-        self, symbol: str, account_currency: str, as_of: datetime
-    ) -> PipValuation:
+    def pip_valuation(self, symbol: str, account_currency: str, as_of: datetime) -> PipValuation:
         if symbol != MT5_DEMO_SYMBOL:
             raise ValueError("unsupported_mt5_symbol")
         if account_currency != "USD":
@@ -586,6 +584,14 @@ class Mt5DemoBroker:
         if len(positions) == 0:
             # Position has disappeared from active positions.
             # Reconcile authoritatively from history.
+            pending_close_order_id = _positive_int(pos_info.get("pending_close_order_id"))
+            pending_close_deal_id = _positive_int(pos_info.get("pending_close_deal_id"))
+            if (pending_close_order_id is None) != (pending_close_deal_id is None):
+                raise RuntimeError("mt5_close_pending_identity_incomplete")
+            if pending_close_order_id is not None:
+                with self._lock:
+                    self._mutation_phase = BrokerMutationPhase.POST_MUTATION_RECONCILIATION
+
             history_deals = _query(
                 self.api,
                 "history_deals_get",
@@ -603,6 +609,10 @@ class Mt5DemoBroker:
                 and getattr(d, "entry", None) == deal_entry_out
                 and getattr(d, "symbol", None) == MT5_DEMO_SYMBOL
                 and getattr(d, "magic", None) == MT5_DEMO_MAGIC
+                and (
+                    pending_close_deal_id is None
+                    or getattr(d, "ticket", None) == pending_close_deal_id
+                )
             ]
             if len(matching_deals) == 0:
                 raise RuntimeError("mt5_close_history_missing")
@@ -614,20 +624,27 @@ class Mt5DemoBroker:
             if not _same_number(deal_vol, float(pos_info["volume"])):
                 raise RuntimeError("mt5_close_history_volume_mismatch")
 
-            deal_reason = getattr(closing_deal, "reason", None)
-            if deal_reason == deal_reason_sl:
-                exit_reason = "SL"
-            elif deal_reason == deal_reason_tp:
-                exit_reason = "TP"
-            else:
-                raise RuntimeError("mt5_close_history_unsupported_reason")
-
             close_deal_id = _positive_int(getattr(closing_deal, "ticket", None))
             close_order_id = _positive_int(getattr(closing_deal, "order", None))
             if close_deal_id is None:
                 raise RuntimeError("mt5_close_missing_deal_id")
             if close_order_id is None:
                 raise RuntimeError("mt5_close_missing_order_id")
+
+            deal_reason = getattr(closing_deal, "reason", None)
+            if pending_close_order_id is not None:
+                if (
+                    close_order_id != pending_close_order_id
+                    or close_deal_id != pending_close_deal_id
+                ):
+                    raise RuntimeError("mt5_close_history_pending_identity_mismatch")
+                exit_reason = "MANUAL"
+            elif deal_reason == deal_reason_sl:
+                exit_reason = "SL"
+            elif deal_reason == deal_reason_tp:
+                exit_reason = "TP"
+            else:
+                raise RuntimeError("mt5_close_history_unsupported_reason")
 
             remaining = _query(
                 self.api,
@@ -717,6 +734,8 @@ class Mt5DemoBroker:
 
         with self._lock:
             self._mutation_phase = BrokerMutationPhase.POST_MUTATION_RECONCILIATION
+            pos_info["pending_close_order_id"] = close_order_id
+            pos_info["pending_close_deal_id"] = close_deal_id
 
         remaining = _query(
             self.api,
@@ -938,9 +957,7 @@ def _protective_stop_buy(
     risk_dec = _decimal(max_loss_usd)
     vol_dec = _decimal(volume)
     contract_dec = (
-        _decimal(contract_size)
-        if contract_size is not None
-        else _contract_size(metadata)
+        _decimal(contract_size) if contract_size is not None else _contract_size(metadata)
     )
     if (
         point is None
@@ -1005,9 +1022,7 @@ def _protective_stop_sell(
     risk_dec = _decimal(max_loss_usd)
     vol_dec = _decimal(volume)
     contract_dec = (
-        _decimal(contract_size)
-        if contract_size is not None
-        else _contract_size(metadata)
+        _decimal(contract_size) if contract_size is not None else _contract_size(metadata)
     )
     if (
         point is None
