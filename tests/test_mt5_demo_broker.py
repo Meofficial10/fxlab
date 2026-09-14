@@ -111,7 +111,7 @@ class FakeMt5Api:
 
     def initialize(self) -> bool:
         self.calls.append("initialize")
-        return True
+        return getattr(self, "initialize_result", True)
 
     def shutdown(self) -> None:
         self.calls.append("shutdown")
@@ -123,6 +123,10 @@ class FakeMt5Api:
     def account_info(self) -> object:
         self.calls.append("account_info")
         return self.account
+
+    def version(self) -> tuple[int, int, str]:
+        self.calls.append("version")
+        return (500, 4410, "1 Sep 2024")
 
     def symbol_info(self, symbol: str) -> object:
         self.calls.append(("symbol_info", symbol))
@@ -143,12 +147,34 @@ class FakeMt5Api:
     def positions_get(self, **query: object) -> tuple[object, ...] | None:
         self.calls.append(("positions_get", tuple(sorted(query.items()))))
         if "ticket" in query:
-            return tuple(item for item in self.positions if item.ticket == query["ticket"])
-        return tuple(item for item in self.positions if item.symbol == query.get("symbol"))
+            return tuple(
+                item
+                for item in self.positions
+                if getattr(item, "ticket", None) == query["ticket"]
+            )
+        if "symbol" in query and query["symbol"] is not None:
+            return tuple(
+                item
+                for item in self.positions
+                if getattr(item, "symbol", None) == query["symbol"]
+            )
+        return tuple(self.positions)
 
     def orders_get(self, **query: object) -> tuple[object, ...] | None:
         self.calls.append(("orders_get", tuple(sorted(query.items()))))
-        return tuple(item for item in self.orders if item.symbol == query.get("symbol"))
+        if "ticket" in query:
+            return tuple(
+                item
+                for item in self.orders
+                if getattr(item, "ticket", None) == query["ticket"]
+            )
+        if "symbol" in query and query["symbol"] is not None:
+            return tuple(
+                item
+                for item in self.orders
+                if getattr(item, "symbol", None) == query["symbol"]
+            )
+        return tuple(self.orders)
 
     def history_deals_get(self, **query: object) -> tuple[object, ...] | None:
         self.calls.append(("history_deals_get", tuple(sorted(query.items()))))
@@ -2316,3 +2342,144 @@ def test_unrelated_close_reason_cannot_masquerade_without_exact_ids(
 
     with pytest.raises(RuntimeError, match="mt5_close_history_missing"):
         broker.close_position("9001")
+
+
+def test_get_account_exposure_flat() -> None:
+    api = FakeMt5Api()
+    broker = Mt5DemoBroker(api=api)
+    broker.connect()
+
+    exposure = broker.get_account_exposure()
+    assert exposure.account_id == "12345678"
+    assert exposure.server == "Pepperstone-Demo"
+    assert exposure.environment == "demo"
+    assert exposure.open_positions == ()
+    assert exposure.pending_orders == ()
+    assert exposure.is_flat is True
+
+
+def test_get_account_exposure_multiple_positions_and_orders() -> None:
+    api = FakeMt5Api()
+    api.positions = [
+        SimpleNamespace(
+            ticket=9001,
+            symbol="EURUSD",
+            volume=0.01,
+            type=0,
+            magic=123,
+            comment="test_pos1",
+        ),
+        SimpleNamespace(
+            ticket=9002,
+            symbol="GBPUSD",
+            volume=0.05,
+            type=1,
+            magic=None,
+            comment="",
+        ),
+    ]
+    api.orders = [
+        SimpleNamespace(
+            ticket=7001,
+            symbol="USDJPY",
+            volume_initial=0.02,
+            type=2,
+            magic=456,
+            comment="pending1",
+        )
+    ]
+    broker = Mt5DemoBroker(api=api)
+    broker.connect()
+
+    exposure = broker.get_account_exposure()
+    assert exposure.is_flat is False
+    assert len(exposure.open_positions) == 2
+    assert exposure.open_positions[0].position_id == "9001"
+    assert exposure.open_positions[0].symbol == "EURUSD"
+    assert exposure.open_positions[0].volume == 0.01
+    assert exposure.open_positions[0].magic == 123
+    assert exposure.open_positions[1].position_id == "9002"
+    assert exposure.open_positions[1].symbol == "GBPUSD"
+    assert exposure.open_positions[1].volume == 0.05
+    assert exposure.open_positions[1].magic is None
+
+    assert len(exposure.pending_orders) == 1
+    assert exposure.pending_orders[0].order_id == "7001"
+    assert exposure.pending_orders[0].symbol == "USDJPY"
+    assert exposure.pending_orders[0].volume == 0.02
+    assert exposure.pending_orders[0].magic == 456
+
+
+def test_get_account_exposure_malformed_position_ticket() -> None:
+    api = FakeMt5Api()
+    api.positions = [
+        SimpleNamespace(
+            ticket="bad_ticket",
+            symbol="EURUSD",
+            volume=0.01,
+            type=0,
+            magic=None,
+            comment="",
+        )
+    ]
+    broker = Mt5DemoBroker(api=api)
+    broker.connect()
+
+    with pytest.raises(RuntimeError, match="malformed_position_identity"):
+        broker.get_account_exposure()
+
+
+def test_get_account_exposure_malformed_position_volume() -> None:
+    api = FakeMt5Api()
+    api.positions = [
+        SimpleNamespace(
+            ticket=9001,
+            symbol="EURUSD",
+            volume=-1.0,
+            type=0,
+            magic=None,
+            comment="",
+        )
+    ]
+    broker = Mt5DemoBroker(api=api)
+    broker.connect()
+
+    with pytest.raises(RuntimeError, match="malformed_position_identity"):
+        broker.get_account_exposure()
+
+
+def test_get_account_exposure_malformed_order_ticket() -> None:
+    api = FakeMt5Api()
+    api.orders = [
+        SimpleNamespace(
+            ticket=-5,
+            symbol="EURUSD",
+            volume_initial=0.01,
+            type=0,
+            magic=None,
+            comment="",
+        )
+    ]
+    broker = Mt5DemoBroker(api=api)
+    broker.connect()
+
+    with pytest.raises(RuntimeError, match="malformed_order_identity"):
+        broker.get_account_exposure()
+
+
+def test_get_account_exposure_not_connected() -> None:
+    api = FakeMt5Api()
+    broker = Mt5DemoBroker(api=api)
+
+    with pytest.raises(RuntimeError, match="mt5_not_connected"):
+        broker.get_account_exposure()
+
+
+def test_get_account_exposure_non_demo_authority() -> None:
+    api = FakeMt5Api()
+    broker = Mt5DemoBroker(api=api)
+    broker.connect()
+    api.account.trade_mode = api.ACCOUNT_TRADE_MODE_REAL
+
+    with pytest.raises(RuntimeError, match="mt5_demo_account_required"):
+        broker.get_account_exposure()

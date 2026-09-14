@@ -55,6 +55,87 @@ class _Mt5DemoPipResolver:
 
 _MT5_DEMO_RESOLVER = _Mt5DemoPipResolver()
 
+
+@dataclass(frozen=True, slots=True)
+class Mt5ExposurePosition:
+    """Immutable normalized representation of one open position on the MT5 account."""
+
+    position_id: str
+    symbol: str
+    volume: float
+    side: int  # +1 for BUY, -1 for SELL
+    magic: int | None
+    comment: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.position_id, str) or not self.position_id.strip():
+            raise ValueError("position_id must be a non-empty string")
+        if not isinstance(self.symbol, str) or not self.symbol.strip():
+            raise ValueError("symbol must be a non-empty string")
+        if (
+            isinstance(self.volume, bool)
+            or not isinstance(self.volume, (int, float))
+            or not math.isfinite(float(self.volume))
+            or float(self.volume) <= 0
+        ):
+            raise ValueError("volume must be a positive finite number")
+        if self.side not in (1, -1):
+            raise ValueError(f"side must be +1 (buy) or -1 (sell), got {self.side}")
+        if self.magic is not None and (
+            not isinstance(self.magic, int) or isinstance(self.magic, bool)
+        ):
+            raise ValueError("magic must be an integer when provided")
+        if not isinstance(self.comment, str):
+            raise ValueError("comment must be a string")
+
+
+@dataclass(frozen=True, slots=True)
+class Mt5PendingOrder:
+    """Immutable normalized representation of one pending order on the MT5 account."""
+
+    order_id: str
+    symbol: str
+    volume: float | None
+    order_type: int | str | None
+    magic: int | None
+    comment: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.order_id, str) or not self.order_id.strip():
+            raise ValueError("order_id must be a non-empty string")
+        if not isinstance(self.symbol, str) or not self.symbol.strip():
+            raise ValueError("symbol must be a non-empty string")
+        if self.volume is not None and (
+            isinstance(self.volume, bool)
+            or not isinstance(self.volume, (int, float))
+            or not math.isfinite(float(self.volume))
+            or float(self.volume) <= 0
+        ):
+            raise ValueError("volume must be a positive finite number when provided")
+        if self.magic is not None and (
+            not isinstance(self.magic, int) or isinstance(self.magic, bool)
+        ):
+            raise ValueError("magic must be an integer when provided")
+        if not isinstance(self.comment, str):
+            raise ValueError("comment must be a string")
+
+
+@dataclass(frozen=True, slots=True)
+class Mt5AccountExposure:
+    """Read-only snapshot of current account exposure, orders, and identity."""
+
+    account_id: str
+    server: str
+    company: str
+    environment: str
+    open_positions: tuple[Mt5ExposurePosition, ...]
+    pending_orders: tuple[Mt5PendingOrder, ...]
+
+    @property
+    def is_flat(self) -> bool:
+        return len(self.open_positions) == 0 and len(self.pending_orders) == 0
+
+
 _MT5_DEMO_DESCRIPTOR = BrokerDescriptor(
     broker_id="mt5-pepperstone-demo",
     implementation_version="1",
@@ -236,6 +317,125 @@ class Mt5DemoBroker:
             margin_available=margin_free,
             currency="USD",
             open_positions=open_positions,
+        )
+
+    def get_account_exposure(self) -> Mt5AccountExposure:
+        with self._lock:
+            if not self._connected:
+                raise RuntimeError("mt5_not_connected")
+        terminal, account = _verified_demo_authority(self.api)
+
+        positions_raw = _query(self.api, "positions_get", "mt5_position_query_failed")
+        orders_raw = _query(self.api, "orders_get", "mt5_order_query_failed")
+
+        open_positions: list[Mt5ExposurePosition] = []
+        for pos in positions_raw:
+            ticket = getattr(pos, "ticket", None)
+            if (
+                ticket is None
+                or not isinstance(ticket, int)
+                or isinstance(ticket, bool)
+                or ticket <= 0
+            ):
+                raise RuntimeError("malformed_position_identity")
+            symbol = getattr(pos, "symbol", None)
+            if not isinstance(symbol, str) or not symbol.strip():
+                raise RuntimeError("malformed_position_identity")
+            volume = getattr(pos, "volume", None)
+            if (
+                isinstance(volume, bool)
+                or not isinstance(volume, (int, float))
+                or not math.isfinite(float(volume))
+                or float(volume) <= 0
+            ):
+                raise RuntimeError("malformed_position_identity")
+            pos_type = getattr(pos, "type", None)
+            buy_type = getattr(self.api, "POSITION_TYPE_BUY", 0)
+            sell_type = getattr(self.api, "POSITION_TYPE_SELL", 1)
+            if pos_type == buy_type:
+                side = 1
+            elif pos_type == sell_type:
+                side = -1
+            else:
+                raise RuntimeError("malformed_position_identity")
+            magic = getattr(pos, "magic", None)
+            magic_int: int | None = None
+            if magic is not None:
+                if not isinstance(magic, int) or isinstance(magic, bool):
+                    raise RuntimeError("malformed_position_identity")
+                magic_int = int(magic)
+            comment = str(getattr(pos, "comment", "") or "")
+
+            open_positions.append(
+                Mt5ExposurePosition(
+                    position_id=str(ticket),
+                    symbol=symbol.strip(),
+                    volume=float(volume),
+                    side=side,
+                    magic=magic_int,
+                    comment=comment,
+                )
+            )
+
+        pending_orders: list[Mt5PendingOrder] = []
+        for ord_item in orders_raw:
+            ticket = getattr(ord_item, "ticket", None)
+            if (
+                ticket is None
+                or not isinstance(ticket, int)
+                or isinstance(ticket, bool)
+                or ticket <= 0
+            ):
+                raise RuntimeError("malformed_order_identity")
+            symbol = getattr(ord_item, "symbol", None)
+            if not isinstance(symbol, str) or not symbol.strip():
+                raise RuntimeError("malformed_order_identity")
+            vol_init = getattr(
+                ord_item,
+                "volume_initial",
+                getattr(ord_item, "volume_current", getattr(ord_item, "volume", None)),
+            )
+            vol: float | None = None
+            if vol_init is not None:
+                if (
+                    isinstance(vol_init, bool)
+                    or not isinstance(vol_init, (int, float))
+                    or not math.isfinite(float(vol_init))
+                    or float(vol_init) <= 0
+                ):
+                    raise RuntimeError("malformed_order_identity")
+                vol = float(vol_init)
+            ord_type = getattr(ord_item, "type", None)
+            magic = getattr(ord_item, "magic", None)
+            magic_int: int | None = None
+            if magic is not None:
+                if not isinstance(magic, int) or isinstance(magic, bool):
+                    raise RuntimeError("malformed_order_identity")
+                magic_int = int(magic)
+            comment = str(getattr(ord_item, "comment", "") or "")
+
+            pending_orders.append(
+                Mt5PendingOrder(
+                    order_id=str(ticket),
+                    symbol=symbol.strip(),
+                    volume=vol,
+                    order_type=ord_type,
+                    magic=magic_int,
+                    comment=comment,
+                )
+            )
+
+        account_login = str(getattr(account, "login", ""))
+        account_server = str(getattr(account, "server", ""))
+        account_company = str(getattr(account, "company", getattr(terminal, "company", "")))
+
+        return Mt5AccountExposure(
+            account_id=account_login,
+            server=account_server,
+            company=account_company,
+            environment="demo",
+            open_positions=tuple(open_positions),
+            pending_orders=tuple(pending_orders),
         )
 
     def pip_valuation(self, symbol: str, account_currency: str, as_of: datetime) -> PipValuation:

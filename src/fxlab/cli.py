@@ -41,6 +41,11 @@ from .execution.app import (
 )
 from .execution.durable_event_store import SQLiteEventStore
 from .execution.event_ledger import AuditEventType, EventLedger
+from .execution.mt5_demo_gate_b2 import (
+    GATE_B2_CONFIRM_TEXT,
+    Mt5DemoGateB2Config,
+    Mt5DemoGateB2Orchestrator,
+)
 from .execution.mt5_demo_preflight import Mt5DemoPreflight
 from .execution.mt5_demo_runtime import (
     MT5_DEMO_EXECUTION_CONFIRMATION,
@@ -364,6 +369,162 @@ def mt5_demo_soak(
         },
         json_output=False,
     )
+
+
+
+@mt5_app.command("demo-gate-b2")
+def mt5_demo_gate_b2(
+    confirmation: Annotated[str, typer.Option("--confirm")],
+    audit_db_dir: Annotated[Path, typer.Option("--audit-db-dir")],
+    account_id: Annotated[str, typer.Option("--account-id")],
+    account_server: Annotated[str, typer.Option("--account-server")],
+    account_company: Annotated[
+        str | None,
+        typer.Option(
+            "--account-company",
+            help="Expected MT5 company name (optional, frozen from preflight)",
+        ),
+    ] = None,
+    total_runs: Annotated[
+        int,
+        typer.Option(
+            "--total-runs",
+            help="Total sequential runs (must be 5)",
+        ),
+    ] = 5,
+    max_loss_usd: Annotated[
+        float,
+        typer.Option(
+            "--max-loss-usd",
+            help="Maximum modeled adverse price loss in USD used to derive the protective stop",
+        ),
+    ] = 1.0,
+    max_entries_per_run: Annotated[
+        int,
+        typer.Option(
+            "--max-entries-per-run",
+            help="Maximum number of sequential trades per run",
+        ),
+    ] = 2,
+    max_duration_seconds: Annotated[
+        float,
+        typer.Option(
+            "--max-duration-seconds",
+            help="Maximum operational runtime in seconds before stopping new entries in a run",
+        ),
+    ] = 300.0,
+    drain_timeout_seconds: Annotated[
+        float,
+        typer.Option(
+            "--drain-timeout-seconds",
+            help=(
+                "Maximum duration in seconds to monitor an open position "
+                "after main duration expires"
+            ),
+        ),
+    ] = 300.0,
+    max_quote_age_seconds: Annotated[
+        float,
+        typer.Option(
+            "--max-quote-age-seconds",
+            help="Maximum acceptable age of market quotes in seconds",
+        ),
+    ] = 5.0,
+    poll_interval_seconds: Annotated[
+        float,
+        typer.Option(
+            "--poll-interval-seconds",
+            help="Polling cycle interval in seconds",
+        ),
+    ] = 1.0,
+    cooldown_seconds: Annotated[
+        float,
+        typer.Option(
+            "--cooldown-seconds",
+            help="Cooldown in seconds after a position closes before next stimulus in soak",
+        ),
+    ] = 30.0,
+    inter_run_cooldown_seconds: Annotated[
+        float,
+        typer.Option(
+            "--inter-run-cooldown-seconds",
+            help="Cooldown in seconds between sequential soak runs",
+        ),
+    ] = 30.0,
+) -> None:
+    """Run Gate B2 sequential reliability validation (5 bounded DEMO soak runs)."""
+    if confirmation != GATE_B2_CONFIRM_TEXT:
+        console.print("[red]MT5 demo Gate B2 rejected[/red] explicit confirmation required")
+        raise typer.Exit(2)
+
+    try:
+        config = Mt5DemoGateB2Config(
+            confirm_text=confirmation,
+            account_id=account_id,
+            account_server=account_server,
+            account_company=account_company,
+            audit_db_dir=audit_db_dir,
+            total_runs=total_runs,
+            max_loss_usd=max_loss_usd,
+            max_entries_per_run=max_entries_per_run,
+            max_duration_seconds=max_duration_seconds,
+            drain_timeout_seconds=drain_timeout_seconds,
+            max_quote_age_seconds=max_quote_age_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            cooldown_seconds=cooldown_seconds,
+            inter_run_cooldown_seconds=inter_run_cooldown_seconds,
+        )
+    except ValueError as exc:
+        console.print(f"[red]MT5 demo Gate B2 rejected[/red] invalid configuration: {exc}")
+        raise typer.Exit(2) from None
+
+    broker: Mt5DemoBroker | None = None
+    try:
+        from .execution.mt5_demo_broker import Mt5DemoBroker
+
+        broker = Mt5DemoBroker()
+        broker.connect()
+        preflight = Mt5DemoPreflight()
+        orchestrator = Mt5DemoGateB2Orchestrator(
+            broker=broker, config=config, preflight=preflight
+        )
+        result = orchestrator.run_batch()
+    except (RuntimeError, ValueError) as exc:
+        console.print(f"[red]MT5 demo Gate B2 failed[/red] {exc}")
+        raise typer.Exit(1) from None
+    finally:
+        if broker is not None:
+            try:
+                broker.disconnect()
+            except Exception:
+                pass
+
+    _json_or_human(
+        {
+            "status": result.status,
+            "runs_completed": result.runs_completed,
+            "runs_passed": result.runs_passed,
+            "total_realized_pnl_usd": result.total_realized_pnl_usd,
+            "failure_reason": result.failure_reason,
+            "runs": [
+                {
+                    "run_index": r.run_index,
+                    "session_id": r.session_id,
+                    "audit_db_path": str(r.audit_db_path),
+                    "status": r.status,
+                    "entries_completed": r.entries_completed,
+                    "realized_pnl_usd": r.realized_pnl_usd,
+                    "reason": r.reason,
+                    "duration_seconds": r.duration_seconds,
+                    "failure_detail": r.failure_detail,
+                }
+                for r in result.runs
+            ],
+        },
+        json_output=False,
+    )
+    if result.status != "success":
+        raise typer.Exit(1)
 
 
 @mt5_app.command("preflight")
