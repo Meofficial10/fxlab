@@ -134,6 +134,7 @@ class Mt5DemoSession:
     )
     risk_limits: RiskLimits | None = None
     clock: object = field(default=None)
+    disconnect_on_stop: bool = True
 
     _risk_engine: RiskEngine = field(init=False)
     _order_manager: OrderManager = field(init=False)
@@ -492,7 +493,8 @@ class Mt5DemoSession:
             component=AuditComponent.PAPER_SESSION,
             payload={"status": "stopped"},
         )
-        self.broker.disconnect()
+        if self.disconnect_on_stop:
+            self.broker.disconnect()
         return res
 
     def poll_cycle(

@@ -51,6 +51,7 @@ class Mt5DemoSoakConfig:
     cooldown_seconds: float = 30.0
     clock: Callable[[], datetime] | None = None
     sleeper: Callable[[float], None] | None = None
+    disconnect_on_stop: bool = True
 
     def __post_init__(self) -> None:
         if self.confirmation != MT5_DEMO_SOAK_CONFIRMATION:
@@ -184,6 +185,7 @@ class Mt5DemoSoakRunner:
                 max_quote_age=timedelta(seconds=config.max_quote_age_seconds),
                 execution_permit=_issue_soak_execution_permit(config),
                 clock=clock_fn,
+                disconnect_on_stop=config.disconnect_on_stop,
             )
 
         start_time = clock_fn()

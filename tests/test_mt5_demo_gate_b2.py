@@ -181,6 +181,7 @@ def test_gate_b2_preserves_exact_gate_b1_soak_policy(tmp_path: Path) -> None:
         assert soak_cfg.max_quote_age_seconds == 5.0
         assert soak_cfg.poll_interval_seconds == 1.0
         assert soak_cfg.cooldown_seconds == 30.0
+        assert soak_cfg.disconnect_on_stop is False
 
 
 def test_gate_b2_invokes_preflight_before_each_attempted_run(tmp_path: Path) -> None:
@@ -1260,3 +1261,95 @@ def test_read_only_exposure_does_not_grant_order_mutation_authority(tmp_path: Pa
     )
     with pytest.raises(BrokerPreSubmissionRejected, match="mt5_mutation_not_permitted"):
         broker.submit_order(order_req)
+
+
+def test_gate_b2_reproduces_and_fixes_post_run_disconnect_lifecycle_defect(
+    tmp_path: Path,
+) -> None:
+    from tests.test_mt5_demo_soak import SoakFakeMt5Api
+
+    from fxlab.execution.mt5_demo_soak import Mt5DemoSoakRunner
+
+    # 1. Reproduce defect when disconnect_on_stop=True (soak disconnects broker)
+    api_1 = SoakFakeMt5Api()
+    broker_1 = Mt5DemoBroker(api=api_1)
+    broker_1.connect()
+    assert broker_1._connected is True
+
+    store_1 = SQLiteEventStore(tmp_path / "soak_disc.db", "sess_disc")
+    ledger_1 = EventLedger("sess_disc", durable_store=store_1)
+    soak_cfg_disc = Mt5DemoSoakConfig(
+        confirmation="I_CONFIRM_MT5_DEMO_SOAK_NO_REAL_MONEY",
+        max_loss_usd=1.0,
+        max_entries=1,
+        max_duration_seconds=1.0,
+        drain_timeout_seconds=1.0,
+        max_quote_age_seconds=5.0,
+        disconnect_on_stop=True,
+    )
+    runner_1 = Mt5DemoSoakRunner()
+    res_1 = runner_1.run(soak_cfg_disc, broker=broker_1, ledger=ledger_1)
+    assert res_1.status == "completed"
+    assert res_1.stop_reason == "max_duration_reached"
+    # Broker was disconnected by inner session cleanup
+    assert broker_1._connected is False
+    with pytest.raises(RuntimeError, match="mt5_not_connected"):
+        broker_1.get_account_exposure()
+    store_1.close()
+
+    # 2. Prove fix when disconnect_on_stop=False (outer owner retains connection)
+    api_2 = SoakFakeMt5Api()
+    broker_2 = Mt5DemoBroker(api=api_2)
+    broker_2.connect()
+    assert broker_2._connected is True
+
+    store_2 = SQLiteEventStore(tmp_path / "soak_nodisc.db", "sess_nodisc")
+    ledger_2 = EventLedger("sess_nodisc", durable_store=store_2)
+    soak_cfg_nodisc = Mt5DemoSoakConfig(
+        confirmation="I_CONFIRM_MT5_DEMO_SOAK_NO_REAL_MONEY",
+        max_loss_usd=1.0,
+        max_entries=1,
+        max_duration_seconds=1.0,
+        drain_timeout_seconds=1.0,
+        max_quote_age_seconds=5.0,
+        disconnect_on_stop=False,
+    )
+    runner_2 = Mt5DemoSoakRunner()
+    res_2 = runner_2.run(soak_cfg_nodisc, broker=broker_2, ledger=ledger_2)
+    assert res_2.status == "completed"
+    assert res_2.stop_reason == "max_duration_reached"
+    # Broker remains connected for outer owner
+    assert broker_2._connected is True
+    exp_2 = broker_2.get_account_exposure()
+    assert exp_2.is_flat is True
+    store_2.close()
+
+
+def test_standalone_session_and_soak_clean_up_by_default(tmp_path: Path) -> None:
+    from tests.test_mt5_demo_soak import SoakFakeMt5Api
+
+    from fxlab.execution.mt5_demo_soak import Mt5DemoSoakRunner
+
+    api = SoakFakeMt5Api()
+    broker = Mt5DemoBroker(api=api)
+    broker.connect()
+
+    store = SQLiteEventStore(tmp_path / "standalone.db", "sess_std")
+    ledger = EventLedger("sess_std", durable_store=store)
+    soak_cfg = Mt5DemoSoakConfig(
+        confirmation="I_CONFIRM_MT5_DEMO_SOAK_NO_REAL_MONEY",
+        max_loss_usd=1.0,
+        max_entries=1,
+        max_duration_seconds=1.0,
+        drain_timeout_seconds=1.0,
+        max_quote_age_seconds=5.0,
+    )
+    # Default is disconnect_on_stop=True
+    assert soak_cfg.disconnect_on_stop is True
+
+    runner = Mt5DemoSoakRunner()
+    res = runner.run(soak_cfg, broker=broker, ledger=ledger)
+    assert res.status == "completed"
+    assert res.stop_reason == "max_duration_reached"
+    assert broker._connected is False
+    store.close()

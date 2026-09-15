@@ -544,6 +544,7 @@ class Mt5DemoGateB2Orchestrator:
                 max_quote_age_seconds=self._config.max_quote_age_seconds,
                 poll_interval_seconds=self._config.poll_interval_seconds,
                 cooldown_seconds=self._config.cooldown_seconds,
+                disconnect_on_stop=False,
             )
 
             run_start = time.perf_counter()
