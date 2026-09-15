@@ -484,7 +484,7 @@ def mt5_demo_gate_b2(
 
         broker = Mt5DemoBroker()
         broker.connect()
-        preflight = Mt5DemoPreflight()
+        preflight = Mt5DemoPreflight(shutdown_after=False)
         orchestrator = Mt5DemoGateB2Orchestrator(
             broker=broker, config=config, preflight=preflight
         )

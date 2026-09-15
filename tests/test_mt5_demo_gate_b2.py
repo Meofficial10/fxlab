@@ -13,6 +13,7 @@ from tests.test_mt5_demo_broker import FakeMt5Api
 from typer.testing import CliRunner
 
 from fxlab.cli import app
+from fxlab.execution.broker import BrokerMutationPhase, BrokerPreSubmissionRejected
 from fxlab.execution.durable_event_store import SQLiteEventStore
 from fxlab.execution.event_ledger import (
     AuditComponent,
@@ -1177,3 +1178,85 @@ def test_cli_demo_gate_b2_no_order_mutation_during_connection_and_preflight(
     assert result.exit_code == 0
     order_sends = [c for c in api.calls if getattr(c, "action", None) == "order_send"]
     assert len(order_sends) == 0
+
+
+def test_gate_b2_reproduces_and_fixes_preflight_shutdown_exposure_guard_bug(
+    tmp_path: Path,
+) -> None:
+    # 1. Reproduce the bug when preflight uses shutdown_after=True with realistic MT5 shutdown
+    api_buggy = FakeMt5Api()
+    api_buggy.simulate_real_shutdown = True
+    broker_buggy = Mt5DemoBroker(api=api_buggy)
+    broker_buggy.connect()
+
+    preflight_buggy = Mt5DemoPreflight(api=api_buggy, shutdown_after=True)
+    # Preflight runs and shuts down MT5 terminal in its finally block
+    preflight_res = preflight_buggy.run()
+    assert preflight_res.environment == "demo"
+    # Now broker.get_account_exposure() fails because MT5 was shut down
+    with pytest.raises(BrokerPreSubmissionRejected, match="mt5_mutation_not_permitted"):
+        broker_buggy.get_account_exposure()
+
+    # 2. Prove the fix when preflight uses shutdown_after=False
+    api_fixed = FakeMt5Api()
+    api_fixed.simulate_real_shutdown = True
+    broker_fixed = Mt5DemoBroker(api=api_fixed)
+    broker_fixed.connect()
+
+    preflight_fixed = Mt5DemoPreflight(api=api_fixed, shutdown_after=False)
+    # Preflight runs and leaves MT5 terminal connected
+    preflight_res_fixed = preflight_fixed.run()
+    assert preflight_res_fixed.environment == "demo"
+
+    # Pre-run exposure check succeeds while flat
+    exposure = broker_fixed.get_account_exposure()
+    assert exposure.is_flat is True
+    assert exposure.account_id == "12345678"
+
+    # Orchestrator runs all 5 runs successfully
+    config = _make_valid_config(tmp_path)
+    mock_runner = MockSoakRunner(entries_completed=2)
+    orchestrator = Mt5DemoGateB2Orchestrator(
+        broker=broker_fixed,
+        config=config,
+        preflight=preflight_fixed,
+        runner_factory=lambda: mock_runner,
+        sleep_fn=lambda _: None,
+    )
+    batch_res = orchestrator.run_batch()
+    assert batch_res.status == "success"
+    assert batch_res.runs_passed == 5
+    assert len(mock_runner.run_calls) == 5
+
+    # Zero order mutations on MT5 API
+    order_sends = [c for c in api_fixed.calls if getattr(c, "action", None) == "order_send"]
+    assert len(order_sends) == 0
+
+
+def test_read_only_exposure_does_not_grant_order_mutation_authority(tmp_path: Path) -> None:
+    api = FakeMt5Api()
+    broker = Mt5DemoBroker(api=api)
+    broker.connect()
+
+    # Pre-mutation phase before exposure
+    assert broker.mutation_phase == BrokerMutationPhase.PRE_MUTATION
+
+    # Reading exposure must NOT change mutation phase
+    exposure = broker.get_account_exposure()
+    assert exposure.is_flat is True
+    assert broker.mutation_phase == BrokerMutationPhase.PRE_MUTATION
+
+    # Direct order submission without trading authority fails with mt5_mutation_not_permitted
+    api.terminal.trade_allowed = False
+    from fxlab.execution.broker import OrderRequest
+
+    order_req = OrderRequest(
+        symbol="EURUSD",
+        side=1,
+        size=0.01,
+        order_type="market",
+        order_id="unauth_1",
+        sl_price=1.0900,
+    )
+    with pytest.raises(BrokerPreSubmissionRejected, match="mt5_mutation_not_permitted"):
+        broker.submit_order(order_req)

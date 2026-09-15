@@ -52,6 +52,7 @@ class Mt5DemoPreflight:
     """Inspect local terminal/account state without exposing an order API."""
 
     api: object = field(default_factory=_load_mt5, repr=False)
+    shutdown_after: bool = True
 
     def run(self, *, quote: str | None = None) -> Mt5PreflightResult:
         selected = _selected_symbol(quote)
@@ -71,13 +72,14 @@ class Mt5DemoPreflight:
             result = _validated_result(self.api, terminal, account)
             return replace(result, quote=_read_quote(self.api, selected)) if selected else result
         finally:
-            shutdown = getattr(self.api, "shutdown", None)
-            if callable(shutdown):
-                try:
-                    shutdown()
-                except Exception:
-                    if initialized:
-                        raise RuntimeError("mt5_shutdown_failed") from None
+            if self.shutdown_after:
+                shutdown = getattr(self.api, "shutdown", None)
+                if callable(shutdown):
+                    try:
+                        shutdown()
+                    except Exception:
+                        if initialized:
+                            raise RuntimeError("mt5_shutdown_failed") from None
 
 
 def _selected_symbol(value: str | None) -> str | None:

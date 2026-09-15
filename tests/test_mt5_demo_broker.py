@@ -108,13 +108,33 @@ class FakeMt5Api:
         )
         self.order_send_count = 0
         self.populate_position_on_order_send = True
+        self.simulate_real_shutdown = False
 
     def initialize(self) -> bool:
         self.calls.append("initialize")
+        if self.simulate_real_shutdown and getattr(self, "initialize_result", True):
+            self.terminal = SimpleNamespace(connected=True, trade_allowed=True)
+            self.account = SimpleNamespace(
+                login=12345678,
+                trade_mode=self.ACCOUNT_TRADE_MODE_DEMO,
+                currency="USD",
+                server="Pepperstone-Demo",
+                company="Pepperstone Group Limited",
+                trade_allowed=True,
+                trade_expert=True,
+                margin_mode=self.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+                balance=10000.0,
+                equity=10000.0,
+                margin=0.0,
+                margin_free=10000.0,
+            )
         return getattr(self, "initialize_result", True)
 
     def shutdown(self) -> None:
         self.calls.append("shutdown")
+        if self.simulate_real_shutdown:
+            self.terminal = None
+            self.account = None
 
     def terminal_info(self) -> object:
         self.calls.append("terminal_info")
