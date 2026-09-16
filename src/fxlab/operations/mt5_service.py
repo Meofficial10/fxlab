@@ -1,6 +1,7 @@
-"""Observation-only MT5 DEMO service composition kernel (Autonomy V1A).
+"""Observation-only MT5 DEMO service composition kernel (Autonomy V1A & V1B).
 
-Runs an unattended, read-only observation lifecycle against MT5 DEMO terminal.
+Runs an unattended, read-only observation lifecycle against MT5 DEMO terminal
+with local authenticated operator control (STATUS, PAUSE, RESUME, STOP).
 Enforces structural zero trade mutations (no execution permits, no order submission,
 no position closing).
 """
@@ -23,10 +24,18 @@ from ..execution.event_ledger import EventLedger
 from ..execution.mt5_demo_broker import MT5_DEMO_SYMBOL, Mt5DemoBroker
 from ..execution.mt5_demo_preflight import Mt5DemoPreflight, _load_mt5
 from ..execution.mt5_demo_session import Mt5DemoSession, Mt5SessionCycleKind
-from ..execution.runtime_control import RuntimeState
-from .control import ServiceState
-from .security import is_safe_local_absolute_path
-from .service import InstanceLock, OperationalLogger
+from ..execution.runtime_control import RuntimeControlReason, RuntimeState
+from .control import (
+    CONTROL_PROTOCOL_VERSION,
+    ControlAction,
+    ControlRequest,
+    ControlResponse,
+    LocalControlServer,
+    ServiceState,
+    freeze_payload,
+)
+from .security import ControlSecret, FileSecretResolver, is_safe_local_absolute_path
+from .service import InstanceLock, OperationalConfig, OperationalLogger
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SAFE_LOG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.jsonl$")
@@ -44,6 +53,10 @@ class Mt5ObservationConfig:
     max_quote_age_seconds: float = 5.0
     max_loss_usd: float = 10.0
     log_filename: str | None = None
+    operator_id: str = "operator"
+    endpoint_id: str | None = None
+    control_secret_file: Path | None = None
+    control_secret: ControlSecret | None = None
     clock: Callable[[], datetime] | None = None
     sleeper: Callable[[float], None] | None = None
     stop_predicate: Callable[[], bool] | None = None
@@ -53,10 +66,20 @@ class Mt5ObservationConfig:
         state = Path(self.state_directory)
         if not is_safe_local_absolute_path(state):
             raise ValueError("state_directory must be an absolute local path without aliases")
-        for name in ("runtime_id", "session_id"):
+        for name in ("runtime_id", "session_id", "operator_id"):
             val = getattr(self, name)
             if not isinstance(val, str) or not _SAFE_ID.fullmatch(val):
                 raise ValueError(f"{name} must be a safe identifier")
+        if self.endpoint_id is not None:
+            if not isinstance(self.endpoint_id, str) or not _SAFE_ID.fullmatch(self.endpoint_id):
+                raise ValueError("endpoint_id must be a safe identifier")
+        if self.control_secret_file is not None:
+            secret_p = Path(self.control_secret_file)
+            if not is_safe_local_absolute_path(secret_p):
+                raise ValueError(
+                    "control_secret_file must be an absolute local path without aliases"
+                )
+            object.__setattr__(self, "control_secret_file", secret_p)
         if self.symbol != MT5_DEMO_SYMBOL:
             raise ValueError(f"unsupported symbol {self.symbol}; must be {MT5_DEMO_SYMBOL}")
         if (
@@ -104,6 +127,23 @@ class Mt5ObservationConfig:
     def log_path(self) -> Path:
         return self.state_directory / (self.log_filename or f"{self.runtime_id}.jsonl")
 
+    @property
+    def operational_config(self) -> OperationalConfig | None:
+        if self.control_secret_file is None and self.control_secret is None:
+            return None
+        secret_path = self.control_secret_file or (
+            self.state_directory / f"{self.runtime_id}.secret"
+        )
+        return OperationalConfig(
+            format_version=1,
+            state_directory=self.state_directory,
+            runtime_id=self.runtime_id,
+            operator_id=self.operator_id,
+            control_secret_file=secret_path,
+            endpoint_id=self.endpoint_id or self.runtime_id,
+            log_filename=self.log_filename or f"{self.runtime_id}.jsonl",
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class Mt5ObservationResult:
@@ -129,6 +169,7 @@ class Mt5DemoObservationService:
         api: object | None = None,
         broker: Mt5DemoBroker | None = None,
         preflight: Mt5DemoPreflight | None = None,
+        control_server: LocalControlServer | None = None,
     ) -> None:
         if not isinstance(config, Mt5ObservationConfig):
             raise ValueError("validated_observation_config_required")
@@ -136,12 +177,15 @@ class Mt5DemoObservationService:
         self.api = api
         self.broker = broker
         self.preflight = preflight
+        self._control_server = control_server
         self._state = ServiceState.STARTING
         self._state_lock = Lock()
         self._stop_requested = Event()
         self._session: Mt5DemoSession | None = None
         self._logger: OperationalLogger | None = None
         self._ticks_observed = 0
+        self._cycles_completed = 0
+        self._shutdown_reason: str | None = None
 
     @property
     def state(self) -> ServiceState:
@@ -156,6 +200,10 @@ class Mt5DemoObservationService:
     def logger(self) -> OperationalLogger | None:
         return self._logger
 
+    @property
+    def control_server(self) -> LocalControlServer | None:
+        return self._control_server
+
     def request_stop(self) -> None:
         self._stop_requested.set()
 
@@ -163,9 +211,147 @@ class Mt5DemoObservationService:
         with self._state_lock:
             self._state = state
 
+    def handle_control(self, request: object) -> ControlResponse:
+        """Handle incoming local operator control request."""
+        if not isinstance(request, ControlRequest):
+            raise ValueError("validated control request is required")
+
+        with self._state_lock:
+            current_service_state = self._state
+
+        session = self._session
+        runtime_state: RuntimeState | None = None
+        if session is not None:
+            runtime_status = session.runtime_controller.status(
+                reconciliation_required=session.reconciliation_required,
+                kill_switch_active=session.risk_engine.kill_switch_active,
+            )
+            runtime_state = runtime_status.state
+
+        if session is None or current_service_state is not ServiceState.RUNNING:
+            return ControlResponse(
+                CONTROL_PROTOCOL_VERSION,
+                request.request_id,
+                False,
+                False,
+                current_service_state,
+                runtime_state,
+                "service_not_ready" if session is None else "service_not_running",
+            )
+
+        clock_fn = self.config.clock or (lambda: datetime.now(UTC))
+        now = clock_fn()
+
+        if request.action is ControlAction.STATUS:
+            payload = {
+                "service_state": current_service_state.value,
+                "runtime_state": runtime_state.value if runtime_state else "unknown",
+                "symbol": self.config.symbol,
+                "cycles_completed": self._cycles_completed,
+                "ticks_observed": self._ticks_observed,
+                "active_position_id": session.active_position_id or "",
+                "reconciliation_required": session.reconciliation_required,
+                "kill_switch_active": session.risk_engine.kill_switch_active,
+            }
+            return ControlResponse(
+                CONTROL_PROTOCOL_VERSION,
+                request.request_id,
+                True,
+                False,
+                current_service_state,
+                runtime_state,
+                "accepted",
+                freeze_payload(payload),
+            )
+
+        if request.action is ControlAction.PAUSE:
+            res = session.pause(
+                reason=RuntimeControlReason.OPERATOR_PAUSED, current_time=now
+            )
+            runtime_status = session.runtime_controller.status(
+                reconciliation_required=session.reconciliation_required,
+                kill_switch_active=session.risk_engine.kill_switch_active,
+            )
+            if self._logger is not None:
+                self._logger.write(
+                    severity="info" if res.accepted else "warning",
+                    reason_code="operator_paused" if res.accepted else "pause_rejected",
+                    service_state=current_service_state.value,
+                    actor_id=self.config.operator_id,
+                    action="pause",
+                    result="accepted" if res.accepted else "rejected",
+                )
+            return ControlResponse(
+                CONTROL_PROTOCOL_VERSION,
+                request.request_id,
+                res.accepted,
+                res.changed,
+                current_service_state,
+                runtime_status.state,
+                res.reason.value if res.reason else "accepted",
+            )
+
+        if request.action is ControlAction.RESUME:
+            res = session.resume(current_time=now)
+            runtime_status = session.runtime_controller.status(
+                reconciliation_required=session.reconciliation_required,
+                kill_switch_active=session.risk_engine.kill_switch_active,
+            )
+            if self._logger is not None:
+                self._logger.write(
+                    severity="info" if res.accepted else "warning",
+                    reason_code="operator_resumed" if res.accepted else "resume_rejected",
+                    service_state=current_service_state.value,
+                    actor_id=self.config.operator_id,
+                    action="resume",
+                    result="accepted" if res.accepted else "rejected",
+                )
+            return ControlResponse(
+                CONTROL_PROTOCOL_VERSION,
+                request.request_id,
+                res.accepted,
+                res.changed,
+                current_service_state,
+                runtime_status.state,
+                res.reason.value if res.reason else "accepted",
+            )
+
+        if request.action is ControlAction.STOP:
+            self._set_state(ServiceState.STOPPING)
+            self._shutdown_reason = "operator_stopped"
+            self._stop_requested.set()
+            if self._logger is not None:
+                self._logger.write(
+                    severity="info",
+                    reason_code="operator_stopped",
+                    service_state=ServiceState.STOPPING.value,
+                    actor_id=self.config.operator_id,
+                    action="stop",
+                    result="accepted",
+                )
+            return ControlResponse(
+                CONTROL_PROTOCOL_VERSION,
+                request.request_id,
+                True,
+                True,
+                ServiceState.STOPPING,
+                runtime_state,
+                "accepted",
+            )
+
+        return ControlResponse(
+            CONTROL_PROTOCOL_VERSION,
+            request.request_id,
+            False,
+            False,
+            current_service_state,
+            runtime_state,
+            "unsupported_control_action",
+        )
+
     def run(self) -> Mt5ObservationResult:
         lock = InstanceLock(self.config.lock_path, self.config.runtime_id)
-        cycles = 0
+        self._cycles_completed = 0
         self._ticks_observed = 0
         exit_code = AppExitCode.RUNTIME_FAILURE
         reason = "service_failed"
@@ -352,7 +538,20 @@ class Mt5DemoObservationService:
                     error_message="session failed to start",
                 )
 
-            # Phase 6: Observation Polling Loop
+            # Phase 6: Start Local Control Server if configured
+            if self._control_server is None and self.config.operational_config is not None:
+                secret = self.config.control_secret or FileSecretResolver().resolve(
+                    self.config.control_secret_file  # type: ignore[arg-type]
+                )
+                self._control_server = LocalControlServer(
+                    self.config.operational_config,
+                    secret,
+                    self.handle_control,
+                    failure_handler=lambda: self._set_state(ServiceState.FAILED),
+                )
+            if self._control_server is not None:
+                self._control_server.start()
+
             self._set_state(ServiceState.RUNNING)
             logger.write(
                 severity="info",
@@ -366,7 +565,10 @@ class Mt5DemoObservationService:
                     exit_code = AppExitCode.SUCCESS
                     break
 
-                if self.config.max_cycles is not None and cycles >= self.config.max_cycles:
+                if (
+                    self.config.max_cycles is not None
+                    and self._cycles_completed >= self.config.max_cycles
+                ):
                     reason = "max_cycles_reached"
                     exit_code = AppExitCode.SUCCESS
                     break
@@ -381,7 +583,7 @@ class Mt5DemoObservationService:
                     force_close=False,
                     current_time=now,
                 )
-                cycles += 1
+                self._cycles_completed += 1
                 if cycle_res.tick is not None:
                     self._ticks_observed += 1
 
@@ -413,7 +615,7 @@ class Mt5DemoObservationService:
                     sleeper_fn(self.config.poll_interval_seconds)
 
             if self._stop_requested.is_set():
-                reason = "operator_stopped"
+                reason = self._shutdown_reason or "operator_stopped"
                 exit_code = AppExitCode.SUCCESS
 
         except KeyboardInterrupt:
@@ -436,6 +638,13 @@ class Mt5DemoObservationService:
                     pass
         finally:
             self._set_state(ServiceState.STOPPING)
+
+            if self._control_server is not None:
+                try:
+                    self._control_server.close()
+                except Exception:
+                    pass
+
             if session is not None:
                 try:
                     now = None
@@ -481,7 +690,7 @@ class Mt5DemoObservationService:
             service_state=self.state,
             reason=reason,
             session_id=self.config.session_id,
-            cycles_completed=cycles,
+            cycles_completed=self._cycles_completed,
             ticks_observed=self._ticks_observed,
             active_position_id=session.active_position_id if session else None,
             error_message=error_msg,

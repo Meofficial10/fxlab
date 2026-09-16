@@ -1,17 +1,29 @@
-"""Tests for MT5 DEMO observation-only service kernel (Autonomy V1A)."""
+"""Tests for MT5 DEMO observation-only service kernel and operator control (Autonomy V1A & V1B)."""
 
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from fxlab.execution.app import AppExitCode
 from fxlab.execution.mt5_demo_broker import MT5_DEMO_SYMBOL
-from fxlab.operations.control import ServiceState
+from fxlab.execution.runtime_control import RuntimeState
+from fxlab.operations.control import (
+    CONTROL_PROTOCOL_VERSION,
+    ControlAction,
+    ControlRequest,
+    ServiceState,
+    send_control_request,
+)
 from fxlab.operations.mt5_service import (
     Mt5DemoObservationService,
     Mt5ObservationConfig,
 )
+from fxlab.operations.security import ControlSecret
 from fxlab.operations.service import InstanceLock
+from fxlab.risk.engine import KillSwitchReason
 
 NOW = datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
 
@@ -181,6 +193,8 @@ def _make_config(
     clock=None,
     sleeper=None,
     stop_predicate=None,
+    control_secret: ControlSecret | None = None,
+    control_secret_file: Path | None = None,
 ) -> Mt5ObservationConfig:
     return Mt5ObservationConfig(
         state_directory=tmp_path / "state",
@@ -193,6 +207,8 @@ def _make_config(
         clock=clock or (lambda: NOW),
         sleeper=sleeper or (lambda _: None),
         stop_predicate=stop_predicate,
+        control_secret=control_secret,
+        control_secret_file=control_secret_file,
         max_cycles=max_cycles,
     )
 
@@ -492,3 +508,479 @@ def test_no_execution_permit_issued_in_service(tmp_path: Path) -> None:
     session = service.session
     assert session is not None
     assert session.execution_permit is None
+
+
+# ---------------------------------------------------------------------------
+# TEST 15 (V1B): Control server starts only after safe service initialization
+# ---------------------------------------------------------------------------
+def test_control_server_starts_after_initialization(tmp_path: Path) -> None:
+    fake_api = SpyingFakeMt5Api()
+    secret = ControlSecret(b"k" * 32)
+    config = _make_config(tmp_path, max_cycles=2, control_secret=secret)
+    service = Mt5DemoObservationService(config, api=fake_api)
+
+    # Before run, control server is not running
+    assert service.control_server is None
+
+    res = service.run()
+    assert res.exit_code == AppExitCode.SUCCESS
+    assert service.control_server is not None
+
+
+# ---------------------------------------------------------------------------
+# TEST 16 (V1B): STATUS returns current observation state and is read-only
+# ---------------------------------------------------------------------------
+def test_control_status_returns_current_observation_state(tmp_path: Path) -> None:
+    fake_api = SpyingFakeMt5Api()
+    iterations = 0
+    status_response = None
+
+    def status_checking_predicate() -> bool:
+        nonlocal iterations, status_response
+        iterations += 1
+        if iterations == 2:
+            req = ControlRequest(
+                protocol_version=CONTROL_PROTOCOL_VERSION,
+                request_id=str(uuid.uuid4()),
+                action=ControlAction.STATUS,
+            )
+            status_response = service.handle_control(req)
+        return False
+
+    config = _make_config(
+        tmp_path, max_cycles=3, stop_predicate=status_checking_predicate
+    )
+    service = Mt5DemoObservationService(config, api=fake_api)
+
+    res = service.run()
+    assert res.exit_code == AppExitCode.SUCCESS
+
+    assert status_response is not None
+    assert status_response.accepted is True
+    assert status_response.changed is False
+    assert status_response.service_state == ServiceState.RUNNING
+    assert status_response.runtime_state == RuntimeState.RUNNING
+    assert status_response.reason == "accepted"
+
+    # Verify status payload details
+    payload_dict = dict(status_response.payload)
+    assert payload_dict["service_state"] == "running"
+    assert payload_dict["symbol"] == "EURUSD"
+    assert payload_dict["reconciliation_required"] is False
+    assert payload_dict["kill_switch_active"] is False
+
+    # Zero mutations
+    assert len(fake_api.order_send_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# TEST 17 (V1B): Repeated STATUS requests are read-only
+# ---------------------------------------------------------------------------
+def test_repeated_status_requests_are_read_only(tmp_path: Path) -> None:
+    fake_api = SpyingFakeMt5Api()
+    iterations = 0
+    responses: list[object] = []
+
+    def status_checking_predicate() -> bool:
+        nonlocal iterations
+        iterations += 1
+        if iterations <= 2:
+            for _ in range(5):
+                req = ControlRequest(
+                    protocol_version=CONTROL_PROTOCOL_VERSION,
+                    request_id=str(uuid.uuid4()),
+                    action=ControlAction.STATUS,
+                )
+                responses.append(service.handle_control(req))
+        return False
+
+    config = _make_config(
+        tmp_path, max_cycles=2, stop_predicate=status_checking_predicate
+    )
+    service = Mt5DemoObservationService(config, api=fake_api)
+
+    res = service.run()
+    assert res.exit_code == AppExitCode.SUCCESS
+    assert len(responses) == 10
+    for resp in responses:
+        assert resp.accepted is True
+        assert resp.changed is False
+    assert len(fake_api.order_send_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# TEST 18 (V1B): PAUSE stops/pauses observation cycles and produces zero trade mutations
+# ---------------------------------------------------------------------------
+def test_control_pause_pauses_observation_zero_mutations(tmp_path: Path) -> None:
+    fake_api = SpyingFakeMt5Api()
+    iterations = 0
+    pause_response = None
+
+    def pause_predicate() -> bool:
+        nonlocal iterations, pause_response
+        iterations += 1
+        if iterations == 2:
+            req = ControlRequest(
+                protocol_version=CONTROL_PROTOCOL_VERSION,
+                request_id=str(uuid.uuid4()),
+                action=ControlAction.PAUSE,
+            )
+            pause_response = service.handle_control(req)
+        return False
+
+    config = _make_config(
+        tmp_path, max_cycles=4, stop_predicate=pause_predicate
+    )
+    service = Mt5DemoObservationService(config, api=fake_api)
+
+    res = service.run()
+    assert res.exit_code == AppExitCode.SUCCESS
+
+    assert pause_response is not None
+    assert pause_response.accepted is True
+    assert pause_response.changed is True
+    assert pause_response.runtime_state == RuntimeState.PAUSED
+    assert pause_response.reason == "operator_paused"
+
+    # Zero mutations during or after pause
+    assert len(fake_api.order_send_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# TEST 19 (V1B): RESUME restores observation from a valid paused state
+# ---------------------------------------------------------------------------
+def test_control_resume_restores_observation(tmp_path: Path) -> None:
+    fake_api = SpyingFakeMt5Api()
+    iterations = 0
+    resume_response = None
+
+    def pause_resume_predicate() -> bool:
+        nonlocal iterations, resume_response
+        iterations += 1
+        if iterations == 2:
+            pause_req = ControlRequest(
+                protocol_version=CONTROL_PROTOCOL_VERSION,
+                request_id=str(uuid.uuid4()),
+                action=ControlAction.PAUSE,
+            )
+            service.handle_control(pause_req)
+        elif iterations == 3:
+            resume_req = ControlRequest(
+                protocol_version=CONTROL_PROTOCOL_VERSION,
+                request_id=str(uuid.uuid4()),
+                action=ControlAction.RESUME,
+            )
+            resume_response = service.handle_control(resume_req)
+        return False
+
+    config = _make_config(
+        tmp_path, max_cycles=5, stop_predicate=pause_resume_predicate
+    )
+    service = Mt5DemoObservationService(config, api=fake_api)
+
+    res = service.run()
+    assert res.exit_code == AppExitCode.SUCCESS
+
+    assert resume_response is not None
+    assert resume_response.accepted is True
+    assert resume_response.changed is True
+    assert resume_response.runtime_state == RuntimeState.RUNNING
+    assert len(fake_api.order_send_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# TEST 20 (V1B): RESUME cannot bypass RECONCILIATION_REQUIRED
+# ---------------------------------------------------------------------------
+def test_control_resume_cannot_bypass_reconciliation_required(tmp_path: Path) -> None:
+    fake_api = SpyingFakeMt5Api()
+
+    def stopping_predicate() -> bool:
+        session = service.session
+        assert session is not None
+        session._reconciliation_required = True
+        session.pause()
+
+        resume_req = ControlRequest(
+            protocol_version=CONTROL_PROTOCOL_VERSION,
+            request_id=str(uuid.uuid4()),
+            action=ControlAction.RESUME,
+        )
+        res_ctrl = service.handle_control(resume_req)
+
+        assert res_ctrl.accepted is False
+        assert res_ctrl.changed is False
+        assert res_ctrl.runtime_state == RuntimeState.RECONCILIATION_REQUIRED
+
+        service.request_stop()
+        return True
+
+    config = _make_config(
+        tmp_path, max_cycles=3, stop_predicate=stopping_predicate
+    )
+    service = Mt5DemoObservationService(config, api=fake_api)
+
+    service.run()
+    assert len(fake_api.order_send_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# TEST 21 (V1B): RESUME cannot bypass KILL_SWITCHED
+# ---------------------------------------------------------------------------
+def test_control_resume_cannot_bypass_kill_switched(tmp_path: Path) -> None:
+    fake_api = SpyingFakeMt5Api()
+    resume_response = None
+
+    def kill_switch_predicate() -> bool:
+        nonlocal resume_response
+        session = service.session
+        assert session is not None
+        session.risk_engine.trigger_kill_switch(KillSwitchReason.MANUAL)
+        session.pause()
+
+        resume_req = ControlRequest(
+            protocol_version=CONTROL_PROTOCOL_VERSION,
+            request_id=str(uuid.uuid4()),
+            action=ControlAction.RESUME,
+        )
+        resume_response = service.handle_control(resume_req)
+
+        service.request_stop()
+        return True
+
+    config = _make_config(
+        tmp_path, max_cycles=3, stop_predicate=kill_switch_predicate
+    )
+    service = Mt5DemoObservationService(config, api=fake_api)
+
+    service.run()
+
+    assert resume_response is not None
+    assert resume_response.accepted is False
+    assert resume_response.changed is False
+    assert resume_response.runtime_state == RuntimeState.KILL_SWITCHED
+    assert len(fake_api.order_send_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# TEST 22 (V1B): STOP exits the service loop and performs cleanup
+# ---------------------------------------------------------------------------
+def test_control_stop_exits_loop_and_cleans_up(tmp_path: Path) -> None:
+    fake_api = SpyingFakeMt5Api()
+    stop_response = None
+
+    def stop_trigger_predicate() -> bool:
+        nonlocal stop_response
+        req = ControlRequest(
+            protocol_version=CONTROL_PROTOCOL_VERSION,
+            request_id=str(uuid.uuid4()),
+            action=ControlAction.STOP,
+        )
+        stop_response = service.handle_control(req)
+        return False
+
+    config = _make_config(
+        tmp_path, max_cycles=100, stop_predicate=stop_trigger_predicate
+    )
+    service = Mt5DemoObservationService(config, api=fake_api)
+
+    res = service.run()
+
+    assert res.exit_code == AppExitCode.SUCCESS
+    assert res.service_state == ServiceState.STOPPED
+    assert res.reason == "operator_stopped"
+
+    assert stop_response is not None
+    assert stop_response.accepted is True
+    assert stop_response.changed is True
+    assert stop_response.service_state == ServiceState.STOPPING
+
+    # Cleanup verification
+    assert fake_api.shutdown_calls >= 1
+    assert len(fake_api.order_send_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# TEST 23 (V1B): STOP does not close broker positions
+# ---------------------------------------------------------------------------
+def test_control_stop_does_not_close_broker_positions(tmp_path: Path) -> None:
+    fake_api = SpyingFakeMt5Api()
+
+    def stop_trigger_predicate() -> bool:
+        req = ControlRequest(
+            protocol_version=CONTROL_PROTOCOL_VERSION,
+            request_id=str(uuid.uuid4()),
+            action=ControlAction.STOP,
+        )
+        service.handle_control(req)
+        return False
+
+    config = _make_config(
+        tmp_path, max_cycles=100, stop_predicate=stop_trigger_predicate
+    )
+    service = Mt5DemoObservationService(config, api=fake_api)
+
+    res = service.run()
+    assert res.exit_code == AppExitCode.SUCCESS
+
+    # ZERO close mutations
+    assert len(fake_api.order_send_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# TEST 24 (V1B): Malformed control request fails safely
+# ---------------------------------------------------------------------------
+def test_malformed_control_request_fails_safely(tmp_path: Path) -> None:
+    config = _make_config(tmp_path, max_cycles=1)
+    service = Mt5DemoObservationService(config, api=SpyingFakeMt5Api())
+
+    with pytest.raises(ValueError, match="validated control request is required"):
+        service.handle_control({"not": "a control request"})  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# TEST 25 (V1B): Unsupported control action (e.g. EMERGENCY_STOP) rejected in V1B
+# ---------------------------------------------------------------------------
+def test_unsupported_emergency_stop_rejected_in_v1b(tmp_path: Path) -> None:
+    fake_api = SpyingFakeMt5Api()
+    emerg_response = None
+
+    def emerg_stop_predicate() -> bool:
+        nonlocal emerg_response
+        req = ControlRequest(
+            protocol_version=CONTROL_PROTOCOL_VERSION,
+            request_id=str(uuid.uuid4()),
+            action=ControlAction.EMERGENCY_STOP,
+        )
+        emerg_response = service.handle_control(req)
+        service.request_stop()
+        return True
+
+    config = _make_config(
+        tmp_path, max_cycles=3, stop_predicate=emerg_stop_predicate
+    )
+    service = Mt5DemoObservationService(config, api=fake_api)
+
+    service.run()
+
+    assert emerg_response is not None
+    assert emerg_response.accepted is False
+    assert emerg_response.changed is False
+    assert emerg_response.reason == "unsupported_control_action"
+    assert len(fake_api.order_send_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# TEST 26 (V1B): Polling exception still shuts down control server and releases lock
+# ---------------------------------------------------------------------------
+def test_polling_exception_shuts_down_control_server(tmp_path: Path) -> None:
+    fake_api = SpyingFakeMt5Api()
+    secret = ControlSecret(b"s" * 32)
+    poll_count = 0
+
+    def faulty_clock():
+        nonlocal poll_count
+        poll_count += 1
+        if poll_count > 2:
+            raise RuntimeError("hardware_fault")
+        return NOW
+
+    config = _make_config(
+        tmp_path, max_cycles=10, clock=faulty_clock, control_secret=secret
+    )
+    service = Mt5DemoObservationService(config, api=fake_api)
+
+    res = service.run()
+
+    assert res.exit_code == int(AppExitCode.RUNTIME_FAILURE)
+    assert res.service_state == ServiceState.FAILED
+
+    # Lock must be released
+    assert not InstanceLock(config.lock_path, config.runtime_id)._handle
+
+
+# ---------------------------------------------------------------------------
+# TEST 27 (V1B): Repeated pause/resume/status operations produce zero mutations
+# ---------------------------------------------------------------------------
+def test_repeated_pause_resume_status_zero_mutations(tmp_path: Path) -> None:
+    fake_api = SpyingFakeMt5Api()
+    iterations = 0
+
+    def mixed_control_predicate() -> bool:
+        nonlocal iterations
+        iterations += 1
+        status_req = ControlRequest(
+            protocol_version=CONTROL_PROTOCOL_VERSION,
+            request_id=str(uuid.uuid4()),
+            action=ControlAction.STATUS,
+        )
+        service.handle_control(status_req)
+
+        if iterations % 2 == 1:
+            pause_req = ControlRequest(
+                protocol_version=CONTROL_PROTOCOL_VERSION,
+                request_id=str(uuid.uuid4()),
+                action=ControlAction.PAUSE,
+            )
+            service.handle_control(pause_req)
+        else:
+            resume_req = ControlRequest(
+                protocol_version=CONTROL_PROTOCOL_VERSION,
+                request_id=str(uuid.uuid4()),
+                action=ControlAction.RESUME,
+            )
+            service.handle_control(resume_req)
+        return False
+
+    config = _make_config(
+        tmp_path, max_cycles=10, stop_predicate=mixed_control_predicate
+    )
+    service = Mt5DemoObservationService(config, api=fake_api)
+
+    res = service.run()
+    assert res.exit_code == AppExitCode.SUCCESS
+    assert res.cycles_completed == 10
+
+    # ZERO MUTATIONS
+    assert len(fake_api.order_send_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# TEST 28 (V1B): Full IPC send_control_request integration
+# ---------------------------------------------------------------------------
+def test_full_ipc_control_request_integration(tmp_path: Path) -> None:
+    fake_api = SpyingFakeMt5Api()
+    secret = ControlSecret(b"p" * 32)
+    iterations = 0
+    status_response = None
+
+    def ipc_predicate() -> bool:
+        nonlocal iterations, status_response
+        iterations += 1
+        if iterations == 2:
+            req = ControlRequest(
+                protocol_version=CONTROL_PROTOCOL_VERSION,
+                request_id=str(uuid.uuid4()),
+                action=ControlAction.STATUS,
+            )
+            op_config = config.operational_config
+            assert op_config is not None
+            status_response = send_control_request(op_config, secret, req)
+        return False
+
+    config = _make_config(
+        tmp_path,
+        max_cycles=4,
+        stop_predicate=ipc_predicate,
+        control_secret=secret,
+        runtime_id="ipc_test_rt",
+    )
+    service = Mt5DemoObservationService(config, api=fake_api)
+
+    res = service.run()
+    assert res.exit_code == AppExitCode.SUCCESS
+
+    assert status_response is not None
+    assert status_response.accepted is True
+    assert status_response.changed is False
+    assert status_response.service_state == ServiceState.RUNNING
+    assert len(fake_api.order_send_calls) == 0
