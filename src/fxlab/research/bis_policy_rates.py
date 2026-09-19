@@ -68,7 +68,7 @@ START_INCLUSIVE: date = date(2014, 1, 1)
 END_EXCLUSIVE: date = date(2024, 1, 1)
 SOURCE_REQUEST_END_INCLUSIVE: date = date(2023, 12, 31)
 
-NORMALIZATION_VERSION = "bis_cbpol_daily_v1"
+NORMALIZATION_VERSION = "bis_cbpol_daily_v2"
 
 BIS_SDMX_API_BASE_URL = "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0"
 BIS_SDMX_XML_ACCEPT = "application/vnd.sdmx.structurespecificdata+xml;version=2.1"
@@ -83,6 +83,20 @@ class RateState(StrEnum):
     OBSERVED = "OBSERVED"
     RATE_PERSISTS = "RATE_PERSISTS"
     MISSING_OR_UNKNOWN = "MISSING_OR_UNKNOWN"
+
+
+class SourceObservationKind(StrEnum):
+    """Source classification of raw observation."""
+
+    NUMERIC = "NUMERIC"
+    MISSING = "MISSING"
+
+
+class PolicyRateStateOrigin(StrEnum):
+    """Origin of the policy-rate state."""
+
+    OBSERVED = "OBSERVED"
+    PERSISTED = "PERSISTED"
 
 
 def _primitive(value: object) -> object:
@@ -204,18 +218,58 @@ class BisObservationValidationError(ValueError):
 
 @dataclass(frozen=True, order=True)
 class PolicyRateRecord:
-    """A single normalized daily policy-rate observation."""
+    """A single normalized daily policy-rate observation under ADR 0014 / ADR 0015."""
 
     observation_date: date
     series_key: str
     currency: str
-    rate_value: Decimal
-    obs_status: str = "A"
+    policy_rate_state: Decimal
+    source_observation_kind: str = SourceObservationKind.NUMERIC
+    source_obs_value: str = ""
+    source_obs_status: str = "A"
+    policy_rate_state_origin: str = PolicyRateStateOrigin.OBSERVED
+    source_state_date: date | None = None
     point_in_time_status: str = "UNRESOLVED"
     obs_conf: str | None = None
     obs_pre_break: str | None = None
 
-    def __post_init__(self) -> None:
+    def __init__(
+        self,
+        observation_date: date,
+        series_key: str,
+        currency: str,
+        policy_rate_state: Decimal | None = None,
+        source_observation_kind: str = SourceObservationKind.NUMERIC,
+        source_obs_value: str = "",
+        source_obs_status: str = "A",
+        policy_rate_state_origin: str = PolicyRateStateOrigin.OBSERVED,
+        source_state_date: date | None = None,
+        point_in_time_status: str = "UNRESOLVED",
+        obs_conf: str | None = None,
+        obs_pre_break: str | None = None,
+        rate_value: Decimal | None = None,
+    ) -> None:
+        effective_rate = policy_rate_state if policy_rate_state is not None else rate_value
+        if effective_rate is None:
+            raise ValueError("policy_rate_state must be provided")
+
+        object.__setattr__(self, "observation_date", observation_date)
+        object.__setattr__(self, "series_key", series_key)
+        object.__setattr__(self, "currency", currency)
+        object.__setattr__(self, "policy_rate_state", effective_rate)
+        object.__setattr__(self, "source_observation_kind", str(source_observation_kind))
+        object.__setattr__(self, "source_obs_value", str(source_obs_value))
+        object.__setattr__(self, "source_obs_status", str(source_obs_status))
+        object.__setattr__(self, "policy_rate_state_origin", str(policy_rate_state_origin))
+        object.__setattr__(
+            self,
+            "source_state_date",
+            source_state_date if source_state_date is not None else observation_date,
+        )
+        object.__setattr__(self, "point_in_time_status", point_in_time_status)
+        object.__setattr__(self, "obs_conf", obs_conf)
+        object.__setattr__(self, "obs_pre_break", obs_pre_break)
+
         if self.series_key not in FROZEN_SERIES_KEYS:
             raise ValueError(f"unsupported series_key: {self.series_key}")
         expected_currency = SERIES_TO_CURRENCY[self.series_key]
@@ -231,8 +285,37 @@ class PolicyRateRecord:
                 f"observation_date {self.observation_date} outside frozen interval "
                 f"[{START_INCLUSIVE}, {END_EXCLUSIVE})"
             )
-        if not isinstance(self.rate_value, Decimal) or not self.rate_value.is_finite():
-            raise ValueError(f"rate_value must be a finite Decimal, got {self.rate_value}")
+        if (
+            not isinstance(self.policy_rate_state, Decimal)
+            or not self.policy_rate_state.is_finite()
+        ):
+            raise ValueError(
+                f"policy_rate_state must be a finite Decimal, got {self.policy_rate_state}"
+            )
+        if self.source_observation_kind not in (
+            SourceObservationKind.NUMERIC,
+            SourceObservationKind.MISSING,
+        ):
+            raise ValueError(
+                f"invalid source_observation_kind: {self.source_observation_kind}"
+            )
+        if self.policy_rate_state_origin not in (
+            PolicyRateStateOrigin.OBSERVED,
+            PolicyRateStateOrigin.PERSISTED,
+        ):
+            raise ValueError(
+                f"invalid policy_rate_state_origin: {self.policy_rate_state_origin}"
+            )
+
+    @property
+    def rate_value(self) -> Decimal:
+        """Backward-compatible alias for policy_rate_state."""
+        return self.policy_rate_state
+
+    @property
+    def obs_status(self) -> str:
+        """Backward-compatible alias for source_obs_status."""
+        return self.source_obs_status
 
 
 @dataclass(frozen=True)
@@ -336,9 +419,19 @@ def compute_normalized_evidence_identity(dataset: BisNormalizedDataset) -> str:
                 "observation_date": r.observation_date.isoformat(),
                 "series_key": r.series_key,
                 "currency": r.currency,
-                "rate_value": format(r.rate_value, "f"),
-                "obs_status": r.obs_status,
+                "source_observation_kind": r.source_observation_kind,
+                "source_obs_value": r.source_obs_value,
+                "source_obs_status": r.source_obs_status,
+                "policy_rate_state": format(r.policy_rate_state, "f"),
+                "policy_rate_state_origin": r.policy_rate_state_origin,
+                "source_state_date": (
+                    r.source_state_date.isoformat()
+                    if r.source_state_date
+                    else r.observation_date.isoformat()
+                ),
                 "point_in_time_status": r.point_in_time_status,
+                "obs_conf": r.obs_conf,
+                "obs_pre_break": r.obs_pre_break,
             }
             for r in dataset.records
         ],
@@ -362,6 +455,135 @@ def _parse_decimal(value_str: str) -> Decimal:
     return val
 
 
+RawObsTuple = tuple[date, str, str, str | None, str | None, str | None]
+
+
+def _normalize_series_observations(
+    series_key: str,
+    raw_obs_list: list[RawObsTuple],
+) -> list[PolicyRateRecord]:
+    """Normalize and deterministically persist policy-rate states for a single series.
+
+    Under ADR 0015:
+    - Finite numeric observations establish an OBSERVED state and update the active state.
+    - Missing observations (OBS_VALUE="NaN", OBS_STATUS="M") inherit the prior established
+      finite state as PERSISTED with the original source_state_date.
+    - Fails closed on leading missing observations, non-M NaNs, absent status NaNs,
+      malformed values, duplicate dates, or out-of-range observations.
+    """
+    if series_key not in FROZEN_SERIES_KEYS:
+        raise ValueError(f"unknown series: {series_key}")
+    currency = SERIES_TO_CURRENCY[series_key]
+
+    seen_dates: dict[date, str] = {}
+    for (
+        obs_date,
+        _time_period_str,
+        raw_obs_val_str,
+        _obs_status,
+        _obs_conf,
+        _obs_pre_break,
+    ) in raw_obs_list:
+        if obs_date in seen_dates:
+            prev_val = seen_dates[obs_date]
+            if prev_val != raw_obs_val_str:
+                raise ValueError(
+                    f"conflicting duplicate observation for ('{series_key}', {obs_date}): "
+                    f"{prev_val} vs {raw_obs_val_str}"
+                )
+            raise ValueError(
+                f"duplicate observation for ('{series_key}', {obs_date}): "
+                f"series {series_key} has duplicate observation on {obs_date}"
+            )
+        seen_dates[obs_date] = raw_obs_val_str
+
+    sorted_obs = sorted(raw_obs_list, key=lambda x: x[0])
+
+    records: list[PolicyRateRecord] = []
+    last_finite_state: Decimal | None = None
+    last_finite_date: date | None = None
+
+    for (
+        obs_date,
+        time_period_str,
+        raw_obs_val_str,
+        obs_status,
+        obs_conf,
+        obs_pre_break,
+    ) in sorted_obs:
+        cleaned_val = raw_obs_val_str.strip()
+        is_missing_marker = cleaned_val.lower() in ("nan", "null", "none", ".", "")
+        if is_missing_marker:
+            if obs_status != "M":
+                raise BisObservationValidationError(
+                    f"non-finite rate value with non-M or absent status: {raw_obs_val_str}",
+                    series_key=series_key,
+                    time_period=time_period_str,
+                    raw_obs_value=raw_obs_val_str,
+                    obs_status=obs_status,
+                    obs_conf=obs_conf,
+                    obs_pre_break=obs_pre_break,
+                )
+            if last_finite_state is None or last_finite_date is None:
+                raise BisObservationValidationError(
+                    "missing observation before valid finite rate established",
+                    series_key=series_key,
+                    time_period=time_period_str,
+                    raw_obs_value=raw_obs_val_str,
+                    obs_status=obs_status,
+                    obs_conf=obs_conf,
+                    obs_pre_break=obs_pre_break,
+                )
+            records.append(
+                PolicyRateRecord(
+                    observation_date=obs_date,
+                    series_key=series_key,
+                    currency=currency,
+                    policy_rate_state=last_finite_state,
+                    source_observation_kind=SourceObservationKind.MISSING,
+                    source_obs_value=raw_obs_val_str or "NaN",
+                    source_obs_status="M",
+                    policy_rate_state_origin=PolicyRateStateOrigin.PERSISTED,
+                    source_state_date=last_finite_date,
+                    obs_conf=obs_conf,
+                    obs_pre_break=obs_pre_break,
+                )
+            )
+        else:
+            try:
+                rate_val = _parse_decimal(raw_obs_val_str)
+            except ValueError as exc:
+                raise BisObservationValidationError(
+                    str(exc),
+                    series_key=series_key,
+                    time_period=time_period_str,
+                    raw_obs_value=raw_obs_val_str,
+                    obs_status=obs_status,
+                    obs_conf=obs_conf,
+                    obs_pre_break=obs_pre_break,
+                ) from exc
+
+            last_finite_state = rate_val
+            last_finite_date = obs_date
+            records.append(
+                PolicyRateRecord(
+                    observation_date=obs_date,
+                    series_key=series_key,
+                    currency=currency,
+                    policy_rate_state=rate_val,
+                    source_observation_kind=SourceObservationKind.NUMERIC,
+                    source_obs_value=raw_obs_val_str,
+                    source_obs_status=obs_status or "A",
+                    policy_rate_state_origin=PolicyRateStateOrigin.OBSERVED,
+                    source_state_date=obs_date,
+                    obs_conf=obs_conf,
+                    obs_pre_break=obs_pre_break,
+                )
+            )
+
+    return records
+
+
 def parse_sdmx_csv_payload(
     body: str | bytes,
     expected_series: str | None = None,
@@ -372,7 +594,7 @@ def parse_sdmx_csv_payload(
     if not reader.fieldnames:
         raise ValueError("SDMX-CSV payload missing header row")
 
-    records: list[PolicyRateRecord] = []
+    raw_by_series: dict[str, list[RawObsTuple]] = {}
     for row in reader:
         series_key = row.get("SERIES_KEY") or row.get("REF_AREA") or (expected_series or "")
         if not series_key and "FREQ" in row and "REF_AREA" in row:
@@ -390,11 +612,13 @@ def parse_sdmx_csv_payload(
         obs_val_str = (row.get("OBS_VALUE") or row.get("obs_value") or "").strip()
         obs_status = (row.get("OBS_STATUS") or row.get("obs_status") or "").strip() or None
         obs_conf = (row.get("OBS_CONF") or row.get("obs_conf") or "").strip() or None
-        obs_pre_break = (row.get("OBS_PRE_BREAK") or row.get("obs_pre_break") or "").strip() or None
+        obs_pre_break = (
+            row.get("OBS_PRE_BREAK") or row.get("obs_pre_break") or ""
+        ).strip() or None
 
         if not time_period_str:
             raise ValueError(f"missing TIME_PERIOD in row for {series_key}")
-        if not obs_val_str:
+        if not obs_val_str and obs_status != "M":
             raise BisObservationValidationError(
                 "missing OBS_VALUE",
                 series_key=series_key,
@@ -418,7 +642,6 @@ def parse_sdmx_csv_payload(
                 obs_pre_break=obs_pre_break,
             ) from exc
 
-        # Sealed boundary check
         if obs_date < START_INCLUSIVE or obs_date >= END_EXCLUSIVE:
             raise BisObservationValidationError(
                 f"observation date outside frozen interval [{START_INCLUSIVE}, {END_EXCLUSIVE})",
@@ -430,32 +653,14 @@ def parse_sdmx_csv_payload(
                 obs_pre_break=obs_pre_break,
             )
 
-        try:
-            rate_val = _parse_decimal(obs_val_str)
-        except ValueError as exc:
-            raise BisObservationValidationError(
-                str(exc),
-                series_key=series_key,
-                time_period=time_period_str,
-                raw_obs_value=obs_val_str,
-                obs_status=obs_status,
-                obs_conf=obs_conf,
-                obs_pre_break=obs_pre_break,
-            ) from exc
-
-        currency = SERIES_TO_CURRENCY[series_key]
-        records.append(
-            PolicyRateRecord(
-                observation_date=obs_date,
-                series_key=series_key,
-                currency=currency,
-                rate_value=rate_val,
-                obs_status=obs_status or "A",
-                obs_conf=obs_conf,
-                obs_pre_break=obs_pre_break,
-            )
+        raw_by_series.setdefault(series_key, []).append(
+            (obs_date, time_period_str, obs_val_str, obs_status, obs_conf, obs_pre_break)
         )
-    return records
+
+    all_records: list[PolicyRateRecord] = []
+    for sk in sorted(raw_by_series.keys()):
+        all_records.extend(_normalize_series_observations(sk, raw_by_series[sk]))
+    return all_records
 
 
 def parse_sdmx_xml_payload(
@@ -469,7 +674,8 @@ def parse_sdmx_xml_payload(
     except ET.ParseError as exc:
         raise ValueError(f"malformed XML payload: {exc}") from exc
 
-    records: list[PolicyRateRecord] = []
+    raw_by_series: dict[str, list[RawObsTuple]] = {}
+
     for elem in root.iter():
         tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
         if tag == "Series":
@@ -486,7 +692,6 @@ def parse_sdmx_xml_payload(
             if series_key not in FROZEN_SERIES_KEYS:
                 raise ValueError(f"unknown series in XML: {series_key}")
 
-            currency = SERIES_TO_CURRENCY[series_key]
             for child in elem:
                 child_tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
                 if child_tag == "Obs":
@@ -503,12 +708,14 @@ def parse_sdmx_xml_payload(
                         child.attrib.get("OBS_CONF") or child.attrib.get("obs_conf") or ""
                     ).strip() or None
                     obs_pre_break = (
-                        child.attrib.get("OBS_PRE_BREAK") or child.attrib.get("obs_pre_break") or ""
+                        child.attrib.get("OBS_PRE_BREAK")
+                        or child.attrib.get("obs_pre_break")
+                        or ""
                     ).strip() or None
 
                     if not time_period:
                         raise ValueError(f"missing TIME_PERIOD in XML Obs for {series_key}")
-                    if not obs_value:
+                    if not obs_value and obs_status != "M":
                         raise BisObservationValidationError(
                             "missing OBS_VALUE",
                             series_key=series_key,
@@ -544,29 +751,8 @@ def parse_sdmx_xml_payload(
                             obs_pre_break=obs_pre_break,
                         )
 
-                    try:
-                        rate_val = _parse_decimal(obs_value)
-                    except ValueError as exc:
-                        raise BisObservationValidationError(
-                            str(exc),
-                            series_key=series_key,
-                            time_period=time_period,
-                            raw_obs_value=obs_value,
-                            obs_status=obs_status,
-                            obs_conf=obs_conf,
-                            obs_pre_break=obs_pre_break,
-                        ) from exc
-
-                    records.append(
-                        PolicyRateRecord(
-                            observation_date=obs_date,
-                            series_key=series_key,
-                            currency=currency,
-                            rate_value=rate_val,
-                            obs_status=obs_status or "A",
-                            obs_conf=obs_conf,
-                            obs_pre_break=obs_pre_break,
-                        )
+                    raw_by_series.setdefault(series_key, []).append(
+                        (obs_date, time_period, obs_value, obs_status, obs_conf, obs_pre_break)
                     )
         elif tag == "Obs" and "SERIES_KEY" in elem.attrib:
             series_key = elem.attrib["SERIES_KEY"].strip()
@@ -575,7 +761,6 @@ def parse_sdmx_xml_payload(
             if series_key not in FROZEN_SERIES_KEYS:
                 raise ValueError(f"unknown series in XML Obs: {series_key}")
 
-            currency = SERIES_TO_CURRENCY[series_key]
             time_period = (
                 elem.attrib.get("TIME_PERIOD") or elem.attrib.get("time_period") or ""
             ).strip()
@@ -594,7 +779,7 @@ def parse_sdmx_xml_payload(
 
             if not time_period:
                 raise ValueError(f"missing TIME_PERIOD in standalone XML Obs for {series_key}")
-            if not obs_value:
+            if not obs_value and obs_status != "M":
                 raise BisObservationValidationError(
                     "missing OBS_VALUE",
                     series_key=series_key,
@@ -630,32 +815,14 @@ def parse_sdmx_xml_payload(
                     obs_pre_break=obs_pre_break,
                 )
 
-            try:
-                rate_val = _parse_decimal(obs_value)
-            except ValueError as exc:
-                raise BisObservationValidationError(
-                    str(exc),
-                    series_key=series_key,
-                    time_period=time_period,
-                    raw_obs_value=obs_value,
-                    obs_status=obs_status,
-                    obs_conf=obs_conf,
-                    obs_pre_break=obs_pre_break,
-                ) from exc
-
-            records.append(
-                PolicyRateRecord(
-                    observation_date=obs_date,
-                    series_key=series_key,
-                    currency=currency,
-                    rate_value=rate_val,
-                    obs_status=obs_status or "A",
-                    obs_conf=obs_conf,
-                    obs_pre_break=obs_pre_break,
-                )
+            raw_by_series.setdefault(series_key, []).append(
+                (obs_date, time_period, obs_value, obs_status, obs_conf, obs_pre_break)
             )
 
-    return records
+    all_records: list[PolicyRateRecord] = []
+    for sk in sorted(raw_by_series.keys()):
+        all_records.extend(_normalize_series_observations(sk, raw_by_series[sk]))
+    return all_records
 
 
 def normalize_bis_policy_rate_payloads(
@@ -702,10 +869,10 @@ def normalize_bis_policy_rate_payloads(
             key = (rec.series_key, rec.observation_date)
             if key in all_records_map:
                 existing = all_records_map[key]
-                if existing.rate_value != rec.rate_value:
+                if existing.policy_rate_state != rec.policy_rate_state:
                     raise ValueError(
                         f"conflicting duplicate observation for {key}: "
-                        f"{existing.rate_value} vs {rec.rate_value}"
+                        f"{existing.policy_rate_state} vs {rec.policy_rate_state}"
                     )
                 raise ValueError(
                     f"duplicate observation for {key}: series {rec.series_key} "
@@ -777,16 +944,32 @@ def build_daily_policy_rate_grid(
             record = obs_by_curr_date.get((currency, curr_date))
 
             if record is not None:
-                last_rate = record.rate_value
-                last_change = curr_date
-                grid[(currency, curr_date)] = PolicyRateGridEntry(
-                    currency=currency,
-                    series_key=series_key,
-                    date=curr_date,
-                    rate=record.rate_value,
-                    state=RateState.OBSERVED,
-                    last_change_date=curr_date,
-                )
+                if record.policy_rate_state_origin == PolicyRateStateOrigin.OBSERVED:
+                    last_rate = record.policy_rate_state
+                    last_change = curr_date
+                    grid[(currency, curr_date)] = PolicyRateGridEntry(
+                        currency=currency,
+                        series_key=series_key,
+                        date=curr_date,
+                        rate=record.policy_rate_state,
+                        state=RateState.OBSERVED,
+                        last_change_date=curr_date,
+                    )
+                elif record.policy_rate_state_origin == PolicyRateStateOrigin.PERSISTED:
+                    last_rate = record.policy_rate_state
+                    last_change = record.source_state_date
+                    grid[(currency, curr_date)] = PolicyRateGridEntry(
+                        currency=currency,
+                        series_key=series_key,
+                        date=curr_date,
+                        rate=record.policy_rate_state,
+                        state=RateState.RATE_PERSISTS,
+                        last_change_date=record.source_state_date,
+                    )
+                else:
+                    raise ValueError(
+                        f"unknown policy_rate_state_origin: {record.policy_rate_state_origin}"
+                    )
             elif last_rate is not None:
                 grid[(currency, curr_date)] = PolicyRateGridEntry(
                     currency=currency,

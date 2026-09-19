@@ -22,7 +22,7 @@ from fxlab.research.bis_policy_rates import (
 )
 
 DEFAULT_RAW_OUTPUT_DIR = Path("data/raw/bis_cbpol")
-DEFAULT_NORMALIZED_OUTPUT_PATH = Path("data/normalized/bis_cbpol_daily_v1.json")
+DEFAULT_NORMALIZED_OUTPUT_PATH = Path("data/normalized/bis_cbpol_daily_v2.json")
 
 
 def fetch_bis_series_payload(series_key: str, timeout: float = 30.0) -> bytes:

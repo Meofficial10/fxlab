@@ -24,7 +24,9 @@ from fxlab.research.bis_policy_rates import (
     BisObservationValidationError,
     BisRawArtifact,
     PolicyRateRecord,
+    PolicyRateStateOrigin,
     RateState,
+    SourceObservationKind,
     build_bis_all_series_request_urls,
     build_bis_series_request_url,
     build_daily_policy_rate_grid,
@@ -724,7 +726,10 @@ def test_36_nan_fails_closed_with_rich_diagnostic_context_xml():
     assert exc.obs_pre_break == "0.5"
 
     err_str = str(exc)
-    assert "non-finite rate value" in err_str
+    assert (
+        "missing observation before valid finite rate established" in err_str
+        or "non-finite rate value" in err_str
+    )
     assert "series=D.XM" in err_str
     assert "time_period=2016-04-05" in err_str
     assert "raw_obs_value=NaN" in err_str
@@ -845,3 +850,475 @@ def test_40_transactional_acquisition_zero_artifacts_after_nan_validation_failur
     # Transactional publication guarantees 0 files
     assert not raw_dir.exists() or len(list(raw_dir.glob("*.json"))) == 0
     assert not norm_file.exists()
+
+
+# --- Test 41–63: ADR 0015 State Persistence & Derived Model Specifications ---
+
+
+def test_41_finite_observation_sets_observed_state():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="US" SERIES_KEY="D.US">\n'
+        b'      <Obs TIME_PERIOD="2014-01-02" OBS_VALUE="0.25" OBS_STATUS="A" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    records = parse_sdmx_xml_payload(xml, expected_series="D.US")
+    assert len(records) == 1
+    r = records[0]
+    assert r.source_observation_kind == SourceObservationKind.NUMERIC
+    assert r.source_obs_value == "0.25"
+    assert r.source_obs_status == "A"
+    assert r.policy_rate_state == Decimal("0.25")
+    assert r.rate_value == Decimal("0.25")
+    assert r.policy_rate_state_origin == PolicyRateStateOrigin.OBSERVED
+    assert r.source_state_date == date(2014, 1, 2)
+
+
+def test_42_nan_m_after_finite_sets_persisted_state():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="CA" SERIES_KEY="D.CA">\n'
+        b'      <Obs TIME_PERIOD="2014-01-03" OBS_VALUE="1.00" OBS_STATUS="A" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-04" OBS_VALUE="NaN" OBS_STATUS="M" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    records = parse_sdmx_xml_payload(xml, expected_series="D.CA")
+    assert len(records) == 2
+    r_observed, r_persisted = records
+    assert r_persisted.observation_date == date(2014, 1, 4)
+    assert r_persisted.source_observation_kind == SourceObservationKind.MISSING
+    assert r_persisted.source_obs_value == "NaN"
+    assert r_persisted.source_obs_status == "M"
+    assert r_persisted.policy_rate_state == Decimal("1.00")
+    assert r_persisted.rate_value == Decimal("1.00")
+    assert r_persisted.policy_rate_state_origin == PolicyRateStateOrigin.PERSISTED
+    assert r_persisted.source_state_date == date(2014, 1, 3)
+
+
+def test_43_raw_nan_remains_missing_source_kind():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="AU" SERIES_KEY="D.AU">\n'
+        b'      <Obs TIME_PERIOD="2014-01-02" OBS_VALUE="2.50" OBS_STATUS="A" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-03" OBS_VALUE="NaN" OBS_STATUS="M" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    records = parse_sdmx_xml_payload(xml, expected_series="D.AU")
+    missing_rec = records[1]
+    assert missing_rec.source_observation_kind == "MISSING"
+    assert missing_rec.source_obs_value == "NaN"
+
+
+def test_44_raw_status_m_preserved():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="GB" SERIES_KEY="D.GB">\n'
+        b'      <Obs TIME_PERIOD="2014-01-02" OBS_VALUE="0.50" OBS_STATUS="A" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-03" OBS_VALUE="NaN" OBS_STATUS="M" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    records = parse_sdmx_xml_payload(xml, expected_series="D.GB")
+    assert records[1].source_obs_status == "M"
+
+
+def test_45_obs_conf_preserved():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="CA" SERIES_KEY="D.CA">\n'
+        b'      <Obs TIME_PERIOD="2014-01-02" OBS_VALUE="1.00" OBS_STATUS="A" OBS_CONF="F" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-04" OBS_VALUE="NaN" OBS_STATUS="M" OBS_CONF="F" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    records = parse_sdmx_xml_payload(xml, expected_series="D.CA")
+    assert records[0].obs_conf == "F"
+    assert records[1].obs_conf == "F"
+
+
+def test_46_obs_pre_break_preserved_without_invented_semantics():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="NZ" SERIES_KEY="D.NZ">\n'
+        b'      <Obs TIME_PERIOD="2014-01-02" OBS_VALUE="2.50" OBS_STATUS="A" '
+        b'OBS_PRE_BREAK="2.75" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    records = parse_sdmx_xml_payload(xml, expected_series="D.NZ")
+    assert records[0].obs_pre_break == "2.75"
+    assert records[0].policy_rate_state == Decimal("2.50")
+
+
+def test_47_consecutive_nan_m_persists_same_finite_state():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="CA" SERIES_KEY="D.CA">\n'
+        b'      <Obs TIME_PERIOD="2014-01-03" OBS_VALUE="1.00" OBS_STATUS="A" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-04" OBS_VALUE="NaN" OBS_STATUS="M" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-05" OBS_VALUE="NaN" OBS_STATUS="M" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    records = parse_sdmx_xml_payload(xml, expected_series="D.CA")
+    assert len(records) == 3
+    assert records[1].policy_rate_state == Decimal("1.00")
+    assert records[2].policy_rate_state == Decimal("1.00")
+    assert records[1].policy_rate_state_origin == PolicyRateStateOrigin.PERSISTED
+    assert records[2].policy_rate_state_origin == PolicyRateStateOrigin.PERSISTED
+
+
+def test_48_consecutive_persistence_retains_original_source_state_date():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="CA" SERIES_KEY="D.CA">\n'
+        b'      <Obs TIME_PERIOD="2014-01-03" OBS_VALUE="1.00" OBS_STATUS="A" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-04" OBS_VALUE="NaN" OBS_STATUS="M" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-05" OBS_VALUE="NaN" OBS_STATUS="M" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    records = parse_sdmx_xml_payload(xml, expected_series="D.CA")
+    assert records[1].source_state_date == date(2014, 1, 3)
+    assert records[2].source_state_date == date(2014, 1, 3)
+
+
+def test_49_next_finite_resets_origin_to_observed():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="CA" SERIES_KEY="D.CA">\n'
+        b'      <Obs TIME_PERIOD="2014-01-03" OBS_VALUE="1.00" OBS_STATUS="A" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-04" OBS_VALUE="NaN" OBS_STATUS="M" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-06" OBS_VALUE="1.00" OBS_STATUS="A" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    records = parse_sdmx_xml_payload(xml, expected_series="D.CA")
+    assert len(records) == 3
+    r_mon = records[2]
+    assert r_mon.observation_date == date(2014, 1, 6)
+    assert r_mon.policy_rate_state_origin == PolicyRateStateOrigin.OBSERVED
+    assert r_mon.source_observation_kind == SourceObservationKind.NUMERIC
+    assert r_mon.source_state_date == date(2014, 1, 6)
+
+
+def test_50_leading_nan_m_fails_closed():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="US" SERIES_KEY="D.US">\n'
+        b'      <Obs TIME_PERIOD="2014-01-01" OBS_VALUE="NaN" OBS_STATUS="M" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    with pytest.raises(BisObservationValidationError) as exc:
+        parse_sdmx_xml_payload(xml, expected_series="D.US")
+    assert "missing observation before valid finite rate established" in str(exc.value)
+
+
+def test_51_nan_with_status_a_fails_closed():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="US" SERIES_KEY="D.US">\n'
+        b'      <Obs TIME_PERIOD="2014-01-02" OBS_VALUE="0.25" OBS_STATUS="A" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-03" OBS_VALUE="NaN" OBS_STATUS="A" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    with pytest.raises(BisObservationValidationError) as exc:
+        parse_sdmx_xml_payload(xml, expected_series="D.US")
+    assert "non-finite rate value" in str(exc.value)
+
+
+def test_52_nan_with_absent_status_fails_closed():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="US" SERIES_KEY="D.US">\n'
+        b'      <Obs TIME_PERIOD="2014-01-02" OBS_VALUE="0.25" OBS_STATUS="A" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-03" OBS_VALUE="NaN" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    with pytest.raises(BisObservationValidationError) as exc:
+        parse_sdmx_xml_payload(xml, expected_series="D.US")
+    assert "non-finite rate value" in str(exc.value)
+
+
+def test_53_malformed_nonnumeric_fails_closed():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="US" SERIES_KEY="D.US">\n'
+        b'      <Obs TIME_PERIOD="2014-01-02" OBS_VALUE="0.25" OBS_STATUS="A" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-03" OBS_VALUE="corrupted" OBS_STATUS="A" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    with pytest.raises(BisObservationValidationError) as exc:
+        parse_sdmx_xml_payload(xml, expected_series="D.US")
+    assert "malformed decimal rate value" in str(exc.value)
+
+
+def test_54_same_series_duplicate_date_fails_closed():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="US" SERIES_KEY="D.US">\n'
+        b'      <Obs TIME_PERIOD="2014-01-02" OBS_VALUE="0.25" OBS_STATUS="A" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-02" OBS_VALUE="0.25" OBS_STATUS="A" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    with pytest.raises(ValueError, match="duplicate observation"):
+        parse_sdmx_xml_payload(xml, expected_series="D.US")
+
+
+def test_55_cross_series_state_leakage_impossible():
+    # CA has established rate 1.00; US starts with leading missing value.
+    # CA rate must NOT leak into US.
+    payloads = _make_full_valid_payloads_dict()
+    payloads["D.US"] = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="US" SERIES_KEY="D.US">\n'
+        b'      <Obs TIME_PERIOD="2014-01-01" OBS_VALUE="NaN" OBS_STATUS="M" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    with pytest.raises(BisObservationValidationError):
+        normalize_bis_policy_rate_payloads(payloads)
+
+
+def test_56_each_series_maintains_independent_state():
+    payloads = _make_full_valid_payloads_dict()
+    # Give D.CA a missing weekend observation after Jan 01
+    payloads["D.CA"] = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="CA" SERIES_KEY="D.CA">\n'
+        b'      <Obs TIME_PERIOD="2014-01-01" OBS_VALUE="1.00" OBS_STATUS="A" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-04" OBS_VALUE="NaN" OBS_STATUS="M" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    dataset = normalize_bis_policy_rate_payloads(payloads)
+    ca_recs = [r for r in dataset.records if r.series_key == "D.CA"]
+    assert len(ca_recs) == 2
+    assert ca_recs[1].policy_rate_state == Decimal("1.00")
+    assert ca_recs[1].policy_rate_state_origin == PolicyRateStateOrigin.PERSISTED
+
+
+def test_57_out_of_range_observation_fails_closed():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="US" SERIES_KEY="D.US">\n'
+        b'      <Obs TIME_PERIOD="2024-01-05" OBS_VALUE="NaN" OBS_STATUS="M" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    with pytest.raises(BisObservationValidationError) as exc:
+        parse_sdmx_xml_payload(xml, expected_series="D.US")
+    assert "outside frozen interval" in str(exc.value)
+
+
+def test_58_frozen_eight_series_validation_enforced():
+    payloads = _make_full_valid_payloads_dict()
+    del payloads["D.AU"]
+    with pytest.raises(ValueError, match="missing required series"):
+        normalize_bis_policy_rate_payloads(payloads)
+
+
+def test_59_normalized_identity_changes_on_derived_state_change():
+    payloads = _make_full_valid_payloads_dict()
+    dataset1 = normalize_bis_policy_rate_payloads(payloads)
+
+    # Change one rate value
+    payloads_modified = _make_full_valid_payloads_dict()
+    payloads_modified["D.US"] = _make_sample_xml_payload("D.US", [
+        ("2014-01-01", "0.50"),
+        ("2015-06-15", "0.75"),
+        ("2019-10-31", "1.75"),
+        ("2023-12-31", "5.25"),
+    ])
+    dataset2 = normalize_bis_policy_rate_payloads(payloads_modified)
+
+    assert dataset1.normalized_identity != dataset2.normalized_identity
+
+
+def test_60_deterministic_serialization_and_output(tmp_path: Path):
+    payloads = _make_full_valid_payloads_dict()
+    dataset1 = normalize_bis_policy_rate_payloads(payloads)
+    dataset2 = normalize_bis_policy_rate_payloads(payloads)
+
+    assert dataset1.normalized_identity == dataset2.normalized_identity
+    out1 = tmp_path / "d1.json"
+    out2 = tmp_path / "d2.json"
+    publish_normalized_bis_dataset(dataset1, out1)
+    publish_normalized_bis_dataset(dataset2, out2)
+    assert out1.read_text(encoding="utf-8") == out2.read_text(encoding="utf-8")
+
+
+def test_61_transactional_failure_creates_zero_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from scripts import acquire_bis_policy_rates
+
+    payloads = _make_full_valid_payloads_dict()
+    # Make D.JP fail closed on non-M NaN
+    payloads["D.JP"] = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="JP" SERIES_KEY="D.JP">\n'
+        b'      <Obs TIME_PERIOD="2014-01-01" OBS_VALUE="-0.10" OBS_STATUS="A" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-02" OBS_VALUE="NaN" OBS_STATUS="A" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+
+    def mock_fetch(series_key: str, timeout: float = 30.0) -> bytes:
+        return payloads[series_key]
+
+    monkeypatch.setattr(acquire_bis_policy_rates, "fetch_bis_series_payload", mock_fetch)
+
+    raw_dir = tmp_path / "raw"
+    norm_file = tmp_path / "norm.json"
+
+    with pytest.raises(BisObservationValidationError):
+        acquire_bis_policy_rates.main(
+            ["--run", "--raw-output-dir", str(raw_dir), "--normalized-output", str(norm_file)]
+        )
+
+    assert not raw_dir.exists() or len(list(raw_dir.glob("*.json"))) == 0
+    assert not norm_file.exists()
+
+
+def test_62_point_in_time_unresolved_no_causal_promotion():
+    rec = PolicyRateRecord(
+        observation_date=date(2014, 1, 4),
+        series_key="D.CA",
+        currency="CAD",
+        policy_rate_state=Decimal("1.00"),
+        source_observation_kind=SourceObservationKind.MISSING,
+        source_obs_value="NaN",
+        source_obs_status="M",
+        policy_rate_state_origin=PolicyRateStateOrigin.PERSISTED,
+        source_state_date=date(2014, 1, 3),
+    )
+    assert rec.point_in_time_status == "UNRESOLVED"
+    assert not hasattr(rec, "causal_promotion")
+    assert not hasattr(rec, "tradable_known_at")
+
+
+def test_63_exact_canada_forensic_pattern_normalized():
+    # Diagnostic pattern verified from authoritative BIS query:
+    # 2014-01-02 value=1 status=A (Thu)
+    # 2014-01-03 value=1 status=A (Fri)
+    # 2014-01-04 value=NaN status=M conf=F (Sat)
+    # 2014-01-05 value=NaN status=M conf=F (Sun)
+    # 2014-01-06 value=1 status=A conf=F (Mon)
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="CA" SERIES_KEY="D.CA">\n'
+        b'      <Obs TIME_PERIOD="2014-01-02" OBS_VALUE="1" OBS_STATUS="A" OBS_CONF="F" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-03" OBS_VALUE="1" OBS_STATUS="A" OBS_CONF="F" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-04" OBS_VALUE="NaN" OBS_STATUS="M" OBS_CONF="F" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-05" OBS_VALUE="NaN" OBS_STATUS="M" OBS_CONF="F" />\n'
+        b'      <Obs TIME_PERIOD="2014-01-06" OBS_VALUE="1" OBS_STATUS="A" OBS_CONF="F" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+    records = parse_sdmx_xml_payload(xml, expected_series="D.CA")
+    assert len(records) == 5
+
+    # Jan 02: Observed 1.00
+    assert records[0].observation_date == date(2014, 1, 2)
+    assert records[0].policy_rate_state == Decimal("1")
+    assert records[0].source_observation_kind == SourceObservationKind.NUMERIC
+    assert records[0].policy_rate_state_origin == PolicyRateStateOrigin.OBSERVED
+    assert records[0].source_state_date == date(2014, 1, 2)
+
+    # Jan 03: Observed 1.00
+    assert records[1].observation_date == date(2014, 1, 3)
+    assert records[1].policy_rate_state == Decimal("1")
+    assert records[1].source_observation_kind == SourceObservationKind.NUMERIC
+    assert records[1].policy_rate_state_origin == PolicyRateStateOrigin.OBSERVED
+    assert records[1].source_state_date == date(2014, 1, 3)
+
+    # Jan 04 (Sat): Missing / Persisted 1.00 from Jan 03
+    assert records[2].observation_date == date(2014, 1, 4)
+    assert records[2].policy_rate_state == Decimal("1")
+    assert records[2].source_observation_kind == SourceObservationKind.MISSING
+    assert records[2].source_obs_value == "NaN"
+    assert records[2].source_obs_status == "M"
+    assert records[2].policy_rate_state_origin == PolicyRateStateOrigin.PERSISTED
+    assert records[2].source_state_date == date(2014, 1, 3)
+
+    # Jan 05 (Sun): Missing / Persisted 1.00 from Jan 03
+    assert records[3].observation_date == date(2014, 1, 5)
+    assert records[3].policy_rate_state == Decimal("1")
+    assert records[3].source_observation_kind == SourceObservationKind.MISSING
+    assert records[3].source_obs_value == "NaN"
+    assert records[3].source_obs_status == "M"
+    assert records[3].policy_rate_state_origin == PolicyRateStateOrigin.PERSISTED
+    assert records[3].source_state_date == date(2014, 1, 3)
+
+    # Jan 06 (Mon): Observed 1.00
+    assert records[4].observation_date == date(2014, 1, 6)
+    assert records[4].policy_rate_state == Decimal("1")
+    assert records[4].source_observation_kind == SourceObservationKind.NUMERIC
+    assert records[4].policy_rate_state_origin == PolicyRateStateOrigin.OBSERVED
+    assert records[4].source_state_date == date(2014, 1, 6)
