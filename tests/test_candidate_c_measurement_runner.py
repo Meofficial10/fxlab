@@ -12,7 +12,8 @@ import numpy as np
 import pandas as pd
 import pytest
 from scripts.run_candidate_c_measurement import (
-    DEFAULT_ADR_PATH,
+    DEFAULT_V1_ADR_PATH,
+    DEFAULT_V2_ADR_PATH,
     CandidateCRunnerConfig,
     execute_candidate_c_measurement,
     format_text_report,
@@ -50,7 +51,6 @@ from fxlab.research.candidate_c_execution_evidence import (
     _sha,
 )
 from fxlab.research.candidate_c_measurement import (
-    CANDIDATE_C_ADR_SHA256,
     CANDIDATE_C_END,
     CANDIDATE_C_PAIRS,
     CANDIDATE_C_START,
@@ -202,7 +202,7 @@ def test_cli_no_args_exits_zero_without_run(capsys: pytest.CaptureFixture[str]) 
     exit_code = main([])
     assert exit_code == 0
     out = capsys.readouterr().out
-    assert "Use --run to execute" in out
+    assert "Use --run with --protocol {v1,v2} to execute" in out
 
 
 # 3. CLI Unknown Arg Exits 2
@@ -245,25 +245,28 @@ def test_get_git_environment_subprocess_error() -> None:
             get_git_environment()
 
 
-# 7. verify_adr_preregistration Success
+# 7. verify_adr_preregistration Success (v1 and v2)
 def test_verify_adr_preregistration_success(tmp_path: Path) -> None:
-    adr_file = tmp_path / "0008-adr.md"
-    real_adr = Path(DEFAULT_ADR_PATH)
-    if real_adr.is_file():
-        adr_file.write_bytes(real_adr.read_bytes())
-        verify_adr_preregistration(adr_file)
-    else:
-        with patch.object(Path, "read_bytes", return_value=b"correct"):
-            with patch("hashlib.sha256") as mock_sha:
-                mock_sha.return_value.hexdigest.return_value = CANDIDATE_C_ADR_SHA256
-                verify_adr_preregistration(adr_file)
+    adr_v1 = tmp_path / "0008-adr.md"
+    real_adr_v1 = Path(DEFAULT_V1_ADR_PATH)
+    if real_adr_v1.is_file():
+        adr_v1.write_bytes(real_adr_v1.read_bytes())
+        verify_adr_preregistration(adr_v1, protocol="v1")
+
+    adr_v2 = tmp_path / "0009-adr.md"
+    real_adr_v2 = Path(DEFAULT_V2_ADR_PATH)
+    if real_adr_v2.is_file():
+        adr_v2.write_bytes(real_adr_v2.read_bytes())
+        verify_adr_preregistration(adr_v2, protocol="v2")
 
 
 # 8. verify_adr_preregistration Missing File
 def test_verify_adr_preregistration_missing_file(tmp_path: Path) -> None:
     non_existent = tmp_path / "missing.md"
     with pytest.raises(FileNotFoundError, match="not found"):
-        verify_adr_preregistration(non_existent)
+        verify_adr_preregistration(non_existent, protocol="v1")
+    with pytest.raises(FileNotFoundError, match="not found"):
+        verify_adr_preregistration(non_existent, protocol="v2")
 
 
 # 9. verify_adr_preregistration Hash Mismatch
@@ -271,7 +274,9 @@ def test_verify_adr_preregistration_hash_mismatch(tmp_path: Path) -> None:
     bad_adr = tmp_path / "bad.md"
     bad_adr.write_text("corrupted content", encoding="utf-8")
     with pytest.raises(ValueError, match="ADR 0008 SHA256 mismatch"):
-        verify_adr_preregistration(bad_adr)
+        verify_adr_preregistration(bad_adr, protocol="v1")
+    with pytest.raises(ValueError, match="ADR 0009 SHA256 mismatch"):
+        verify_adr_preregistration(bad_adr, protocol="v2")
 
 
 # 10. load_direct_d1_datasets Missing Dir
@@ -420,6 +425,7 @@ def test_save_measurement_artifacts_fails_if_exists(tmp_path: Path) -> None:
 # 18. execute_candidate_c_measurement Rejects Dirty Worktree
 def test_execute_candidate_c_measurement_rejects_dirty_worktree(tmp_path: Path) -> None:
     config = CandidateCRunnerConfig(
+        protocol="v2",
         results_root=tmp_path / "results",
     )
     with patch("scripts.run_candidate_c_measurement.verify_adr_preregistration"):
@@ -434,6 +440,7 @@ def test_execute_candidate_c_measurement_rejects_dirty_worktree(tmp_path: Path) 
 # 19. execute_candidate_c_measurement Rejects ADR Mismatch
 def test_execute_candidate_c_measurement_rejects_adr_mismatch(tmp_path: Path) -> None:
     config = CandidateCRunnerConfig(
+        protocol="v2",
         results_root=tmp_path / "results",
     )
     with patch(
@@ -444,10 +451,11 @@ def test_execute_candidate_c_measurement_rejects_adr_mismatch(tmp_path: Path) ->
             execute_candidate_c_measurement(config)
 
 
-# 20. execute_candidate_c_measurement End-to-End Synthetic
+# 20. execute_candidate_c_measurement End-to-End Synthetic (v1 and v2)
 def test_execute_candidate_c_measurement_end_to_end_synthetic(tmp_path: Path) -> None:
     results_root = tmp_path / "results"
-    config = CandidateCRunnerConfig(
+    config_v2 = CandidateCRunnerConfig(
+        protocol="v2",
         results_root=results_root,
     )
     synthetic_ds = {
@@ -468,18 +476,26 @@ def test_execute_candidate_c_measurement_end_to_end_synthetic(tmp_path: Path) ->
                     "scripts.run_candidate_c_measurement.build_candidate_c_execution_evidence_manifest",
                     return_value=manifest,
                 ):
-                    result = execute_candidate_c_measurement(config)
-                    assert isinstance(result, CandidateCMeasurementResult)
-                    assert (results_root / result.run_id).is_dir()
+                    result_v2 = execute_candidate_c_measurement(config_v2)
+                    assert isinstance(result_v2, CandidateCMeasurementResult)
+                    assert (results_root / result_v2.run_id).is_dir()
                     assert (
-                        results_root / result.run_id / "candidate_c_measurement_result.json"
+                        results_root / result_v2.run_id / "candidate_c_measurement_result.json"
                     ).is_file()
                     assert (
-                        results_root / result.run_id / "candidate_c_report.txt"
+                        results_root / result_v2.run_id / "candidate_c_report.txt"
                     ).is_file()
 
+                    config_v1 = CandidateCRunnerConfig(
+                        protocol="v1",
+                        results_root=results_root,
+                    )
+                    result_v1 = execute_candidate_c_measurement(config_v1)
+                    assert isinstance(result_v1, CandidateCMeasurementResult)
+                    assert (results_root / result_v1.run_id).is_dir()
 
-# 21. main Run Success
+
+# 21. main Run Success (v1 and v2)
 def test_main_run_success(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     results_root = tmp_path / "results"
     synthetic_ds = {
@@ -500,20 +516,64 @@ def test_main_run_success(tmp_path: Path, capsys: pytest.CaptureFixture[str]) ->
                     "scripts.run_candidate_c_measurement.build_candidate_c_execution_evidence_manifest",
                     return_value=manifest,
                 ):
-                    code = main(["--run", "--results-root", str(results_root)])
-                    assert code == 0
-                    out = capsys.readouterr().out
-                    assert "Candidate C Measurement Completed:" in out
-                    assert "Run ID:" in out
+                    code_v2 = main(
+                        ["--run", "--protocol", "v2", "--results-root", str(results_root)]
+                    )
+                    assert code_v2 == 0
+                    out_v2 = capsys.readouterr().out
+                    assert "Candidate C Measurement Completed:" in out_v2
+                    assert "Run ID:" in out_v2
+
+                    code_v1 = main(
+                        ["--run", "--protocol", "v1", "--results-root", str(results_root)]
+                    )
+                    assert code_v1 == 0
+                    out_v1 = capsys.readouterr().out
+                    assert "Candidate C Measurement Completed:" in out_v1
+                    assert "Run ID:" in out_v1
 
 
-# 22. main Run Error Returns 1
+# 22. main Run Missing Protocol Fails Closed
+def test_main_run_missing_protocol_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    results_root = tmp_path / "results"
+    results_root.mkdir()
+
+    with patch("scripts.run_candidate_c_measurement.load_direct_d1_datasets") as mock_load:
+        with patch(
+            "scripts.run_candidate_c_measurement.execute_candidate_c_measurement"
+        ) as mock_exec:
+            code = main(["--run", "--results-root", str(results_root)])
+            assert code == 1
+            err = capsys.readouterr().err
+            assert "Candidate C measurement requires explicit protocol selection" in err
+            assert "--protocol {v1,v2}" in err
+            mock_load.assert_not_called()
+            mock_exec.assert_not_called()
+            # Verify no result directories were created
+            assert list(results_root.iterdir()) == []
+
+
+# 23. execute_candidate_c_measurement Rejects Missing Protocol
+def test_execute_candidate_c_measurement_rejects_missing_protocol(tmp_path: Path) -> None:
+    config = CandidateCRunnerConfig(
+        protocol=None,
+        results_root=tmp_path / "results",
+    )
+    with patch("scripts.run_candidate_c_measurement.load_direct_d1_datasets") as mock_load:
+        with pytest.raises(ValueError, match="requires explicit protocol selection"):
+            execute_candidate_c_measurement(config)
+        mock_load.assert_not_called()
+
+
+# 24. main Run Error Returns 1
 def test_main_run_error_returns_one(capsys: pytest.CaptureFixture[str]) -> None:
     with patch(
         "scripts.run_candidate_c_measurement.execute_candidate_c_measurement",
         side_effect=RuntimeError("Test error"),
     ):
-        code = main(["--run"])
+        code = main(["--run", "--protocol", "v2"])
         assert code == 1
         err = capsys.readouterr().err
         assert "ERROR: Candidate C measurement failed: Test error" in err

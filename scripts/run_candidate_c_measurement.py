@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Runner for Candidate C v1 Real-Data Measurement.
+"""Runner for Candidate C Real-Data Measurement (v1 and v2).
 
 Orchestrates the frozen Candidate C measurement engine against validated local evidence.
-Enforces research boundaries, Git worktree cleanliness, and ADR 0008 preregistration integrity.
+Enforces research boundaries, Git worktree cleanliness, and preregistration ADR integrity.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from fxlab.research.candidate_c_measurement import (
     CANDIDATE_C_END,
     CANDIDATE_C_PAIRS,
     CANDIDATE_C_START,
+    CANDIDATE_C_V2_ADR_SHA256,
     CandidateCCodeEnvironment,
     CandidateCMeasurementResult,
     canonical_candidate_c_result,
@@ -38,7 +39,9 @@ from fxlab.research.candidate_c_measurement import (
 DEFAULT_DIRECT_D1_ROOT = Path("E:/jarvis-data/raw_dukascopy_direct_d1")
 DEFAULT_EXECUTION_EVIDENCE_ROOT = Path("E:/jarvis-data/candidate_c_execution_2014_2023")
 DEFAULT_RESULTS_ROOT = Path("E:/jarvis-data/candidate-c-results")
-DEFAULT_ADR_PATH = Path("docs/adr/0008-candidate-c-cross-sectional-reversal-preregistration.md")
+DEFAULT_V1_ADR_PATH = Path("docs/adr/0008-candidate-c-cross-sectional-reversal-preregistration.md")
+DEFAULT_V2_ADR_PATH = Path("docs/adr/0009-candidate-c-v2-tradable-session-exit-preregistration.md")
+DEFAULT_ADR_PATH = DEFAULT_V2_ADR_PATH
 
 
 def get_git_environment(cwd: Path | str | None = None) -> CandidateCCodeEnvironment:
@@ -67,16 +70,22 @@ def get_git_environment(cwd: Path | str | None = None) -> CandidateCCodeEnvironm
     return CandidateCCodeEnvironment(commit=commit, worktree_clean=is_clean)
 
 
-def verify_adr_preregistration(adr_path: Path | str) -> None:
-    """Verify that the ADR 0008 preregistration document matches the immutable hash."""
+def verify_adr_preregistration(
+    adr_path: Path | str,
+    protocol: str = "v2",
+) -> None:
+    """Verify that the ADR preregistration document matches the immutable hash."""
     path = Path(adr_path)
     if not path.is_file():
-        raise FileNotFoundError(f"ADR 0008 file not found at {path}")
+        adr_name = "0008" if protocol == "v1" else "0009"
+        raise FileNotFoundError(f"ADR {adr_name} file not found at {path}")
     content = path.read_bytes()
     computed_sha = hashlib.sha256(content).hexdigest()
-    if computed_sha != CANDIDATE_C_ADR_SHA256:
+    expected_sha = CANDIDATE_C_ADR_SHA256 if protocol == "v1" else CANDIDATE_C_V2_ADR_SHA256
+    adr_name = "0008" if protocol == "v1" else "0009"
+    if computed_sha != expected_sha:
         raise ValueError(
-            f"ADR 0008 SHA256 mismatch: expected {CANDIDATE_C_ADR_SHA256}, got {computed_sha}"
+            f"ADR {adr_name} SHA256 mismatch: expected {expected_sha}, got {computed_sha}"
         )
 
 
@@ -112,9 +121,10 @@ def load_direct_d1_datasets(
 
 def format_text_report(result: CandidateCMeasurementResult) -> str:
     """Format human-readable Candidate C measurement report."""
+    version_label = "v2" if "v2" in result.schema else "v1"
     lines = [
         "==================================================",
-        "FXLab — Candidate C v1 Measurement Report",
+        f"FXLab — Candidate C {version_label} Measurement Report",
         "==================================================",
         f"Run ID:        {result.run_id}",
         f"Policy ID:     {result.policy_id}",
@@ -188,17 +198,28 @@ def save_measurement_artifacts(
 
 @dataclass(frozen=True)
 class CandidateCRunnerConfig:
+    protocol: str | None = None
     direct_d1_root: Path = DEFAULT_DIRECT_D1_ROOT
     execution_evidence_root: Path = DEFAULT_EXECUTION_EVIDENCE_ROOT
     results_root: Path = DEFAULT_RESULTS_ROOT
-    adr_path: Path = DEFAULT_ADR_PATH
+    adr_path: Path | None = None
     repo_root: Path | None = None
 
 
 def execute_candidate_c_measurement(config: CandidateCRunnerConfig) -> CandidateCMeasurementResult:
     """Execute preflight checks, evidence loading, measurement, and artifact persistence."""
+    if config.protocol not in ("v1", "v2"):
+        raise ValueError(
+            "Candidate C measurement requires explicit protocol selection: --protocol {v1,v2}"
+        )
+
+    protocol_version = 1 if config.protocol == "v1" else 2
+    adr_path = config.adr_path or (
+        DEFAULT_V1_ADR_PATH if protocol_version == 1 else DEFAULT_V2_ADR_PATH
+    )
+
     # 1. ADR Check
-    verify_adr_preregistration(config.adr_path)
+    verify_adr_preregistration(adr_path, protocol=config.protocol)
 
     # 2. Git Check
     code_env = get_git_environment(config.repo_root)
@@ -223,6 +244,7 @@ def execute_candidate_c_measurement(config: CandidateCRunnerConfig) -> Candidate
         datasets=datasets,
         execution_manifest=manifest,
         code_environment=code_env,
+        version=protocol_version,
     )
 
     # 6. Save Artifacts
@@ -234,12 +256,18 @@ def execute_candidate_c_measurement(config: CandidateCRunnerConfig) -> Candidate
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point for Candidate C measurement runner."""
     parser = argparse.ArgumentParser(
-        description="FXLab Candidate C v1 Real-Data Measurement Runner",
+        description="FXLab Candidate C Real-Data Measurement Runner",
     )
     parser.add_argument(
         "--run",
         action="store_true",
         help="Execute Candidate C measurement against local evidence.",
+    )
+    parser.add_argument(
+        "--protocol",
+        choices=["v1", "v2"],
+        default=None,
+        help="Candidate C preregistration protocol version (required with --run: v1 or v2)",
     )
     parser.add_argument(
         "--direct-d1-root",
@@ -265,19 +293,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--adr-path",
         type=Path,
-        default=DEFAULT_ADR_PATH,
-        help=f"Path to ADR 0008 preregistration markdown (default: {DEFAULT_ADR_PATH})",
+        default=None,
+        help="Path to preregistration ADR markdown (default: ADR 0008 for v1, ADR 0009 for v2)",
     )
 
     args = parser.parse_args(argv)
 
     if not args.run:
-        print("Candidate C Real-Data Measurement Runner V1")
-        print("Use --run to execute measurement against local evidence.")
+        print("Candidate C Real-Data Measurement Runner")
+        print("Use --run with --protocol {v1,v2} to execute measurement against local evidence.")
         print("Use --help for options.")
         return 0
 
+    if args.protocol is None:
+        print(
+            "ERROR: Candidate C measurement requires explicit protocol selection: "
+            "--protocol {v1,v2}",
+            file=sys.stderr,
+        )
+        return 1
+
     config = CandidateCRunnerConfig(
+        protocol=args.protocol,
         direct_d1_root=args.direct_d1_root,
         execution_evidence_root=args.execution_evidence_root,
         results_root=args.results_root,

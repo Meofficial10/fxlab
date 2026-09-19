@@ -43,6 +43,9 @@ from fxlab.research.candidate_c_execution_evidence import (
 
 CANDIDATE_C_ADR_SHA256 = "375e88e341596769092dac5e648fadfc709c5fb8b7769a53567e34fe832bbf67"
 CANDIDATE_C_PREREGISTRATION_COMMIT = "1348402b7374dcc8f2dfef9537fe876c9b561a6d"
+CANDIDATE_C_V2_ADR_SHA256 = "596ff67bbba0a40964e3d7367947c880975e7952e2a9f2256ee163ce4cac900c"
+CANDIDATE_C_V2_PREREGISTRATION_COMMIT = "e7fc284c749d5bc17f6695785c50554986480266"
+CANDIDATE_C_V2_PROTOCOL_ID = "candidate_c_cross_sectional_reversal.v2"
 CANDIDATE_C_PAIRS = CANDIDATE_C_EXECUTION_PAIRS
 CANDIDATE_C_INVERSE_PAIRS = frozenset(("USDCAD", "USDCHF", "USDJPY"))
 CANDIDATE_C_START = datetime(2014, 1, 1, tzinfo=UTC)
@@ -100,6 +103,28 @@ class CandidateCPolicy:
 
 
 def _policy_payload(policy: CandidateCPolicy) -> dict[str, object]:
+    if policy.candidate_version == 1:
+        execution = (
+            "all_seven_first_valid_00h_bid_ask",
+            "causal_entry_non_entry",
+            "unavailable_exit_is_not_evaluable",
+            "no_fallback",
+        )
+        decision = "adr_0008_section_8_exact"
+    elif policy.candidate_version == 2:
+        execution = (
+            "all_seven_first_valid_00h_bid_ask",
+            "causal_entry_non_entry",
+            "tradable_session_exit_search_max_7_days",
+            "evidenced_non_execution_skip_absent_or_empty",
+            "unverifiable_exit_is_not_evaluable",
+            "split_and_seal_boundary_crossing_purge",
+            "no_fallback",
+        )
+        decision = "adr_0009_exact"
+    else:
+        raise ValueError(f"unsupported candidate version {policy.candidate_version}")
+
     return {
         "schema": policy.schema,
         "candidate_id": policy.candidate_id,
@@ -118,12 +143,7 @@ def _policy_payload(policy: CandidateCPolicy) -> dict[str, object]:
             policy.selected_weight,
             "selection_boundary_tie_is_non_entry",
         ),
-        "execution": (
-            "all_seven_first_valid_00h_bid_ask",
-            "causal_entry_non_entry",
-            "unavailable_exit_is_not_evaluable",
-            "no_fallback",
-        ),
+        "execution": execution,
         "cost": (
             policy.headline_factor,
             policy.stress_factor,
@@ -145,12 +165,22 @@ def _policy_payload(policy: CandidateCPolicy) -> dict[str, object]:
             "student_t_one_sided",
             "no_randomness",
         ),
-        "decision": "adr_0008_section_8_exact",
+        "decision": decision,
     }
 
 
-def build_candidate_c_policy() -> CandidateCPolicy:
-    return CandidateCPolicy()
+def build_candidate_c_policy(version: int = 1) -> CandidateCPolicy:
+    if version == 1:
+        return CandidateCPolicy()
+    if version == 2:
+        return CandidateCPolicy(
+            schema="candidate_c_measurement_policy.v2",
+            candidate_version=2,
+            adr_path="docs/adr/0009-candidate-c-v2-tradable-session-exit-preregistration.md",
+            adr_sha256=CANDIDATE_C_V2_ADR_SHA256,
+            preregistration_commit=CANDIDATE_C_V2_PREREGISTRATION_COMMIT,
+        )
+    raise ValueError(f"unsupported Candidate C version: {version}")
 
 
 @dataclass(frozen=True)
@@ -584,7 +614,7 @@ def build_candidate_c_run_id(
     execution_state_counts: Sequence[tuple[str, int]],
     audit_context: Mapping[str, object] | None = None,
 ) -> str:
-    expected_policy = build_candidate_c_policy()
+    expected_policy = build_candidate_c_policy(version=policy.candidate_version)
     if policy != expected_policy or policy.policy_id != expected_policy.policy_id:
         raise ValueError("wrong Candidate C frozen policy")
     if not code_environment.worktree_clean:
@@ -597,9 +627,10 @@ def build_candidate_c_run_id(
     ):
         raise ValueError("Candidate C execution identities are invalid")
     del audit_context
+    schema = f"candidate_c_measurement_run.v{policy.candidate_version}"
     return canonical_sha256(
         {
-            "schema": "candidate_c_measurement_run.v1",
+            "schema": schema,
             "policy_id": policy.policy_id,
             "code_commit": code_environment.commit,
             "datasets": semantics,
@@ -803,6 +834,49 @@ def _split_result(
     )
 
 
+def _find_v2_exit(
+    *,
+    signal_at: datetime,
+    split_end: datetime,
+    lookup: Mapping[tuple[str, datetime], CandidateCExecutionEvidence],
+) -> tuple[str, datetime | None, tuple[str, ...]]:
+    """Search next tradable D1 session for Candidate C v2 across at most 7 calendar days.
+
+    Returns (status, exit_at, reasons):
+    - ("found", exit_at, ())
+    - ("purged", None, ())
+    - ("not_evaluable", None, (reasons...))
+    """
+    for k in range(1, 8):
+        candidate_boundary = signal_at + timedelta(days=k)
+        if candidate_boundary >= split_end:
+            return "purged", None, ()
+        records = tuple(lookup.get((pair, candidate_boundary)) for pair in CANDIDATE_C_PAIRS)
+        if any(record is None for record in records):
+            return "not_evaluable", None, ("missing_local_partition",)
+        states = tuple(record.state for record in records if record is not None)
+        if all(state is CandidateCExecutionState.AVAILABLE for state in states):
+            return "found", candidate_boundary, ()
+        if all(
+            state
+            in (
+                CandidateCExecutionState.ABSENT_EVIDENCED,
+                CandidateCExecutionState.EMPTY_EVIDENCED,
+            )
+            for state in states
+        ):
+            continue
+        reasons: list[str] = []
+        for record in records:
+            if record is not None and record.state is not CandidateCExecutionState.AVAILABLE:
+                reasons.append(f"exit_{record.state.value}")
+        if not reasons:
+            reasons.append("exit_unverifiable_boundary")
+        return "not_evaluable", None, tuple(sorted(set(reasons)))
+
+    return "not_evaluable", None, ("next_tradable_session_not_found_within_7_boundaries",)
+
+
 def _result(
     *,
     policy: CandidateCPolicy,
@@ -812,8 +886,13 @@ def _result(
     validation: CandidateCSplitResult | None,
     state_counts: tuple[tuple[str, int], ...],
 ) -> CandidateCMeasurementResult:
+    schema = (
+        "candidate_c_measurement_result.v2"
+        if policy.candidate_version == 2
+        else "candidate_c_measurement_result.v1"
+    )
     payload = {
-        "schema": "candidate_c_measurement_result.v1",
+        "schema": schema,
         "policy_id": policy.policy_id,
         "run_id": run_id,
         "decision": decision,
@@ -822,7 +901,7 @@ def _result(
         "execution_state_counts": state_counts,
     }
     return CandidateCMeasurementResult(
-        "candidate_c_measurement_result.v1",
+        schema,
         policy.policy_id,
         run_id,
         decision.decision,
@@ -840,9 +919,12 @@ def measure_candidate_c(
     datasets: Mapping[str, BarDataset],
     execution_manifest: CandidateCExecutionEvidenceManifest,
     code_environment: CandidateCCodeEnvironment,
+    policy: CandidateCPolicy | None = None,
+    version: int | None = None,
 ) -> CandidateCMeasurementResult:
-    """Measure frozen Candidate C v1 from already-validated, sealed typed evidence."""
-    policy = build_candidate_c_policy()
+    """Measure frozen Candidate C from already-validated, sealed typed evidence."""
+    if policy is None:
+        policy = build_candidate_c_policy(version=version or 1)
     _verify_execution_manifest(execution_manifest)
     semantics = _dataset_semantics(datasets)
     run_id = build_candidate_c_run_id(
@@ -899,6 +981,7 @@ def measure_candidate_c(
     pair_headline = {name: defaultdict(float) for name in split_dates}
     pair_stress = {name: defaultdict(float) for name in split_dates}
     not_evaluable: list[str] = []
+    active_until: datetime | None = None
 
     for position in range(5, len(index)):
         signal_at = (index[position] + pd.Timedelta(days=1)).to_pydatetime()
@@ -906,6 +989,9 @@ def measure_candidate_c(
             break
         if not validate_candidate_c_signal_boundary(signal_at):
             continue
+        if active_until is not None and signal_at < active_until:
+            continue
+        active_until = None
         split = "train" if signal_at < CANDIDATE_C_TRAIN_END else "validation"
         scores = {
             pair: candidate_c_score(
@@ -937,22 +1023,38 @@ def measure_candidate_c(
                 if record is not None and record.state is not CandidateCExecutionState.AVAILABLE:
                     non_entries[split][record.state.value] += 1
             continue
-        exit_at = signal_at + timedelta(days=1)
-        exit_records = tuple(lookup.get((pair, exit_at)) for pair in CANDIDATE_C_PAIRS)
-        if any(record is None for record in exit_records):
-            not_evaluable.append("missing_local_partition_after_entry")
-            break
-        exit_states = tuple(record.state for record in exit_records if record is not None)
-        if (
-            candidate_c_entry_disposition(exit_states, after_entry=True)
-            is not CandidateCEntryDisposition.ENTER
-        ):
-            not_evaluable.extend(
-                f"exit_{record.state.value}"
-                for record in exit_records
-                if record is not None and record.state is not CandidateCExecutionState.AVAILABLE
+
+        if policy.candidate_version == 1:
+            exit_at = signal_at + timedelta(days=1)
+            exit_records = tuple(lookup.get((pair, exit_at)) for pair in CANDIDATE_C_PAIRS)
+            if any(record is None for record in exit_records):
+                not_evaluable.append("missing_local_partition_after_entry")
+                break
+            exit_states = tuple(record.state for record in exit_records if record is not None)
+            if (
+                candidate_c_entry_disposition(exit_states, after_entry=True)
+                is not CandidateCEntryDisposition.ENTER
+            ):
+                not_evaluable.extend(
+                    f"exit_{record.state.value}"
+                    for record in exit_records
+                    if record is not None and record.state is not CandidateCExecutionState.AVAILABLE
+                )
+                break
+        else:
+            split_end = CANDIDATE_C_TRAIN_END if split == "train" else CANDIDATE_C_END
+            status, resolved_exit, reasons = _find_v2_exit(
+                signal_at=signal_at, split_end=split_end, lookup=lookup
             )
-            break
+            if status == "purged":
+                continue
+            if status == "not_evaluable":
+                not_evaluable.extend(reasons)
+                break
+            assert resolved_exit is not None
+            exit_at = resolved_exit
+            active_until = exit_at
+
         gross_return = headline_return = stress_return = 0.0
         for pair, weight in selected:
             entry_record = lookup[(pair, signal_at)]
@@ -989,9 +1091,9 @@ def measure_candidate_c(
         if day_offset is None:
             not_evaluable.append("cohort_exit_outside_split")
             break
-        daily[split]["gross"][day_offset] = gross_return
-        daily[split]["headline"][day_offset] = headline_return
-        daily[split]["stress"][day_offset] = stress_return
+        daily[split]["gross"][day_offset] += gross_return
+        daily[split]["headline"][day_offset] += headline_return
+        daily[split]["stress"][day_offset] += stress_return
         cohorts[split]["gross"].append(gross_return)
         cohorts[split]["headline"].append(headline_return)
         cohorts[split]["stress"].append(stress_return)
@@ -1061,6 +1163,9 @@ def canonical_candidate_c_result(result: object) -> bytes:
 __all__ = [
     "CANDIDATE_C_ADR_SHA256",
     "CANDIDATE_C_PAIRS",
+    "CANDIDATE_C_V2_ADR_SHA256",
+    "CANDIDATE_C_V2_PREREGISTRATION_COMMIT",
+    "CANDIDATE_C_V2_PROTOCOL_ID",
     "CandidateCCodeEnvironment",
     "CandidateCDecision",
     "CandidateCDecisionResult",
