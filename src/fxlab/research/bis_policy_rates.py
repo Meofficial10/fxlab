@@ -67,8 +67,11 @@ CURRENCY_TO_SERIES: Mapping[str, str] = MappingProxyType(
 START_INCLUSIVE: date = date(2014, 1, 1)
 END_EXCLUSIVE: date = date(2024, 1, 1)
 SOURCE_REQUEST_END_INCLUSIVE: date = date(2023, 12, 31)
+INITIALIZATION_END_INCLUSIVE: date = START_INCLUSIVE - timedelta(days=1)
+INITIALIZATION_CONTRACT_VERSION = "bis_cbpol_boundary_initialization_v1"
+INITIALIZATION_ACQUISITION_RULE = "endPeriod=start_minus_one_day,lastNObservations=1"
 
-NORMALIZATION_VERSION = "bis_cbpol_daily_v2"
+NORMALIZATION_VERSION = "bis_cbpol_daily_v3"
 
 BIS_SDMX_API_BASE_URL = "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0"
 BIS_SDMX_XML_ACCEPT = "application/vnd.sdmx.structurespecificdata+xml;version=2.1"
@@ -176,6 +179,15 @@ def build_bis_all_series_request_urls() -> dict[str, str]:
         series_key: build_bis_series_request_url(series_key) for series_key in FROZEN_SERIES_KEYS
     }
 
+
+def build_bis_initialization_request_url(series_key: str) -> str:
+    """Build the frozen direct-predecessor query from ADR 0016."""
+    if series_key not in FROZEN_SERIES_KEYS:
+        raise ValueError(f"unsupported series_key {series_key}; must be in {FROZEN_SERIES_KEYS}")
+    return (
+        f"{BIS_SDMX_API_BASE_URL}/{series_key}"
+        f"?endPeriod={INITIALIZATION_END_INCLUSIVE.isoformat()}&lastNObservations=1"
+    )
 
 class BisObservationValidationError(ValueError):
     """Structured fail-closed error capturing diagnostic context on validation failure."""
@@ -366,6 +378,55 @@ def compute_raw_evidence_identity(raw: BisRawArtifact) -> str:
 
 
 @dataclass(frozen=True)
+class BisInitializationEvidence:
+    """Immutable same-series predecessor evidence under ADR 0016."""
+
+    series_key: str
+    raw_byte_count: int
+    raw_sha256: str
+    raw_payload: bytes
+    selected_predecessor_date: date
+    selected_predecessor_value: Decimal
+    source_obs_status: str
+    obs_conf: str | None = None
+    obs_pre_break: str | None = None
+    provider: str = "Bank for International Settlements (BIS)"
+    dataset_identifier: str = BIS_DATASET_IDENTIFIER
+    dataset_version: str = BIS_DATAFLOW_VERSION
+    initialization_contract_version: str = INITIALIZATION_CONTRACT_VERSION
+    acquisition_rule: str = INITIALIZATION_ACQUISITION_RULE
+    end_inclusive: str = "2013-12-31"
+    last_n_observations: int = 1
+    start_inclusive: str = "2014-01-01"
+    research_end_exclusive: str = "2024-01-01"
+    normalization_version: str = NORMALIZATION_VERSION
+
+    def __post_init__(self) -> None:
+        if self.series_key not in FROZEN_SERIES_KEYS:
+            raise ValueError(f"unsupported initialization series: {self.series_key}")
+        if self.raw_byte_count <= 0 or not _SHA_RE.fullmatch(self.raw_sha256):
+            raise ValueError("initialization raw byte count/hash invalid")
+        if self.raw_byte_count != len(self.raw_payload):
+            raise ValueError("initialization raw byte count mismatch")
+        if self.raw_sha256 != hashlib.sha256(self.raw_payload).hexdigest():
+            raise ValueError("initialization raw SHA-256 mismatch")
+        if self.selected_predecessor_date >= START_INCLUSIVE:
+            raise ValueError("initialization predecessor must be strictly before START_INCLUSIVE")
+        if not self.selected_predecessor_value.is_finite():
+            raise ValueError("initialization predecessor must be finite")
+        if self.end_inclusive != INITIALIZATION_END_INCLUSIVE.isoformat():
+            raise ValueError("initialization end bound mismatch")
+        if self.last_n_observations != 1:
+            raise ValueError("initialization must request exactly lastNObservations=1")
+        if self.normalization_version != NORMALIZATION_VERSION:
+            raise ValueError("initialization normalization version mismatch")
+
+
+def compute_initialization_evidence_identity(evidence: BisInitializationEvidence) -> str:
+    """Hash every decision-relevant initialization evidence field."""
+    return canonical_sha256(evidence)
+
+@dataclass(frozen=True)
 class BisNormalizedDataset:
     """Normalized, validated, and deterministically ordered BIS policy rates dataset."""
 
@@ -376,6 +437,7 @@ class BisNormalizedDataset:
     records: tuple[PolicyRateRecord, ...] = ()
     record_count: int = 0
     raw_evidence_identity: str = ""
+    initialization_evidence_identities: tuple[tuple[str, str], ...] = ()
     point_in_time_status: str = "UNRESOLVED"
     normalized_identity: str = field(default="", compare=True)
 
@@ -384,6 +446,20 @@ class BisNormalizedDataset:
             raise ValueError(f"schema must be {NORMALIZATION_VERSION}")
         if tuple(sorted(self.series_keys)) != FROZEN_SERIES_KEYS:
             raise ValueError("series_keys must match frozen eight series")
+        if (
+            tuple(key for key, _ in self.initialization_evidence_identities)
+            != FROZEN_SERIES_KEYS
+        ):
+            raise ValueError(
+                "initialization evidence identities must cover frozen series in order"
+            )
+        if any(
+            not _SHA_RE.fullmatch(identity)
+            for _, identity in self.initialization_evidence_identities
+        ):
+            raise ValueError(
+                "initialization evidence identity must be a lowercase SHA-256"
+            )
         if len(self.records) != self.record_count:
             raise ValueError(
                 f"record_count mismatch: {len(self.records)} != {self.record_count}"
@@ -413,6 +489,7 @@ def compute_normalized_evidence_identity(dataset: BisNormalizedDataset) -> str:
         "end_exclusive": dataset.end_exclusive,
         "record_count": dataset.record_count,
         "raw_evidence_identity": dataset.raw_evidence_identity,
+        "initialization_evidence_identities": dataset.initialization_evidence_identities,
         "point_in_time_status": dataset.point_in_time_status,
         "records": [
             {
@@ -461,6 +538,7 @@ RawObsTuple = tuple[date, str, str, str | None, str | None, str | None]
 def _normalize_series_observations(
     series_key: str,
     raw_obs_list: list[RawObsTuple],
+    initialization_evidence: BisInitializationEvidence | None = None,
 ) -> list[PolicyRateRecord]:
     """Normalize and deterministically persist policy-rate states for a single series.
 
@@ -500,8 +578,18 @@ def _normalize_series_observations(
     sorted_obs = sorted(raw_obs_list, key=lambda x: x[0])
 
     records: list[PolicyRateRecord] = []
-    last_finite_state: Decimal | None = None
-    last_finite_date: date | None = None
+    if initialization_evidence is not None and initialization_evidence.series_key != series_key:
+        raise ValueError("initialization evidence series mismatch")
+    last_finite_state = (
+        initialization_evidence.selected_predecessor_value
+        if initialization_evidence is not None
+        else None
+    )
+    last_finite_date = (
+        initialization_evidence.selected_predecessor_date
+        if initialization_evidence is not None
+        else None
+    )
 
     for (
         obs_date,
@@ -587,6 +675,7 @@ def _normalize_series_observations(
 def parse_sdmx_csv_payload(
     body: str | bytes,
     expected_series: str | None = None,
+    initialization_evidence: BisInitializationEvidence | None = None,
 ) -> list[PolicyRateRecord]:
     """Parse observations from an SDMX-CSV BIS response."""
     text = body.decode("utf-8") if isinstance(body, bytes) else body
@@ -659,13 +748,18 @@ def parse_sdmx_csv_payload(
 
     all_records: list[PolicyRateRecord] = []
     for sk in sorted(raw_by_series.keys()):
-        all_records.extend(_normalize_series_observations(sk, raw_by_series[sk]))
+        all_records.extend(
+            _normalize_series_observations(
+                sk, raw_by_series[sk], initialization_evidence
+            )
+        )
     return all_records
 
 
 def parse_sdmx_xml_payload(
     body: str | bytes,
     expected_series: str | None = None,
+    initialization_evidence: BisInitializationEvidence | None = None,
 ) -> list[PolicyRateRecord]:
     """Parse observations from an SDMX-ML StructureSpecificData XML BIS response."""
     raw_bytes = body.encode("utf-8") if isinstance(body, str) else body
@@ -821,13 +915,94 @@ def parse_sdmx_xml_payload(
 
     all_records: list[PolicyRateRecord] = []
     for sk in sorted(raw_by_series.keys()):
-        all_records.extend(_normalize_series_observations(sk, raw_by_series[sk]))
+        all_records.extend(
+            _normalize_series_observations(
+                sk, raw_by_series[sk], initialization_evidence
+            )
+        )
     return all_records
 
+
+def parse_bis_initialization_payload(
+    body: str | bytes,
+    *,
+    expected_series: str,
+) -> BisInitializationEvidence:
+    """Validate the single direct-predecessor response frozen by ADR 0016."""
+    if expected_series not in FROZEN_SERIES_KEYS:
+        raise ValueError(f"unsupported initialization series: {expected_series}")
+    raw_bytes = body.encode("utf-8") if isinstance(body, str) else body
+    if not raw_bytes:
+        raise ValueError("empty initialization payload")
+    try:
+        root = ET.fromstring(raw_bytes)
+    except ET.ParseError as exc:
+        raise ValueError(f"malformed initialization XML payload: {exc}") from exc
+
+    observations: list[tuple[str, str, str | None, str | None, str | None]] = []
+    seen_series: set[str] = set()
+    for elem in root.iter():
+        tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+        if tag != "Series":
+            continue
+        area = (elem.attrib.get("REF_AREA") or elem.attrib.get("ref_area") or "").strip()
+        series_key = (elem.attrib.get("SERIES_KEY") or f"D.{area}").strip()
+        seen_series.add(series_key)
+        if series_key != expected_series:
+            raise ValueError(
+                f"initialization series mismatch: expected {expected_series}, got {series_key}"
+            )
+        for child in elem:
+            child_tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            if child_tag != "Obs":
+                continue
+            observations.append(
+                (
+                    (child.attrib.get("TIME_PERIOD") or "").strip(),
+                    (child.attrib.get("OBS_VALUE") or "").strip(),
+                    (child.attrib.get("OBS_STATUS") or "").strip() or None,
+                    (child.attrib.get("OBS_CONF") or "").strip() or None,
+                    (child.attrib.get("OBS_PRE_BREAK") or "").strip() or None,
+                )
+            )
+
+    if seen_series != {expected_series}:
+        raise ValueError(f"initialization series mismatch: expected only {expected_series}")
+    if len(observations) != 1:
+        raise ValueError("initialization response must contain exactly one observation")
+
+    time_period, raw_value, obs_status, obs_conf, obs_pre_break = observations[0]
+    try:
+        predecessor_date = date.fromisoformat(time_period)
+    except ValueError as exc:
+        raise ValueError("malformed initialization predecessor date") from exc
+    if predecessor_date >= START_INCLUSIVE:
+        raise ValueError("initialization predecessor must be strictly before START_INCLUSIVE")
+    try:
+        predecessor_value = _parse_decimal(raw_value)
+    except ValueError as exc:
+        raise ValueError("initialization predecessor must be finite") from exc
+    if obs_status == "M":
+        raise ValueError("initialization predecessor must be finite and non-missing")
+    if obs_pre_break is not None and obs_pre_break != raw_value:
+        raise ValueError("initialization predecessor has ambiguous structural transition")
+
+    return BisInitializationEvidence(
+        series_key=expected_series,
+        raw_byte_count=len(raw_bytes),
+        raw_sha256=hashlib.sha256(raw_bytes).hexdigest(),
+        raw_payload=raw_bytes,
+        selected_predecessor_date=predecessor_date,
+        selected_predecessor_value=predecessor_value,
+        source_obs_status=obs_status or "A",
+        obs_conf=obs_conf,
+        obs_pre_break=obs_pre_break,
+    )
 
 def normalize_bis_policy_rate_payloads(
     raw_payloads_by_series: Mapping[str, bytes],
     *,
+    initialization_payloads_by_series: Mapping[str, bytes],
     content_format: str = "sdmx-xml",
 ) -> BisNormalizedDataset:
     """Normalize, cross-validate, and package multi-series BIS raw payloads into
@@ -844,6 +1019,20 @@ def normalize_bis_policy_rate_payloads(
         if extra:
             raise ValueError(f"unknown series payloads provided: {sorted(extra)}")
 
+    provided_initialization_keys = set(initialization_payloads_by_series.keys())
+    if provided_initialization_keys != expected_keys:
+        missing = expected_keys - provided_initialization_keys
+        extra = provided_initialization_keys - expected_keys
+        if missing:
+            raise ValueError(f"missing required initialization payloads: {sorted(missing)}")
+        raise ValueError(f"unknown initialization payloads provided: {sorted(extra)}")
+
+    initialization_evidence = {
+        series_key: parse_bis_initialization_payload(
+            initialization_payloads_by_series[series_key], expected_series=series_key
+        )
+        for series_key in FROZEN_SERIES_KEYS
+    }
     all_records_map: dict[tuple[str, date], PolicyRateRecord] = {}
     combined_bytes = bytearray()
 
@@ -856,9 +1045,17 @@ def normalize_bis_policy_rate_payloads(
         combined_bytes.extend(body)
 
         if content_format == "sdmx-xml":
-            records = parse_sdmx_xml_payload(body, expected_series=series_key)
+            records = parse_sdmx_xml_payload(
+                body,
+                expected_series=series_key,
+                initialization_evidence=initialization_evidence[series_key],
+            )
         elif content_format == "sdmx-csv":
-            records = parse_sdmx_csv_payload(body, expected_series=series_key)
+            records = parse_sdmx_csv_payload(
+                body,
+                expected_series=series_key,
+                initialization_evidence=initialization_evidence[series_key],
+            )
         else:
             raise ValueError(f"unsupported content_format: {content_format}")
 
@@ -904,6 +1101,13 @@ def normalize_bis_policy_rate_payloads(
         records=sorted_records,
         record_count=len(sorted_records),
         raw_evidence_identity=raw_identity,
+        initialization_evidence_identities=tuple(
+            (
+                series_key,
+                compute_initialization_evidence_identity(initialization_evidence[series_key]),
+            )
+            for series_key in FROZEN_SERIES_KEYS
+        ),
     )
 
 
@@ -1048,7 +1252,10 @@ def publish_canonical_acquisition_bundle(
     normalized_dataset: BisNormalizedDataset,
     raw_output_dir: Path,
     normalized_output_file: Path,
-) -> tuple[dict[str, Path], Path]:
+    *,
+    initialization_artifacts_by_series: Mapping[str, BisInitializationEvidence] | None = None,
+    initialization_output_dir: Path | None = None,
+) -> tuple[dict[str, Path], Path] | tuple[dict[str, Path], dict[str, Path], Path]:
     """Transactionally publish complete canonical acquisition bundle.
 
     Safety contract:
@@ -1067,7 +1274,16 @@ def publish_canonical_acquisition_bundle(
             f"bundle requires all eight frozen series, got {sorted(raw_artifacts_by_series.keys())}"
         )
 
+    if (initialization_artifacts_by_series is None) != (initialization_output_dir is None):
+        raise ValueError("initialization artifacts and output directory must be provided together")
+    if initialization_artifacts_by_series is not None and (
+        set(initialization_artifacts_by_series) != set(FROZEN_SERIES_KEYS)
+    ):
+        raise ValueError("bundle requires initialization evidence for all eight series")
+
     raw_output_dir.mkdir(parents=True, exist_ok=True)
+    if initialization_output_dir is not None:
+        initialization_output_dir.mkdir(parents=True, exist_ok=True)
     normalized_output_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Determine all target paths and contents
@@ -1078,11 +1294,23 @@ def publish_canonical_acquisition_bundle(
         raw_content = canonical_json(raw_art)
         raw_targets[series_key] = (raw_path, raw_content)
 
+    initialization_targets: dict[str, tuple[Path, str]] = {}
+    if initialization_artifacts_by_series is not None and initialization_output_dir is not None:
+        for series_key in FROZEN_SERIES_KEYS:
+            evidence = initialization_artifacts_by_series[series_key]
+            if evidence.series_key != series_key:
+                raise ValueError("initialization artifact series mismatch")
+            identity = compute_initialization_evidence_identity(evidence)
+            target = initialization_output_dir / (
+                f"bis_cbpol_initialization_{series_key}_{identity[:16]}.json"
+            )
+            initialization_targets[series_key] = (target, canonical_json(evidence))
     norm_target_path = normalized_output_file
     norm_content = canonical_json(normalized_dataset)
 
     # Phase 1: Pre-check all targets for conflicts
     all_targets: list[tuple[Path, str]] = list(raw_targets.values())
+    all_targets.extend(initialization_targets.values())
     all_targets.append((norm_target_path, norm_content))
 
     preexisting_paths: set[Path] = set()
@@ -1142,4 +1370,7 @@ def publish_canonical_acquisition_bundle(
         raise
 
     result_raw_paths = {k: v[0] for k, v in raw_targets.items()}
+    if initialization_targets:
+        result_initialization_paths = {k: v[0] for k, v in initialization_targets.items()}
+        return result_raw_paths, result_initialization_paths, norm_target_path
     return result_raw_paths, norm_target_path

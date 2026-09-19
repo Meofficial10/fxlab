@@ -32,6 +32,7 @@ from fxlab.research.bis_policy_rates import (
     build_daily_policy_rate_grid,
     compute_raw_evidence_identity,
     normalize_bis_policy_rate_payloads,
+    parse_bis_initialization_payload,
     parse_sdmx_csv_payload,
     parse_sdmx_xml_payload,
     publish_canonical_acquisition_bundle,
@@ -93,6 +94,12 @@ def _make_full_valid_payloads_dict() -> dict[str, bytes]:
         payloads[key] = _make_sample_xml_payload(key, obs)
     return payloads
 
+
+def _make_full_initialization_payloads_dict() -> dict[str, bytes]:
+    return {
+        key: _make_sample_xml_payload(key, [("2013-12-31", "0.50")])
+        for key in FROZEN_SERIES_KEYS
+    }
 
 # --- Test 1–6: Frozen Contract & Request Construction ---
 
@@ -198,7 +205,11 @@ def test_07_raw_artifact_validation_fails_closed():
 
 def test_08_valid_eight_series_xml_payload_accepted():
     payloads = _make_full_valid_payloads_dict()
-    dataset = normalize_bis_policy_rate_payloads(payloads, content_format="sdmx-xml")
+    dataset = normalize_bis_policy_rate_payloads(
+        payloads,
+        initialization_payloads_by_series=_make_full_initialization_payloads_dict(),
+        content_format="sdmx-xml",
+    )
     assert dataset.schema == NORMALIZATION_VERSION
     assert dataset.record_count == 32  # 4 dates * 8 series
     assert len(dataset.records) == 32
@@ -212,7 +223,11 @@ def test_09_valid_eight_series_csv_payload_accepted():
     obs = [("2014-01-01", "0.25"), ("2023-12-31", "5.00")]
     for key in FROZEN_SERIES_KEYS:
         payloads[key] = _make_sample_csv_payload(key, obs)
-    dataset = normalize_bis_policy_rate_payloads(payloads, content_format="sdmx-csv")
+    dataset = normalize_bis_policy_rate_payloads(
+        payloads,
+        initialization_payloads_by_series=_make_full_initialization_payloads_dict(),
+        content_format="sdmx-csv",
+    )
     assert dataset.record_count == 16
     assert len(dataset.records) == 16
 
@@ -221,14 +236,18 @@ def test_10_unknown_series_rejected():
     payloads = _make_full_valid_payloads_dict()
     payloads["D.CN"] = _make_sample_xml_payload("D.CN", [("2014-01-01", "4.00")])
     with pytest.raises(ValueError, match="unknown series payloads"):
-        normalize_bis_policy_rate_payloads(payloads)
+        normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
 
 
 def test_11_missing_required_series_rejected():
     payloads = _make_full_valid_payloads_dict()
     del payloads["D.JP"]
     with pytest.raises(ValueError, match="missing required series payloads"):
-        normalize_bis_policy_rate_payloads(payloads)
+        normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
 
 
 def test_12_conflicting_duplicate_observation_rejected():
@@ -240,7 +259,9 @@ def test_12_conflicting_duplicate_observation_rejected():
     )
     payloads["D.US"] = xml_with_dup
     with pytest.raises(ValueError, match="conflicting duplicate observation"):
-        normalize_bis_policy_rate_payloads(payloads)
+        normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
 
 
 def test_13_non_finite_and_malformed_numeric_rejected():
@@ -275,7 +296,9 @@ def test_15_observation_2024_plus_rejected():
 
 def test_16_deterministic_normalized_ordering():
     payloads = _make_full_valid_payloads_dict()
-    dataset = normalize_bis_policy_rate_payloads(payloads)
+    dataset = normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
     # Check that records are strictly sorted by (observation_date, series_key)
     dates = [r.observation_date for r in dataset.records]
     assert dates == sorted(dates)
@@ -307,7 +330,9 @@ def test_18_malformed_xml_fails_closed():
 
 def test_19_daily_grid_rate_persistence():
     payloads = _make_full_valid_payloads_dict()
-    dataset = normalize_bis_policy_rate_payloads(payloads)
+    dataset = normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
     grid = build_daily_policy_rate_grid(dataset)
 
     # 2014-01-01 was observed
@@ -373,7 +398,9 @@ def test_23_same_date_different_series_allowed():
     same_date_obs = [("2014-01-01", "0.25")]
     for key in FROZEN_SERIES_KEYS:
         payloads[key] = _make_sample_xml_payload(key, same_date_obs)
-    dataset = normalize_bis_policy_rate_payloads(payloads)
+    dataset = normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
     assert dataset.record_count == 8
     # All 8 records have the exact same observation_date
     assert {r.observation_date for r in dataset.records} == {date(2014, 1, 1)}
@@ -390,12 +417,16 @@ def test_24_duplicate_same_series_and_date_fails_closed():
     )
     payloads["D.US"] = xml_with_dup
     with pytest.raises(ValueError, match="duplicate observation"):
-        normalize_bis_policy_rate_payloads(payloads)
+        normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
 
 
 def test_25_atomic_publishing_raw_and_normalized(tmp_path: Path):
     payloads = _make_full_valid_payloads_dict()
-    dataset = normalize_bis_policy_rate_payloads(payloads)
+    dataset = normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
 
     # Publish normalized dataset
     out_file = tmp_path / "normalized.json"
@@ -416,6 +447,7 @@ def test_25_atomic_publishing_raw_and_normalized(tmp_path: Path):
         records=diff_records,
         record_count=len(diff_records),
         raw_evidence_identity=dataset.raw_evidence_identity,
+        initialization_evidence_identities=dataset.initialization_evidence_identities,
     )
     with pytest.raises(FileExistsError, match="exists with different content"):
         publish_normalized_bis_dataset(diff_dataset, out_file)
@@ -450,7 +482,9 @@ def test_27_operator_script_fails_closed_without_run(tmp_path: Path):
 
 def test_28_transactional_bundle_publishing_all_eight(tmp_path: Path):
     payloads = _make_full_valid_payloads_dict()
-    dataset = normalize_bis_policy_rate_payloads(payloads)
+    dataset = normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
 
     raw_artifacts: dict[str, BisRawArtifact] = {}
     for key in FROZEN_SERIES_KEYS:
@@ -465,15 +499,29 @@ def test_28_transactional_bundle_publishing_all_eight(tmp_path: Path):
             series_payloads=((key, body),),
         )
 
+    initialization_payloads = _make_full_initialization_payloads_dict()
+    initialization_artifacts = {
+        key: parse_bis_initialization_payload(
+            initialization_payloads[key], expected_series=key
+        )
+        for key in FROZEN_SERIES_KEYS
+    }
     raw_dir = tmp_path / "raw"
+    initialization_dir = tmp_path / "initialization"
     norm_file = tmp_path / "norm.json"
 
-    raw_paths, out_norm = publish_canonical_acquisition_bundle(
-        raw_artifacts, dataset, raw_dir, norm_file
+    raw_paths, initialization_paths, out_norm = publish_canonical_acquisition_bundle(
+        raw_artifacts,
+        dataset,
+        raw_dir,
+        norm_file,
+        initialization_artifacts_by_series=initialization_artifacts,
+        initialization_output_dir=initialization_dir,
     )
     assert len(raw_paths) == 8
-    for p in raw_paths.values():
-        assert p.exists()
+    assert len(initialization_paths) == 8
+    for path in (*raw_paths.values(), *initialization_paths.values()):
+        assert path.exists()
     assert out_norm.exists()
 
 
@@ -494,13 +542,26 @@ def test_29_fetch_failure_in_script_leaves_zero_artifacts(
         return payloads[series_key]
 
     monkeypatch.setattr(acquire_bis_policy_rates, "fetch_bis_series_payload", mock_fetch)
+    monkeypatch.setattr(
+        acquire_bis_policy_rates,
+        "fetch_bis_initialization_payload",
+        lambda series_key, timeout=30.0: _make_full_initialization_payloads_dict()[series_key],
+    )
 
     raw_dir = tmp_path / "raw"
     norm_file = tmp_path / "norm.json"
 
     with pytest.raises(RuntimeError, match="network failure"):
         acquire_bis_policy_rates.main(
-            ["--run", "--raw-output-dir", str(raw_dir), "--normalized-output", str(norm_file)]
+            [
+                "--run",
+                "--raw-output-dir",
+                str(raw_dir),
+                "--initialization-output-dir",
+                str(tmp_path / "initialization"),
+                "--normalized-output",
+                str(norm_file),
+            ]
         )
 
     # Must leave ZERO canonical raw or normalized files
@@ -521,13 +582,26 @@ def test_30_malformed_payload_in_script_leaves_zero_artifacts(
         return payloads[series_key]
 
     monkeypatch.setattr(acquire_bis_policy_rates, "fetch_bis_series_payload", mock_fetch)
+    monkeypatch.setattr(
+        acquire_bis_policy_rates,
+        "fetch_bis_initialization_payload",
+        lambda series_key, timeout=30.0: _make_full_initialization_payloads_dict()[series_key],
+    )
 
     raw_dir = tmp_path / "raw"
     norm_file = tmp_path / "norm.json"
 
     with pytest.raises(ValueError, match="malformed XML"):
         acquire_bis_policy_rates.main(
-            ["--run", "--raw-output-dir", str(raw_dir), "--normalized-output", str(norm_file)]
+            [
+                "--run",
+                "--raw-output-dir",
+                str(raw_dir),
+                "--initialization-output-dir",
+                str(tmp_path / "initialization"),
+                "--normalized-output",
+                str(norm_file),
+            ]
         )
 
     assert not raw_dir.exists() or len(list(raw_dir.glob("*.json"))) == 0
@@ -547,13 +621,26 @@ def test_31_normalization_failure_leaves_zero_artifacts(
         return payloads[series_key]
 
     monkeypatch.setattr(acquire_bis_policy_rates, "fetch_bis_series_payload", mock_fetch)
+    monkeypatch.setattr(
+        acquire_bis_policy_rates,
+        "fetch_bis_initialization_payload",
+        lambda series_key, timeout=30.0: _make_full_initialization_payloads_dict()[series_key],
+    )
 
     raw_dir = tmp_path / "raw"
     norm_file = tmp_path / "norm.json"
 
     with pytest.raises(ValueError, match="outside frozen interval"):
         acquire_bis_policy_rates.main(
-            ["--run", "--raw-output-dir", str(raw_dir), "--normalized-output", str(norm_file)]
+            [
+                "--run",
+                "--raw-output-dir",
+                str(raw_dir),
+                "--initialization-output-dir",
+                str(tmp_path / "initialization"),
+                "--normalized-output",
+                str(norm_file),
+            ]
         )
 
     assert not raw_dir.exists() or len(list(raw_dir.glob("*.json"))) == 0
@@ -562,7 +649,9 @@ def test_31_normalization_failure_leaves_zero_artifacts(
 
 def test_32_preexisting_different_target_fails_before_any_new_target(tmp_path: Path):
     payloads = _make_full_valid_payloads_dict()
-    dataset = normalize_bis_policy_rate_payloads(payloads)
+    dataset = normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
 
     raw_artifacts: dict[str, BisRawArtifact] = {}
     for key in FROZEN_SERIES_KEYS:
@@ -594,7 +683,9 @@ def test_32_preexisting_different_target_fails_before_any_new_target(tmp_path: P
 
 def test_33_preexisting_identical_target_handled_safely(tmp_path: Path):
     payloads = _make_full_valid_payloads_dict()
-    dataset = normalize_bis_policy_rate_payloads(payloads)
+    dataset = normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
 
     raw_artifacts: dict[str, BisRawArtifact] = {}
     for key in FROZEN_SERIES_KEYS:
@@ -627,7 +718,9 @@ def test_34_failure_during_multi_file_publication_rollback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     payloads = _make_full_valid_payloads_dict()
-    dataset = normalize_bis_policy_rate_payloads(payloads)
+    dataset = normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
 
     raw_artifacts: dict[str, BisRawArtifact] = {}
     for key in FROZEN_SERIES_KEYS:
@@ -670,7 +763,9 @@ def test_35_preexisting_files_protected_during_rollback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     payloads = _make_full_valid_payloads_dict()
-    dataset = normalize_bis_policy_rate_payloads(payloads)
+    dataset = normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
 
     raw_artifacts: dict[str, BisRawArtifact] = {}
     for key in FROZEN_SERIES_KEYS:
@@ -822,7 +917,7 @@ def test_40_transactional_acquisition_zero_artifacts_after_nan_validation_failur
         b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
         b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
         b'    <Series FREQ="D" REF_AREA="XM" SERIES_KEY="D.XM">\n'
-        b'      <Obs TIME_PERIOD="2016-04-05" OBS_VALUE="NaN" OBS_STATUS="M" />\n'
+        b'      <Obs TIME_PERIOD="2016-04-05" OBS_VALUE="NaN" OBS_STATUS="A" />\n'
         b'    </Series>\n'
         b'  </message:DataSet>\n'
         b'</message:StructureSpecificData>'
@@ -832,20 +927,33 @@ def test_40_transactional_acquisition_zero_artifacts_after_nan_validation_failur
         return payloads[series_key]
 
     monkeypatch.setattr(acquire_bis_policy_rates, "fetch_bis_series_payload", mock_fetch)
+    monkeypatch.setattr(
+        acquire_bis_policy_rates,
+        "fetch_bis_initialization_payload",
+        lambda series_key, timeout=30.0: _make_full_initialization_payloads_dict()[series_key],
+    )
 
     raw_dir = tmp_path / "raw"
     norm_file = tmp_path / "norm.json"
 
     with pytest.raises(BisObservationValidationError) as exc_info:
         acquire_bis_policy_rates.main(
-            ["--run", "--raw-output-dir", str(raw_dir), "--normalized-output", str(norm_file)]
+            [
+                "--run",
+                "--raw-output-dir",
+                str(raw_dir),
+                "--initialization-output-dir",
+                str(tmp_path / "initialization"),
+                "--normalized-output",
+                str(norm_file),
+            ]
         )
 
     exc = exc_info.value
     assert exc.series_key == "D.XM"
     assert exc.time_period == "2016-04-05"
     assert exc.raw_obs_value == "NaN"
-    assert exc.obs_status == "M"
+    assert exc.obs_status == "A"
 
     # Transactional publication guarantees 0 files
     assert not raw_dir.exists() or len(list(raw_dir.glob("*.json"))) == 0
@@ -1129,8 +1237,16 @@ def test_55_cross_series_state_leakage_impossible():
         b'  </message:DataSet>\n'
         b'</message:StructureSpecificData>'
     )
-    with pytest.raises(BisObservationValidationError):
-        normalize_bis_policy_rate_payloads(payloads)
+    initialization = _make_full_initialization_payloads_dict()
+    initialization["D.US"] = _make_sample_xml_payload(
+        "D.US", [("2013-12-31", "0.75")]
+    )
+    dataset = normalize_bis_policy_rate_payloads(
+        payloads, initialization_payloads_by_series=initialization
+    )
+    us_record = next(record for record in dataset.records if record.series_key == "D.US")
+    assert us_record.policy_rate_state == Decimal("0.75")
+    assert us_record.source_state_date == date(2013, 12, 31)
 
 
 def test_56_each_series_maintains_independent_state():
@@ -1147,7 +1263,9 @@ def test_56_each_series_maintains_independent_state():
         b'  </message:DataSet>\n'
         b'</message:StructureSpecificData>'
     )
-    dataset = normalize_bis_policy_rate_payloads(payloads)
+    dataset = normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
     ca_recs = [r for r in dataset.records if r.series_key == "D.CA"]
     assert len(ca_recs) == 2
     assert ca_recs[1].policy_rate_state == Decimal("1.00")
@@ -1174,12 +1292,16 @@ def test_58_frozen_eight_series_validation_enforced():
     payloads = _make_full_valid_payloads_dict()
     del payloads["D.AU"]
     with pytest.raises(ValueError, match="missing required series"):
-        normalize_bis_policy_rate_payloads(payloads)
+        normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
 
 
 def test_59_normalized_identity_changes_on_derived_state_change():
     payloads = _make_full_valid_payloads_dict()
-    dataset1 = normalize_bis_policy_rate_payloads(payloads)
+    dataset1 = normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
 
     # Change one rate value
     payloads_modified = _make_full_valid_payloads_dict()
@@ -1189,15 +1311,22 @@ def test_59_normalized_identity_changes_on_derived_state_change():
         ("2019-10-31", "1.75"),
         ("2023-12-31", "5.25"),
     ])
-    dataset2 = normalize_bis_policy_rate_payloads(payloads_modified)
+    dataset2 = normalize_bis_policy_rate_payloads(
+        payloads_modified,
+        initialization_payloads_by_series=_make_full_initialization_payloads_dict(),
+    )
 
     assert dataset1.normalized_identity != dataset2.normalized_identity
 
 
 def test_60_deterministic_serialization_and_output(tmp_path: Path):
     payloads = _make_full_valid_payloads_dict()
-    dataset1 = normalize_bis_policy_rate_payloads(payloads)
-    dataset2 = normalize_bis_policy_rate_payloads(payloads)
+    dataset1 = normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
+    dataset2 = normalize_bis_policy_rate_payloads(
+            payloads, initialization_payloads_by_series=_make_full_initialization_payloads_dict()
+        )
 
     assert dataset1.normalized_identity == dataset2.normalized_identity
     out1 = tmp_path / "d1.json"
@@ -1230,13 +1359,26 @@ def test_61_transactional_failure_creates_zero_artifacts(
         return payloads[series_key]
 
     monkeypatch.setattr(acquire_bis_policy_rates, "fetch_bis_series_payload", mock_fetch)
+    monkeypatch.setattr(
+        acquire_bis_policy_rates,
+        "fetch_bis_initialization_payload",
+        lambda series_key, timeout=30.0: _make_full_initialization_payloads_dict()[series_key],
+    )
 
     raw_dir = tmp_path / "raw"
     norm_file = tmp_path / "norm.json"
 
     with pytest.raises(BisObservationValidationError):
         acquire_bis_policy_rates.main(
-            ["--run", "--raw-output-dir", str(raw_dir), "--normalized-output", str(norm_file)]
+            [
+                "--run",
+                "--raw-output-dir",
+                str(raw_dir),
+                "--initialization-output-dir",
+                str(tmp_path / "initialization"),
+                "--normalized-output",
+                str(norm_file),
+            ]
         )
 
     assert not raw_dir.exists() or len(list(raw_dir.glob("*.json"))) == 0
