@@ -30,6 +30,7 @@ from fxlab.research.bis_policy_rates import (
     compute_raw_evidence_identity,
     normalize_bis_policy_rate_payloads,
     parse_sdmx_xml_payload,
+    publish_canonical_acquisition_bundle,
     publish_normalized_bis_dataset,
 )
 
@@ -431,9 +432,271 @@ def test_26_module_has_no_prohibited_strategy_calculations():
     assert "pnl" not in src.lower()
 
 
-def test_27_operator_script_fails_closed_without_run():
+def test_27_operator_script_fails_closed_without_run(tmp_path: Path):
     from scripts.acquire_bis_policy_rates import main
 
-    # Without --run flag, main() must exit with non-zero code
-    exit_code = main([])
+    raw_dir = tmp_path / "raw"
+    norm_file = tmp_path / "norm.json"
+    # Without --run flag, main() must exit with non-zero code and create zero files
+    exit_code = main(["--raw-output-dir", str(raw_dir), "--normalized-output", str(norm_file)])
     assert exit_code == 1
+    assert not raw_dir.exists()
+    assert not norm_file.exists()
+
+
+def test_28_transactional_bundle_publishing_all_eight(tmp_path: Path):
+    payloads = _make_full_valid_payloads_dict()
+    dataset = normalize_bis_policy_rate_payloads(payloads)
+
+    raw_artifacts: dict[str, BisRawArtifact] = {}
+    for key in FROZEN_SERIES_KEYS:
+        body = payloads[key]
+        raw_artifacts[key] = BisRawArtifact(
+            requested_series=FROZEN_SERIES_KEYS,
+            start_inclusive="2014-01-01",
+            end_exclusive="2024-01-01",
+            content_format="sdmx-xml",
+            raw_byte_count=len(body),
+            raw_sha256=hashlib.sha256(body).hexdigest(),
+            series_payloads=((key, body),),
+        )
+
+    raw_dir = tmp_path / "raw"
+    norm_file = tmp_path / "norm.json"
+
+    raw_paths, out_norm = publish_canonical_acquisition_bundle(
+        raw_artifacts, dataset, raw_dir, norm_file
+    )
+    assert len(raw_paths) == 8
+    for p in raw_paths.values():
+        assert p.exists()
+    assert out_norm.exists()
+
+
+def test_29_fetch_failure_in_script_leaves_zero_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from scripts import acquire_bis_policy_rates
+
+    payloads = _make_full_valid_payloads_dict()
+
+    call_count = 0
+
+    def mock_fetch(series_key: str, timeout: float = 30.0) -> bytes:
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 4:
+            raise RuntimeError("network failure on series 4")
+        return payloads[series_key]
+
+    monkeypatch.setattr(acquire_bis_policy_rates, "fetch_bis_series_payload", mock_fetch)
+
+    raw_dir = tmp_path / "raw"
+    norm_file = tmp_path / "norm.json"
+
+    with pytest.raises(RuntimeError, match="network failure"):
+        acquire_bis_policy_rates.main(
+            ["--run", "--raw-output-dir", str(raw_dir), "--normalized-output", str(norm_file)]
+        )
+
+    # Must leave ZERO canonical raw or normalized files
+    assert not raw_dir.exists() or len(list(raw_dir.glob("*.json"))) == 0
+    assert not norm_file.exists()
+
+
+def test_30_malformed_payload_in_script_leaves_zero_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from scripts import acquire_bis_policy_rates
+
+    payloads = _make_full_valid_payloads_dict()
+    # Inject malformed XML in series D.JP
+    payloads["D.JP"] = b"<malformed><xml>"
+
+    def mock_fetch(series_key: str, timeout: float = 30.0) -> bytes:
+        return payloads[series_key]
+
+    monkeypatch.setattr(acquire_bis_policy_rates, "fetch_bis_series_payload", mock_fetch)
+
+    raw_dir = tmp_path / "raw"
+    norm_file = tmp_path / "norm.json"
+
+    with pytest.raises(ValueError, match="malformed XML"):
+        acquire_bis_policy_rates.main(
+            ["--run", "--raw-output-dir", str(raw_dir), "--normalized-output", str(norm_file)]
+        )
+
+    assert not raw_dir.exists() or len(list(raw_dir.glob("*.json"))) == 0
+    assert not norm_file.exists()
+
+
+def test_31_normalization_failure_leaves_zero_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from scripts import acquire_bis_policy_rates
+
+    payloads = _make_full_valid_payloads_dict()
+    # Inject out of range observation (2024)
+    payloads["D.US"] = _make_sample_xml_payload("D.US", [("2024-05-01", "5.25")])
+
+    def mock_fetch(series_key: str, timeout: float = 30.0) -> bytes:
+        return payloads[series_key]
+
+    monkeypatch.setattr(acquire_bis_policy_rates, "fetch_bis_series_payload", mock_fetch)
+
+    raw_dir = tmp_path / "raw"
+    norm_file = tmp_path / "norm.json"
+
+    with pytest.raises(ValueError, match="outside frozen interval"):
+        acquire_bis_policy_rates.main(
+            ["--run", "--raw-output-dir", str(raw_dir), "--normalized-output", str(norm_file)]
+        )
+
+    assert not raw_dir.exists() or len(list(raw_dir.glob("*.json"))) == 0
+    assert not norm_file.exists()
+
+
+def test_32_preexisting_different_target_fails_before_any_new_target(tmp_path: Path):
+    payloads = _make_full_valid_payloads_dict()
+    dataset = normalize_bis_policy_rate_payloads(payloads)
+
+    raw_artifacts: dict[str, BisRawArtifact] = {}
+    for key in FROZEN_SERIES_KEYS:
+        body = payloads[key]
+        raw_artifacts[key] = BisRawArtifact(
+            requested_series=FROZEN_SERIES_KEYS,
+            start_inclusive="2014-01-01",
+            end_exclusive="2024-01-01",
+            content_format="sdmx-xml",
+            raw_byte_count=len(body),
+            raw_sha256=hashlib.sha256(body).hexdigest(),
+            series_payloads=((key, body),),
+        )
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True)
+    norm_file = tmp_path / "norm.json"
+
+    # Pre-create conflicting normalized output file
+    norm_file.write_text('{"different": "content"}', encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="exists with different content"):
+        publish_canonical_acquisition_bundle(raw_artifacts, dataset, raw_dir, norm_file)
+
+    # Check that NO raw files were written to raw_dir
+    assert len(list(raw_dir.glob("*.json"))) == 0
+    assert norm_file.read_text(encoding="utf-8") == '{"different": "content"}'
+
+
+def test_33_preexisting_identical_target_handled_safely(tmp_path: Path):
+    payloads = _make_full_valid_payloads_dict()
+    dataset = normalize_bis_policy_rate_payloads(payloads)
+
+    raw_artifacts: dict[str, BisRawArtifact] = {}
+    for key in FROZEN_SERIES_KEYS:
+        body = payloads[key]
+        raw_artifacts[key] = BisRawArtifact(
+            requested_series=FROZEN_SERIES_KEYS,
+            start_inclusive="2014-01-01",
+            end_exclusive="2024-01-01",
+            content_format="sdmx-xml",
+            raw_byte_count=len(body),
+            raw_sha256=hashlib.sha256(body).hexdigest(),
+            series_payloads=((key, body),),
+        )
+
+    raw_dir = tmp_path / "raw"
+    norm_file = tmp_path / "norm.json"
+
+    # First publication
+    publish_canonical_acquisition_bundle(raw_artifacts, dataset, raw_dir, norm_file)
+
+    # Second publication with identical content succeeds deterministically
+    raw_paths, out_norm = publish_canonical_acquisition_bundle(
+        raw_artifacts, dataset, raw_dir, norm_file
+    )
+    assert len(raw_paths) == 8
+    assert out_norm.exists()
+
+
+def test_34_failure_during_multi_file_publication_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    payloads = _make_full_valid_payloads_dict()
+    dataset = normalize_bis_policy_rate_payloads(payloads)
+
+    raw_artifacts: dict[str, BisRawArtifact] = {}
+    for key in FROZEN_SERIES_KEYS:
+        body = payloads[key]
+        raw_artifacts[key] = BisRawArtifact(
+            requested_series=FROZEN_SERIES_KEYS,
+            start_inclusive="2014-01-01",
+            end_exclusive="2024-01-01",
+            content_format="sdmx-xml",
+            raw_byte_count=len(body),
+            raw_sha256=hashlib.sha256(body).hexdigest(),
+            series_payloads=((key, body),),
+        )
+
+    raw_dir = tmp_path / "raw"
+    norm_file = tmp_path / "norm.json"
+
+    # Simulate failure on the 3rd file replacement
+    real_replace = Path.replace
+    replace_count = 0
+
+    def mock_replace(self: Path, target: Path | str) -> Path:
+        nonlocal replace_count
+        replace_count += 1
+        if replace_count >= 3:
+            raise OSError("simulated filesystem error during commit")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", mock_replace)
+
+    with pytest.raises(OSError, match="simulated filesystem error"):
+        publish_canonical_acquisition_bundle(raw_artifacts, dataset, raw_dir, norm_file)
+
+    # Verify that files 1 and 2 that were replaced got rolled back (deleted)
+    assert len(list(raw_dir.glob("*.json"))) == 0
+    assert not norm_file.exists()
+
+
+def test_35_preexisting_files_protected_during_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    payloads = _make_full_valid_payloads_dict()
+    dataset = normalize_bis_policy_rate_payloads(payloads)
+
+    raw_artifacts: dict[str, BisRawArtifact] = {}
+    for key in FROZEN_SERIES_KEYS:
+        body = payloads[key]
+        raw_artifacts[key] = BisRawArtifact(
+            requested_series=FROZEN_SERIES_KEYS,
+            start_inclusive="2014-01-01",
+            end_exclusive="2024-01-01",
+            content_format="sdmx-xml",
+            raw_byte_count=len(body),
+            raw_sha256=hashlib.sha256(body).hexdigest(),
+            series_payloads=((key, body),),
+        )
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True)
+    norm_file = tmp_path / "norm.json"
+
+    # Pre-existing unrelated file in raw_dir
+    unrelated_file = raw_dir / "unrelated_audit.json"
+    unrelated_file.write_text('{"keep": "me"}', encoding="utf-8")
+
+    def mock_replace(self: Path, target: Path | str) -> Path:
+        raise OSError("forced error during replacement")
+
+    monkeypatch.setattr(Path, "replace", mock_replace)
+
+    with pytest.raises(OSError, match="forced error"):
+        publish_canonical_acquisition_bundle(raw_artifacts, dataset, raw_dir, norm_file)
+
+    # Pre-existing file must remain intact
+    assert unrelated_file.exists()
+    assert unrelated_file.read_text(encoding="utf-8") == '{"keep": "me"}'

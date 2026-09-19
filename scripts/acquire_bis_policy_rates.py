@@ -7,6 +7,7 @@ Without `--run`, this script fails closed immediately without performing any net
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -17,8 +18,7 @@ from fxlab.research.bis_policy_rates import (
     BisRawArtifact,
     build_bis_series_request_url,
     normalize_bis_policy_rate_payloads,
-    publish_normalized_bis_dataset,
-    publish_raw_bis_artifact,
+    publish_canonical_acquisition_bundle,
 )
 
 DEFAULT_RAW_OUTPUT_DIR = Path("data/raw/bis_cbpol")
@@ -73,26 +73,47 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("Starting bounded BIS policy-rate evidence acquisition for ADR 0014...")
+    # Step 1: Fetch all 8 bounded payloads into memory
     raw_payloads: dict[str, bytes] = {}
-
     for series_key in FROZEN_SERIES_KEYS:
         print(f"Fetching series {series_key} [2014-01-01 to 2023-12-31]...")
         payload = fetch_bis_series_payload(series_key)
         raw_payloads[series_key] = payload
-        raw_art = BisRawArtifact.from_bytes(payload, series_key=series_key)
-        raw_path = publish_raw_bis_artifact(raw_art, args.raw_output_dir)
-        print(f"  Received {len(payload)} bytes for {series_key}; published raw: {raw_path}")
+        print(f"  Received {len(payload)} bytes for {series_key}")
 
-    print("Normalizing and validating acquired payloads...")
+    # Step 2: Build and validate all 8 raw evidence objects in memory
+    raw_artifacts: dict[str, BisRawArtifact] = {}
+    for series_key in FROZEN_SERIES_KEYS:
+        payload = raw_payloads[series_key]
+        raw_art = BisRawArtifact(
+            requested_series=FROZEN_SERIES_KEYS,
+            start_inclusive="2014-01-01",
+            end_exclusive="2024-01-01",
+            content_format="sdmx-xml",
+            raw_byte_count=len(payload),
+            raw_sha256=hashlib.sha256(payload).hexdigest(),
+            series_payloads=((series_key, payload),),
+        )
+        raw_artifacts[series_key] = raw_art
+
+    # Step 3: Normalize and validate the complete 8-series dataset in memory
+    print("Normalizing and cross-validating complete eight-series dataset...")
     normalized_dataset = normalize_bis_policy_rate_payloads(
         raw_payloads, content_format="sdmx-xml"
     )
     print(f"Normalized {normalized_dataset.record_count} total observations across 8 series.")
     print(f"Normalized identity: {normalized_dataset.normalized_identity}")
 
-    published_path = publish_normalized_bis_dataset(
-        normalized_dataset, args.normalized_output
+    # Step 4: Transactionally publish all artifacts only after complete validation
+    print("Publishing complete canonical artifact bundle transactionally...")
+    raw_paths, published_path = publish_canonical_acquisition_bundle(
+        raw_artifacts_by_series=raw_artifacts,
+        normalized_dataset=normalized_dataset,
+        raw_output_dir=args.raw_output_dir,
+        normalized_output_file=args.normalized_output,
     )
+    for sk, p in raw_paths.items():
+        print(f"  Published raw artifact for {sk}: {p}")
     print(f"Published canonical normalized dataset: {published_path}")
     return 0
 

@@ -89,6 +89,11 @@ def _primitive(value: object) -> object:
     """Recursively convert objects to JSON-serializable primitives in deterministic order."""
     if value is None or isinstance(value, (bool, int, str)):
         return value
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.hex()
     if isinstance(value, float):
         if not math.isfinite(value):
             raise ValueError("non-finite values are not canonical")
@@ -672,3 +677,105 @@ def publish_normalized_bis_dataset(
 
     temp_path.replace(output_file)
     return output_file
+
+
+def publish_canonical_acquisition_bundle(
+    raw_artifacts_by_series: Mapping[str, BisRawArtifact],
+    normalized_dataset: BisNormalizedDataset,
+    raw_output_dir: Path,
+    normalized_output_file: Path,
+) -> tuple[dict[str, Path], Path]:
+    """Transactionally publish complete canonical acquisition bundle.
+
+    Safety contract:
+    1. Pre-validates all 8 series keys are present and match raw artifacts.
+    2. Pre-computes all 8 raw target filepaths and normalized target filepath.
+    3. Pre-checks all destination paths: if any file already exists with different
+       content, raises FileExistsError immediately before creating any new file.
+    4. Genuinely new files are written to isolated temporary files in their respective
+       target directories.
+    5. Performs atomic replacement / rename of all new files.
+    6. If an error occurs during multi-file replacement, rolls back and deletes only
+       the files created by the current invocation, preserving pre-existing files.
+    """
+    if set(raw_artifacts_by_series.keys()) != set(FROZEN_SERIES_KEYS):
+        raise ValueError(
+            f"bundle requires all eight frozen series, got {sorted(raw_artifacts_by_series.keys())}"
+        )
+
+    raw_output_dir.mkdir(parents=True, exist_ok=True)
+    normalized_output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Determine all target paths and contents
+    raw_targets: dict[str, tuple[Path, str]] = {}
+    for series_key in FROZEN_SERIES_KEYS:
+        raw_art = raw_artifacts_by_series[series_key]
+        raw_path = raw_output_dir / f"bis_cbpol_raw_{series_key}_{raw_art.raw_sha256[:16]}.json"
+        raw_content = canonical_json(raw_art)
+        raw_targets[series_key] = (raw_path, raw_content)
+
+    norm_target_path = normalized_output_file
+    norm_content = canonical_json(normalized_dataset)
+
+    # Phase 1: Pre-check all targets for conflicts
+    all_targets: list[tuple[Path, str]] = list(raw_targets.values())
+    all_targets.append((norm_target_path, norm_content))
+
+    preexisting_paths: set[Path] = set()
+    files_to_create: list[tuple[Path, str]] = []
+
+    for target_path, content in all_targets:
+        if target_path.exists():
+            existing = target_path.read_text(encoding="utf-8")
+            if existing != content:
+                raise FileExistsError(
+                    f"target file {target_path} exists with different content"
+                )
+            preexisting_paths.add(target_path)
+        else:
+            files_to_create.append((target_path, content))
+
+    # Phase 2: Write all new files to temporary files in target directories
+    temp_files: list[tuple[Path, Path]] = []
+    try:
+        for final_path, content in files_to_create:
+            with tempfile.NamedTemporaryFile(
+                "w", dir=final_path.parent, delete=False, encoding="utf-8"
+            ) as tmp:
+                tmp.write(content)
+                temp_files.append((Path(tmp.name), final_path))
+    except Exception:
+        # Clean up any temporary files created so far
+        for temp_p, _ in temp_files:
+            if temp_p.exists():
+                try:
+                    temp_p.unlink()
+                except Exception:
+                    pass
+        raise
+
+    # Phase 3: Atomic commit / rename with rollback protection
+    created_in_this_run: list[Path] = []
+    try:
+        for temp_p, final_p in temp_files:
+            temp_p.replace(final_p)
+            created_in_this_run.append(final_p)
+    except Exception:
+        # Rollback only files created in this invocation
+        for p in created_in_this_run:
+            if p.exists() and p not in preexisting_paths:
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+        # Clean up any leftover temporary files
+        for temp_p, _ in temp_files:
+            if temp_p.exists():
+                try:
+                    temp_p.unlink()
+                except Exception:
+                    pass
+        raise
+
+    result_raw_paths = {k: v[0] for k, v in raw_targets.items()}
+    return result_raw_paths, norm_target_path
