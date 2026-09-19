@@ -163,6 +163,45 @@ def build_bis_all_series_request_urls() -> dict[str, str]:
     }
 
 
+class BisObservationValidationError(ValueError):
+    """Structured fail-closed error capturing diagnostic context on validation failure."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        series_key: str,
+        time_period: str,
+        raw_obs_value: str,
+        obs_status: str | None = None,
+        obs_conf: str | None = None,
+        obs_pre_break: str | None = None,
+    ) -> None:
+        self.reason = reason
+        self.series_key = series_key
+        self.time_period = time_period
+        self.raw_obs_value = raw_obs_value
+        self.obs_status = obs_status
+        self.obs_conf = obs_conf
+        self.obs_pre_break = obs_pre_break
+
+        parts = [
+            f"{reason}:",
+            f"series={series_key}",
+            f"time_period={time_period}",
+            f"raw_obs_value={raw_obs_value}",
+        ]
+        if obs_status is not None:
+            parts.append(f"obs_status={obs_status}")
+        if obs_conf is not None:
+            parts.append(f"obs_conf={obs_conf}")
+        if obs_pre_break is not None:
+            parts.append(f"obs_pre_break={obs_pre_break}")
+
+        message = " ".join(parts)
+        super().__init__(message)
+
+
 @dataclass(frozen=True, order=True)
 class PolicyRateRecord:
     """A single normalized daily policy-rate observation."""
@@ -173,6 +212,8 @@ class PolicyRateRecord:
     rate_value: Decimal
     obs_status: str = "A"
     point_in_time_status: str = "UNRESOLVED"
+    obs_conf: str | None = None
+    obs_pre_break: str | None = None
 
     def __post_init__(self) -> None:
         if self.series_key not in FROZEN_SERIES_KEYS:
@@ -333,10 +374,12 @@ def parse_sdmx_csv_payload(
 
     records: list[PolicyRateRecord] = []
     for row in reader:
-        series_key = row.get("SERIES_KEY") or row.get("REF_AREA") or ""
+        series_key = row.get("SERIES_KEY") or row.get("REF_AREA") or (expected_series or "")
         if not series_key and "FREQ" in row and "REF_AREA" in row:
             series_key = f"{row['FREQ']}.{row['REF_AREA']}"
         series_key = series_key.strip()
+        if not series_key and expected_series:
+            series_key = expected_series
 
         if expected_series and series_key != expected_series:
             raise ValueError(f"series mismatch: expected {expected_series}, got {series_key}")
@@ -344,26 +387,61 @@ def parse_sdmx_csv_payload(
             raise ValueError(f"unknown or unsupported series: {series_key}")
 
         time_period_str = (row.get("TIME_PERIOD") or row.get("time_period") or "").strip()
+        obs_val_str = (row.get("OBS_VALUE") or row.get("obs_value") or "").strip()
+        obs_status = (row.get("OBS_STATUS") or row.get("obs_status") or "").strip() or None
+        obs_conf = (row.get("OBS_CONF") or row.get("obs_conf") or "").strip() or None
+        obs_pre_break = (row.get("OBS_PRE_BREAK") or row.get("obs_pre_break") or "").strip() or None
+
         if not time_period_str:
-            raise ValueError("missing TIME_PERIOD in row")
+            raise ValueError(f"missing TIME_PERIOD in row for {series_key}")
+        if not obs_val_str:
+            raise BisObservationValidationError(
+                "missing OBS_VALUE",
+                series_key=series_key,
+                time_period=time_period_str,
+                raw_obs_value=obs_val_str,
+                obs_status=obs_status,
+                obs_conf=obs_conf,
+                obs_pre_break=obs_pre_break,
+            )
+
         try:
             obs_date = date.fromisoformat(time_period_str)
         except ValueError as exc:
-            raise ValueError(f"malformed observation date: {time_period_str}") from exc
+            raise BisObservationValidationError(
+                f"malformed observation date: {time_period_str}",
+                series_key=series_key,
+                time_period=time_period_str,
+                raw_obs_value=obs_val_str,
+                obs_status=obs_status,
+                obs_conf=obs_conf,
+                obs_pre_break=obs_pre_break,
+            ) from exc
 
         # Sealed boundary check
         if obs_date < START_INCLUSIVE or obs_date >= END_EXCLUSIVE:
-            raise ValueError(
-                f"observation date {obs_date} outside frozen interval "
-                f"[{START_INCLUSIVE}, {END_EXCLUSIVE})"
+            raise BisObservationValidationError(
+                f"observation date outside frozen interval [{START_INCLUSIVE}, {END_EXCLUSIVE})",
+                series_key=series_key,
+                time_period=time_period_str,
+                raw_obs_value=obs_val_str,
+                obs_status=obs_status,
+                obs_conf=obs_conf,
+                obs_pre_break=obs_pre_break,
             )
 
-        obs_val_str = (row.get("OBS_VALUE") or row.get("obs_value") or "").strip()
-        if not obs_val_str:
-            raise ValueError(f"missing OBS_VALUE for {series_key} on {obs_date}")
-
-        rate_val = _parse_decimal(obs_val_str)
-        obs_status = (row.get("OBS_STATUS") or row.get("obs_status") or "A").strip()
+        try:
+            rate_val = _parse_decimal(obs_val_str)
+        except ValueError as exc:
+            raise BisObservationValidationError(
+                str(exc),
+                series_key=series_key,
+                time_period=time_period_str,
+                raw_obs_value=obs_val_str,
+                obs_status=obs_status,
+                obs_conf=obs_conf,
+                obs_pre_break=obs_pre_break,
+            ) from exc
 
         currency = SERIES_TO_CURRENCY[series_key]
         records.append(
@@ -372,7 +450,9 @@ def parse_sdmx_csv_payload(
                 series_key=series_key,
                 currency=currency,
                 rate_value=rate_val,
-                obs_status=obs_status,
+                obs_status=obs_status or "A",
+                obs_conf=obs_conf,
+                obs_pre_break=obs_pre_break,
             )
         )
     return records
@@ -394,7 +474,13 @@ def parse_sdmx_xml_payload(
         tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
         if tag == "Series":
             series_ref_area = elem.attrib.get("REF_AREA") or elem.attrib.get("ref_area") or ""
-            series_key = elem.attrib.get("SERIES_KEY") or f"D.{series_ref_area}"
+            series_key = elem.attrib.get("SERIES_KEY") or (
+                f"D.{series_ref_area}" if series_ref_area else (expected_series or "")
+            )
+            series_key = series_key.strip()
+            if not series_key and expected_series:
+                series_key = expected_series
+
             if expected_series and series_key != expected_series:
                 raise ValueError(f"series mismatch: expected {expected_series}, got {series_key}")
             if series_key not in FROZEN_SERIES_KEYS:
@@ -404,73 +490,168 @@ def parse_sdmx_xml_payload(
             for child in elem:
                 child_tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
                 if child_tag == "Obs":
-                    time_period = child.attrib.get("TIME_PERIOD") or child.attrib.get("time_period")
-                    obs_value = child.attrib.get("OBS_VALUE") or child.attrib.get("obs_value")
+                    time_period = (
+                        child.attrib.get("TIME_PERIOD") or child.attrib.get("time_period") or ""
+                    ).strip()
+                    obs_value = (
+                        child.attrib.get("OBS_VALUE") or child.attrib.get("obs_value") or ""
+                    ).strip()
                     obs_status = (
-                        child.attrib.get("OBS_STATUS") or child.attrib.get("obs_status") or "A"
-                    )
+                        child.attrib.get("OBS_STATUS") or child.attrib.get("obs_status") or ""
+                    ).strip() or None
+                    obs_conf = (
+                        child.attrib.get("OBS_CONF") or child.attrib.get("obs_conf") or ""
+                    ).strip() or None
+                    obs_pre_break = (
+                        child.attrib.get("OBS_PRE_BREAK") or child.attrib.get("obs_pre_break") or ""
+                    ).strip() or None
 
                     if not time_period:
                         raise ValueError(f"missing TIME_PERIOD in XML Obs for {series_key}")
-                    if obs_value is None or not obs_value.strip():
-                        raise ValueError(f"missing OBS_VALUE in XML Obs for {series_key}")
-
-                    try:
-                        obs_date = date.fromisoformat(time_period.strip())
-                    except ValueError as exc:
-                        raise ValueError(f"malformed date in XML Obs: {time_period}") from exc
-
-                    if obs_date < START_INCLUSIVE or obs_date >= END_EXCLUSIVE:
-                        raise ValueError(
-                            f"XML observation date {obs_date} outside frozen interval "
-                            f"[{START_INCLUSIVE}, {END_EXCLUSIVE})"
+                    if not obs_value:
+                        raise BisObservationValidationError(
+                            "missing OBS_VALUE",
+                            series_key=series_key,
+                            time_period=time_period,
+                            raw_obs_value=obs_value,
+                            obs_status=obs_status,
+                            obs_conf=obs_conf,
+                            obs_pre_break=obs_pre_break,
                         )
 
-                    rate_val = _parse_decimal(obs_value)
+                    try:
+                        obs_date = date.fromisoformat(time_period)
+                    except ValueError as exc:
+                        raise BisObservationValidationError(
+                            f"malformed date: {time_period}",
+                            series_key=series_key,
+                            time_period=time_period,
+                            raw_obs_value=obs_value,
+                            obs_status=obs_status,
+                            obs_conf=obs_conf,
+                            obs_pre_break=obs_pre_break,
+                        ) from exc
+
+                    if obs_date < START_INCLUSIVE or obs_date >= END_EXCLUSIVE:
+                        raise BisObservationValidationError(
+                            f"observation date outside frozen interval "
+                            f"[{START_INCLUSIVE}, {END_EXCLUSIVE})",
+                            series_key=series_key,
+                            time_period=time_period,
+                            raw_obs_value=obs_value,
+                            obs_status=obs_status,
+                            obs_conf=obs_conf,
+                            obs_pre_break=obs_pre_break,
+                        )
+
+                    try:
+                        rate_val = _parse_decimal(obs_value)
+                    except ValueError as exc:
+                        raise BisObservationValidationError(
+                            str(exc),
+                            series_key=series_key,
+                            time_period=time_period,
+                            raw_obs_value=obs_value,
+                            obs_status=obs_status,
+                            obs_conf=obs_conf,
+                            obs_pre_break=obs_pre_break,
+                        ) from exc
+
                     records.append(
                         PolicyRateRecord(
                             observation_date=obs_date,
                             series_key=series_key,
                             currency=currency,
                             rate_value=rate_val,
-                            obs_status=obs_status.strip(),
+                            obs_status=obs_status or "A",
+                            obs_conf=obs_conf,
+                            obs_pre_break=obs_pre_break,
                         )
                     )
         elif tag == "Obs" and "SERIES_KEY" in elem.attrib:
-            series_key = elem.attrib["SERIES_KEY"]
+            series_key = elem.attrib["SERIES_KEY"].strip()
             if expected_series and series_key != expected_series:
                 raise ValueError(f"series mismatch: expected {expected_series}, got {series_key}")
             if series_key not in FROZEN_SERIES_KEYS:
                 raise ValueError(f"unknown series in XML Obs: {series_key}")
 
             currency = SERIES_TO_CURRENCY[series_key]
-            time_period = elem.attrib.get("TIME_PERIOD")
-            obs_value = elem.attrib.get("OBS_VALUE")
-            obs_status = elem.attrib.get("OBS_STATUS") or "A"
+            time_period = (
+                elem.attrib.get("TIME_PERIOD") or elem.attrib.get("time_period") or ""
+            ).strip()
+            obs_value = (
+                elem.attrib.get("OBS_VALUE") or elem.attrib.get("obs_value") or ""
+            ).strip()
+            obs_status = (
+                elem.attrib.get("OBS_STATUS") or elem.attrib.get("obs_status") or ""
+            ).strip() or None
+            obs_conf = (
+                elem.attrib.get("OBS_CONF") or elem.attrib.get("obs_conf") or ""
+            ).strip() or None
+            obs_pre_break = (
+                elem.attrib.get("OBS_PRE_BREAK") or elem.attrib.get("obs_pre_break") or ""
+            ).strip() or None
 
             if not time_period:
                 raise ValueError(f"missing TIME_PERIOD in standalone XML Obs for {series_key}")
-            if obs_value is None or not obs_value.strip():
-                raise ValueError(f"missing OBS_VALUE in standalone XML Obs for {series_key}")
+            if not obs_value:
+                raise BisObservationValidationError(
+                    "missing OBS_VALUE",
+                    series_key=series_key,
+                    time_period=time_period,
+                    raw_obs_value=obs_value,
+                    obs_status=obs_status,
+                    obs_conf=obs_conf,
+                    obs_pre_break=obs_pre_break,
+                )
 
             try:
-                obs_date = date.fromisoformat(time_period.strip())
+                obs_date = date.fromisoformat(time_period)
             except ValueError as exc:
-                raise ValueError(f"malformed date in XML Obs: {time_period}") from exc
+                raise BisObservationValidationError(
+                    f"malformed date: {time_period}",
+                    series_key=series_key,
+                    time_period=time_period,
+                    raw_obs_value=obs_value,
+                    obs_status=obs_status,
+                    obs_conf=obs_conf,
+                    obs_pre_break=obs_pre_break,
+                ) from exc
 
             if obs_date < START_INCLUSIVE or obs_date >= END_EXCLUSIVE:
-                raise ValueError(
-                    f"observation date {obs_date} outside frozen interval "
-                    f"[{START_INCLUSIVE}, {END_EXCLUSIVE})"
+                raise BisObservationValidationError(
+                    f"observation date outside frozen interval "
+                    f"[{START_INCLUSIVE}, {END_EXCLUSIVE})",
+                    series_key=series_key,
+                    time_period=time_period,
+                    raw_obs_value=obs_value,
+                    obs_status=obs_status,
+                    obs_conf=obs_conf,
+                    obs_pre_break=obs_pre_break,
                 )
-            rate_val = _parse_decimal(obs_value)
+
+            try:
+                rate_val = _parse_decimal(obs_value)
+            except ValueError as exc:
+                raise BisObservationValidationError(
+                    str(exc),
+                    series_key=series_key,
+                    time_period=time_period,
+                    raw_obs_value=obs_value,
+                    obs_status=obs_status,
+                    obs_conf=obs_conf,
+                    obs_pre_break=obs_pre_break,
+                ) from exc
+
             records.append(
                 PolicyRateRecord(
                     observation_date=obs_date,
                     series_key=series_key,
                     currency=currency,
                     rate_value=rate_val,
-                    obs_status=obs_status.strip(),
+                    obs_status=obs_status or "A",
+                    obs_conf=obs_conf,
+                    obs_pre_break=obs_pre_break,
                 )
             )
 

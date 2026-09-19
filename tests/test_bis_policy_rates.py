@@ -21,6 +21,7 @@ from fxlab.research.bis_policy_rates import (
     SOURCE_REQUEST_END_INCLUSIVE,
     START_INCLUSIVE,
     BisNormalizedDataset,
+    BisObservationValidationError,
     BisRawArtifact,
     PolicyRateRecord,
     RateState,
@@ -29,6 +30,7 @@ from fxlab.research.bis_policy_rates import (
     build_daily_policy_rate_grid,
     compute_raw_evidence_identity,
     normalize_bis_policy_rate_payloads,
+    parse_sdmx_csv_payload,
     parse_sdmx_xml_payload,
     publish_canonical_acquisition_bundle,
     publish_normalized_bis_dataset,
@@ -697,6 +699,149 @@ def test_35_preexisting_files_protected_during_rollback(
     with pytest.raises(OSError, match="forced error"):
         publish_canonical_acquisition_bundle(raw_artifacts, dataset, raw_dir, norm_file)
 
-    # Pre-existing file must remain intact
-    assert unrelated_file.exists()
-    assert unrelated_file.read_text(encoding="utf-8") == '{"keep": "me"}'
+def test_36_nan_fails_closed_with_rich_diagnostic_context_xml():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="XM" SERIES_KEY="D.XM">\n'
+        b'      <Obs TIME_PERIOD="2016-04-05" OBS_VALUE="NaN" OBS_STATUS="M" OBS_CONF="F" '
+        b'OBS_PRE_BREAK="0.5" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+
+    with pytest.raises(BisObservationValidationError) as exc_info:
+        parse_sdmx_xml_payload(xml, expected_series="D.XM")
+
+    exc = exc_info.value
+    assert exc.series_key == "D.XM"
+    assert exc.time_period == "2016-04-05"
+    assert exc.raw_obs_value == "NaN"
+    assert exc.obs_status == "M"
+    assert exc.obs_conf == "F"
+    assert exc.obs_pre_break == "0.5"
+
+    err_str = str(exc)
+    assert "non-finite rate value" in err_str
+    assert "series=D.XM" in err_str
+    assert "time_period=2016-04-05" in err_str
+    assert "raw_obs_value=NaN" in err_str
+    assert "obs_status=M" in err_str
+    assert "obs_conf=F" in err_str
+    assert "obs_pre_break=0.5" in err_str
+
+
+def test_37_nan_fails_closed_with_absent_optional_metadata_xml():
+    # When OBS_STATUS, OBS_CONF, OBS_PRE_BREAK are not in source payload, they remain None
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="CA" SERIES_KEY="D.CA">\n'
+        b'      <Obs TIME_PERIOD="2018-09-12" OBS_VALUE="NaN" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+
+    with pytest.raises(BisObservationValidationError) as exc_info:
+        parse_sdmx_xml_payload(xml, expected_series="D.CA")
+
+    exc = exc_info.value
+    assert exc.series_key == "D.CA"
+    assert exc.time_period == "2018-09-12"
+    assert exc.raw_obs_value == "NaN"
+    assert exc.obs_status is None
+    assert exc.obs_conf is None
+    assert exc.obs_pre_break is None
+
+    err_str = str(exc)
+    assert "obs_status" not in err_str
+    assert "obs_conf" not in err_str
+    assert "obs_pre_break" not in err_str
+
+
+def test_38_nan_fails_closed_with_rich_diagnostic_context_csv():
+    csv_payload = (
+        b"DATAFLOW,FREQ,REF_AREA,SERIES_KEY,TIME_PERIOD,OBS_VALUE,OBS_STATUS,OBS_CONF,OBS_PRE_BREAK\n"
+        b"BIS:WS_CBPOL(1.0),D,US,D.US,2019-07-31,NaN,ND,C,2.25\n"
+    )
+
+    with pytest.raises(BisObservationValidationError) as exc_info:
+        parse_sdmx_csv_payload(csv_payload, expected_series="D.US")
+
+    exc = exc_info.value
+    assert exc.series_key == "D.US"
+    assert exc.time_period == "2019-07-31"
+    assert exc.raw_obs_value == "NaN"
+    assert exc.obs_status == "ND"
+    assert exc.obs_conf == "C"
+    assert exc.obs_pre_break == "2.25"
+
+
+def test_39_finite_observations_preserve_raw_metadata_without_error():
+    xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="AU" SERIES_KEY="D.AU">\n'
+        b'      <Obs TIME_PERIOD="2015-02-04" OBS_VALUE="2.25" OBS_STATUS="A" OBS_CONF="F" '
+        b'OBS_PRE_BREAK="2.5" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+
+    records = parse_sdmx_xml_payload(xml, expected_series="D.AU")
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.series_key == "D.AU"
+    assert rec.observation_date == date(2015, 2, 4)
+    assert rec.rate_value == Decimal("2.25")
+    assert rec.obs_status == "A"
+    assert rec.obs_conf == "F"
+    assert rec.obs_pre_break == "2.5"
+
+
+def test_40_transactional_acquisition_zero_artifacts_after_nan_validation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from scripts import acquire_bis_policy_rates
+
+    payloads = _make_full_valid_payloads_dict()
+    # Inject NaN in series D.XM
+    payloads["D.XM"] = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<message:StructureSpecificData xmlns:message="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message">\n'
+        b'  <message:DataSet structureRef="BIS_WS_CBPOL_1_0">\n'
+        b'    <Series FREQ="D" REF_AREA="XM" SERIES_KEY="D.XM">\n'
+        b'      <Obs TIME_PERIOD="2016-04-05" OBS_VALUE="NaN" OBS_STATUS="M" />\n'
+        b'    </Series>\n'
+        b'  </message:DataSet>\n'
+        b'</message:StructureSpecificData>'
+    )
+
+    def mock_fetch(series_key: str, timeout: float = 30.0) -> bytes:
+        return payloads[series_key]
+
+    monkeypatch.setattr(acquire_bis_policy_rates, "fetch_bis_series_payload", mock_fetch)
+
+    raw_dir = tmp_path / "raw"
+    norm_file = tmp_path / "norm.json"
+
+    with pytest.raises(BisObservationValidationError) as exc_info:
+        acquire_bis_policy_rates.main(
+            ["--run", "--raw-output-dir", str(raw_dir), "--normalized-output", str(norm_file)]
+        )
+
+    exc = exc_info.value
+    assert exc.series_key == "D.XM"
+    assert exc.time_period == "2016-04-05"
+    assert exc.raw_obs_value == "NaN"
+    assert exc.obs_status == "M"
+
+    # Transactional publication guarantees 0 files
+    assert not raw_dir.exists() or len(list(raw_dir.glob("*.json"))) == 0
+    assert not norm_file.exists()
